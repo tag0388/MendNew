@@ -1,8 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, useParams, Navigate, useLocation } from 'react-router-dom';
-import { auth, db } from './firebase';
-import { onAuthStateChanged, signInWithPopup, GoogleAuthProvider, User, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendEmailVerification } from 'firebase/auth';
-import { collection, query, where, onSnapshot, addDoc, doc, updateDoc, getDoc, getDocs, limit } from 'firebase/firestore';
+import { supabase, subscribeToTable } from './lib/supabase';
+import type { User } from '@supabase/supabase-js';
+import { setCurrentUser, toCurrentUser, signOut } from './lib/currentUser';
+import {
+  loadSessionContext, fetchEnterprise, fetchProjects, acceptInvitation,
+  type SessionContext,
+} from './lib/session';
+import { fetchProject } from './lib/projects';
 import { Enterprise, Project } from './types';
 import Sidebar from './components/Sidebar';
 import Header from './components/Header';
@@ -32,22 +37,24 @@ export default function App() {
   const [isRegistering, setIsRegistering] = useState(false);
   const [showLanding, setShowLanding] = useState(true);
   const [isInIframe, setIsInIframe] = useState(false);
-  const [systemOwnerEnterpriseId, setSystemOwnerEnterpriseId] = useState<string | null>(() => {
+  const [session, setSession] = useState<SessionContext | null>(null);
+  const [activeEnterpriseId, setActiveEnterpriseId] = useState<string | null>(() => {
     try {
-      return localStorage.getItem('systemOwnerEnterpriseId');
+      return localStorage.getItem('activeEnterpriseId');
     } catch (e) {
       return null;
     }
   });
 
-  const isSystemOwner = user?.email?.toLowerCase() === 'tarek.guindy@gmail.com' || user?.email?.toLowerCase() === 'tarek_guindy@hotmail.com';
+  // Platform admin is a row in platform_admins, not a hardcoded email list.
+  const isSystemOwner = session?.isPlatformAdmin ?? false;
 
   useEffect(() => {
     try {
-      if (systemOwnerEnterpriseId) {
-        localStorage.setItem('systemOwnerEnterpriseId', systemOwnerEnterpriseId);
+      if (activeEnterpriseId) {
+        localStorage.setItem('activeEnterpriseId', activeEnterpriseId);
       } else {
-        localStorage.removeItem('systemOwnerEnterpriseId');
+        localStorage.removeItem('activeEnterpriseId');
       }
     } catch (e) {
       console.warn('LocalStorage access failed', e);
@@ -55,7 +62,7 @@ export default function App() {
     // Reset the current project when switching enterprises
     setCurrentProject(null);
     setView('enterprise');
-  }, [systemOwnerEnterpriseId]);
+  }, [activeEnterpriseId]);
   useEffect(() => {
     // Check if the app is running in an iframe
     try {
@@ -74,195 +81,161 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
+    let active = true;
+
+    const apply = async (u: User | null) => {
+      if (!active) return;
       setUser(u);
-      setLoading(false);
-      
-      // Handle invitation if present in URL
+      setCurrentUser(toCurrentUser(u));
+
       if (u) {
-        handlePendingInvitation(u);
+        try {
+          const ctx = await loadSessionContext(u.id, u.email ?? '');
+          if (!active) return;
+          setSession(ctx);
+          // Land on an enterprise the user is actually a member of.
+          setActiveEnterpriseId((prev) =>
+            prev && ctx.memberships.some((m) => m.enterpriseId === prev)
+              ? prev
+              : ctx.memberships[0]?.enterpriseId ?? null
+          );
+        } catch (err) {
+          console.error('Failed to load session context', err);
+          if (active) setSession(null);
+        }
+        await handlePendingInvitation();
+      } else {
+        setSession(null);
       }
+      if (active) setLoading(false);
+    };
+
+    supabase.auth.getSession().then(({ data }) => apply(data.session?.user ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+      void apply(s?.user ?? null);
     });
-    return () => unsubscribe();
+
+    return () => {
+      active = false;
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
-  const handlePendingInvitation = async (u: User) => {
+  /**
+   * Redeems an invite token from the URL.
+   *
+   * The Firestore version checked the email and expiry on the client, then
+   * wrote the membership itself -- and pushed the accepting user into
+   * `adminUsers` while labelling them an 'Enterprise User', so every invited
+   * user silently became an enterprise admin. The whole redemption is now one
+   * SECURITY DEFINER function that validates and grants the invited role.
+   */
+  const handlePendingInvitation = async () => {
     const params = new URLSearchParams(window.location.search);
     const token = params.get('token');
+    if (!token) return;
 
-    if (token) {
-      try {
-        // 1. Find the invitation by token
-        const q = query(collection(db, 'invitations'), where('token', '==', token), where('status', '==', 'pending'), limit(1));
-        const snapshot = await getDocs(q);
-        
-        if (!snapshot.empty) {
-          const inviteDoc = snapshot.docs[0];
-          const inviteData = inviteDoc.data();
-          
-          // 2. Security Check: Email must match (if provided in invite)
-          if (inviteData.email && u.email?.toLowerCase() !== inviteData.email.toLowerCase()) {
-            setAuthError(`This invitation was sent to ${inviteData.email}. Please sign in with that account.`);
-            return;
-          }
-
-          // 3. Security Check: Token expiration
-          if (new Date(inviteData.expiresAt) < new Date()) {
-            setAuthError('This invitation has expired. Please ask for a new one.');
-            return;
-          }
-
-          // 4. Add user to Enterprise
-          const enterpriseRef = doc(db, 'enterprises', inviteData.enterpriseId);
-          const enterpriseSnap = await getDoc(enterpriseRef);
-          
-          if (enterpriseSnap.exists()) {
-            const data = enterpriseSnap.data();
-            const users = data.users || {};
-            
-            if (!users[u.uid]) {
-              await updateDoc(enterpriseRef, {
-                [`users.${u.uid}`]: {
-                  name: u.displayName || u.email?.split('@')[0] || 'New User',
-                  email: u.email,
-                  role: 'Enterprise User',
-                  joinedAt: new Date().toISOString()
-                },
-                adminUsers: [...(data.adminUsers || []), u.uid]
-              });
-            }
-
-            // 5. Mark invitation as accepted
-            await updateDoc(inviteDoc.ref, {
-              status: 'accepted',
-              acceptedAt: new Date().toISOString(),
-              acceptedBy: u.uid
-            });
-
-            // 6. Clear URL params
-            window.history.replaceState({}, document.title, window.location.pathname);
-            alert(`Welcome! You've been added to ${data.name}.`);
-          }
-        }
-      } catch (error) {
-        console.error('Failed to process invitation:', error);
-      }
+    try {
+      const enterpriseId = await acceptInvitation(token);
+      window.history.replaceState({}, document.title, window.location.pathname);
+      setActiveEnterpriseId(enterpriseId);
+      // Pick up the membership the redemption just created.
+      const u = (await supabase.auth.getUser()).data.user;
+      if (u) setSession(await loadSessionContext(u.id, u.email ?? ''));
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'This invitation could not be used.');
     }
   };
 
+  // Load the active enterprise and the projects the user may open.
+  //
+  // The Firestore version queried
+  //   where('adminUsers', 'array-contains', user.id)
+  // so an ordinary Enterprise User matched no enterprise and saw an empty app.
+  // Membership now comes from enterprise_members, and RLS decides which
+  // projects come back -- an admin gets all of the enterprise's, a normal user
+  // only those they are assigned to.
   useEffect(() => {
-    if (!user) return;
+    if (!user || !activeEnterpriseId) {
+      setCurrentEnterprise(null);
+      setProjects([]);
+      return;
+    }
+    let active = true;
 
-    // Fetch Enterprise
-    const enterpriseQuery = isSystemOwner && systemOwnerEnterpriseId
-      ? query(collection(db, 'enterprises'), where('__name__', '==', systemOwnerEnterpriseId))
-      : query(collection(db, 'enterprises'), where('adminUsers', 'array-contains', user.uid));
-
-    const unsubscribe = onSnapshot(enterpriseQuery, (snapshot) => {
-      if (!snapshot.empty) {
-        const doc = snapshot.docs[0];
-        const data = { ...doc.data() as Enterprise, id: doc.id };
-        setCurrentEnterprise(data);
-        
-        // Fetch projects for this enterprise
-        const qProjects = query(collection(db, 'projects'), where('enterpriseId', '==', doc.id));
-        getDocs(qProjects).then(projSnap => {
-          setProjects(projSnap.docs.map(d => ({ ...d.data() as Project, id: d.id })));
-        });
-      } else {
-        setCurrentEnterprise(null);
+    const load = async () => {
+      try {
+        const [ent, projs] = await Promise.all([
+          fetchEnterprise(activeEnterpriseId),
+          fetchProjects(activeEnterpriseId),
+        ]);
+        if (!active) return;
+        setCurrentEnterprise(ent);
+        setProjects(projs);
+      } catch (error) {
+        console.error('Enterprise fetch error:', error);
+        if (active) setCurrentEnterprise(null);
       }
-    }, (error) => {
-      console.error("Enterprise fetch error:", error);
-    });
-    return () => unsubscribe();
-  }, [user, systemOwnerEnterpriseId]);
+    };
 
-  useEffect(() => {
-    if (!user || 
-        (user.email?.toLowerCase() !== 'tarek.guindy@gmail.com' && 
-         user.email?.toLowerCase() !== 'tarek_guindy@hotmail.com')) return;
-
-    // Check if any enterprise exists
-    const q = query(collection(db, 'enterprises'));
-    const unsubscribe = onSnapshot(q, async (snapshot) => {
-      if (snapshot.empty) {
-        try {
-          await addDoc(collection(db, 'enterprises'), {
-            name: 'Global Construction Corp',
-            adminUsers: [user.uid],
-            settings: { theme: 'dark' },
-            users: {
-              [user.uid]: {
-                name: 'Tarek Guindy',
-                role: 'Enterprise System Admin'
-              }
-            }
-          });
-        } catch (error) {
-          console.error('Bootstrap failed', error);
-        }
-      }
-    }, (error) => {
-      console.error("Bootstrap check error:", error);
-    });
-    return () => unsubscribe();
-  }, [user]);
-
-  useEffect(() => {
-    if (!user || !currentProject?.id) return;
-
-    const unsubscribe = onSnapshot(doc(db, 'projects', currentProject.id), (snapshot) => {
-      if (snapshot.exists()) {
-        setCurrentProject({ ...snapshot.data() as Project, id: snapshot.id });
-      }
-    }, (error) => {
-      console.error("Current project fetch error:", error);
-    });
-    return () => unsubscribe();
-  }, [user, currentProject?.id]);
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [user, activeEnterpriseId]);
 
   const handleLogin = async () => {
-    const provider = new GoogleAuthProvider();
     setAuthError(null);
-    try {
-      await signInWithPopup(auth, provider);
-    } catch (error: any) {
+    // Redirect flow rather than a popup: popups are what the Firebase version
+    // kept failing on in Safari and in the iframe.
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: window.location.origin },
+    });
+    if (error) {
       console.error('Login failed', error);
-      if (error.code === 'auth/popup-blocked') {
-        setAuthError('The login popup was blocked. Please click "Open in New Tab" below to sign in.');
-      } else if (error.message?.includes('cookie')) {
-        setAuthError('Your browser is blocking security cookies. Please click "Open in New Tab" below.');
-      } else {
-        setAuthError('Authentication failed. Please try opening the app in a new tab.');
-      }
+      setAuthError(
+        error.message.includes('provider')
+          ? 'Google sign-in is not enabled for this project yet. Use email and password, or enable the Google provider in Supabase.'
+          : 'Authentication failed. Please try again.'
+      );
     }
   };
 
   const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
-    try {
-      if (isRegistering) {
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-        await sendEmailVerification(userCredential.user);
-        alert('A verification email has been sent. Please check your inbox to complete registration.');
-      } else {
-        await signInWithEmailAndPassword(auth, email, password);
+
+    if (isRegistering) {
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { emailRedirectTo: window.location.origin },
+      });
+      if (error) {
+        setAuthError(
+          error.message.includes('already registered')
+            ? 'This email is already registered. Try signing in instead.'
+            : error.message
+        );
+        return;
       }
-    } catch (error: any) {
-      console.error('Email auth failed', error);
-      if (error.code === 'auth/email-already-in-use') {
-        setAuthError('This email is already registered. Try signing in instead.');
-      } else if (error.code === 'auth/weak-password') {
-        setAuthError('Password should be at least 6 characters.');
-      } else if (error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') {
-        setAuthError('Invalid email or password.');
-      } else if (error.code === 'auth/too-many-requests') {
-        setAuthError('Too many failed attempts. Please try again later.');
-      } else {
-        setAuthError('Authentication failed. Please try again.');
+      // With email confirmation on, Supabase returns a user but no session.
+      if (data.user && !data.session) {
+        alert('A confirmation email has been sent. Please check your inbox to complete registration.');
       }
+      return;
+    }
+
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) {
+      setAuthError(
+        error.message.includes('Invalid login')
+          ? 'Invalid email or password.'
+          : error.message.includes('Email not confirmed')
+            ? 'Please confirm your email address before signing in.'
+            : error.message
+      );
     }
   };
 
@@ -278,8 +251,10 @@ export default function App() {
         currentEnterprise={currentEnterprise}
         setCurrentEnterprise={setCurrentEnterprise}
         isSystemOwner={isSystemOwner}
-        systemOwnerEnterpriseId={systemOwnerEnterpriseId}
-        setSystemOwnerEnterpriseId={setSystemOwnerEnterpriseId}
+        activeEnterpriseId={activeEnterpriseId}
+        setActiveEnterpriseId={setActiveEnterpriseId}
+        session={session}
+        setSession={setSession}
         theme={theme}
         setTheme={setTheme}
         isSidebarCollapsed={isSidebarCollapsed}
@@ -310,8 +285,10 @@ interface AuthenticatedAppProps {
   currentEnterprise: Enterprise | null;
   setCurrentEnterprise: (e: Enterprise | null) => void;
   isSystemOwner: boolean;
-  systemOwnerEnterpriseId: string | null;
-  setSystemOwnerEnterpriseId: (id: string | null) => void;
+  activeEnterpriseId: string | null;
+  setActiveEnterpriseId: (id: string | null) => void;
+  session: SessionContext | null;
+  setSession: (s: SessionContext | null) => void;
   theme: 'light' | 'dark';
   setTheme: (t: 'light' | 'dark') => void;
   isSidebarCollapsed: boolean;
@@ -335,7 +312,7 @@ interface AuthenticatedAppProps {
 
 function AuthenticatedApp({
   user, loading, currentEnterprise, setCurrentEnterprise, isSystemOwner,
-  systemOwnerEnterpriseId, setSystemOwnerEnterpriseId, theme, setTheme,
+  activeEnterpriseId, setActiveEnterpriseId, session, setSession, theme, setTheme,
   isSidebarCollapsed, setIsSidebarCollapsed, authError, setAuthError,
   email, setEmail, password, setPassword, isRegistering, setIsRegistering,
   showLanding, setShowLanding, 
@@ -356,7 +333,7 @@ function AuthenticatedApp({
     );
   }
 
-  if (user && !user.emailVerified && !isSystemOwner) {
+  if (user && !user.email_confirmed_at && !isSystemOwner) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-[#F5F5F4] p-6">
         <div className="max-w-md w-full bg-white p-12 rounded-3xl shadow-sm text-center">
@@ -370,13 +347,16 @@ function AuthenticatedApp({
           </p>
           <div className="space-y-4">
             <button 
-              onClick={() => sendEmailVerification(user).then(() => alert('Verification email resent!'))}
+              onClick={async () => {
+                const { error } = await supabase.auth.resend({ type: 'signup', email: user.email ?? '' });
+                alert(error ? `Could not resend: ${error.message}` : 'Verification email resent!');
+              }}
               className="w-full py-3 bg-black text-white rounded-lg font-medium hover:bg-black/90 transition-colors"
             >
               Resend Verification Email
             </button>
             <button 
-              onClick={() => auth.signOut()}
+              onClick={() => void signOut()}
               className="w-full py-3 border border-gray-200 hover:bg-gray-50 text-black rounded-lg font-medium transition-colors"
             >
               Sign Out
@@ -565,23 +545,22 @@ function AuthenticatedApp({
             <button 
               onClick={async () => {
                 const name = prompt('Enter your Enterprise Name:');
-                if (name) {
-                  try {
-                    await addDoc(collection(db, 'enterprises'), {
-                      name,
-                      adminUsers: [user.uid],
-                      users: {
-                        [user.uid]: {
-                          name: user.displayName || user.email?.split('@')[0] || 'Admin',
-                          email: user.email,
-                          role: 'Enterprise System Admin',
-                          joinedAt: new Date().toISOString()
-                        }
-                      }
-                    });
-                  } catch (e) {
-                    alert('Failed to create enterprise. Please try again.');
-                  }
+                if (!name) return;
+                try {
+                  // enterprises_grant_creator_admin() makes the creator an
+                  // Enterprise System Admin, so the client never asserts its
+                  // own role.
+                  const { data, error } = await supabase
+                    .from('enterprises')
+                    .insert({ name, enterprise_code: name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, '-').slice(0, 40) })
+                    .select('id')
+                    .single();
+                  if (error) throw error;
+                  const u = (await supabase.auth.getUser()).data.user;
+                  if (u) setSession(await loadSessionContext(u.id, u.email ?? ''));
+                  setActiveEnterpriseId(data.id);
+                } catch (e) {
+                  alert(e instanceof Error ? e.message : 'Failed to create enterprise. Please try again.');
                 }
               }}
               className="w-full py-3 bg-black text-white rounded-lg font-medium hover:bg-black/90 transition-colors flex items-center justify-center gap-2"
@@ -590,7 +569,7 @@ function AuthenticatedApp({
               Create New Enterprise
             </button>
             <button 
-              onClick={() => auth.signOut()}
+              onClick={() => void signOut()}
               className="w-full py-3 border border-gray-200 hover:bg-gray-50 text-black rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
             >
               <LogOut className="w-4 h-4" />
@@ -607,7 +586,7 @@ function AuthenticatedApp({
       <Sidebar 
         enterprise={currentEnterprise}
         userEmail={user.email}
-        userId={user.uid}
+        userId={user.id}
         theme={theme}
         setTheme={setTheme}
         isCollapsed={isSidebarCollapsed}
@@ -615,7 +594,7 @@ function AuthenticatedApp({
       />
       <div className="flex-1 flex flex-col overflow-hidden bg-white dark:bg-[#0A0A0A] transition-colors duration-300">
         <Header 
-          user={user} 
+          user={{ displayName: session?.displayName ?? null, photoURL: session?.photoUrl ?? null }} 
           enterprise={currentEnterprise} 
         />
         <main className="flex-1 flex flex-col overflow-hidden bg-[#F5F5F4] dark:bg-[#0A0A0A] transition-colors duration-300">
@@ -623,7 +602,7 @@ function AuthenticatedApp({
             <Route path="/" element={
               <EnterpriseDashboard 
                 enterprise={currentEnterprise} 
-                userId={user.uid}
+                userId={user.id}
                 isSystemOwner={isSystemOwner}
               />
             } />
@@ -635,7 +614,7 @@ function AuthenticatedApp({
               <SystemAdmin 
                 currentEnterpriseId={currentEnterprise?.id}
                 onSwitchEnterprise={(id) => {
-                  setSystemOwnerEnterpriseId(id);
+                  setActiveEnterpriseId(id);
                   navigate('/');
                 }} 
               />
@@ -644,7 +623,7 @@ function AuthenticatedApp({
               currentEnterprise ? <EnterpriseAdmin enterprise={currentEnterprise} setIsSidebarCollapsed={setIsSidebarCollapsed} /> : <Navigate to="/" />
             } />
             <Route path="/profile" element={
-              currentEnterprise ? <UserProfile userId={user.uid} enterprise={currentEnterprise} /> : <Navigate to="/" />
+              currentEnterprise ? <UserProfile userId={user.id} enterprise={currentEnterprise} /> : <Navigate to="/" />
             } />
             <Route path="*" element={<Navigate to="/" />} />
           </Routes>
@@ -662,12 +641,20 @@ function ProjectView({ enterprise, user, theme, setIsSidebarCollapsed }: { enter
 
   useEffect(() => {
     if (!projectId) return;
-    const unsubscribe = onSnapshot(doc(db, 'projects', projectId), (snapshot) => {
-      if (snapshot.exists()) {
-        setProject({ ...snapshot.data() as Project, id: snapshot.id });
-      }
+    let active = true;
+    void fetchProject(projectId).then((p) => {
+      if (active) setProject(p);
     });
-    return () => unsubscribe();
+    // Re-fetch when this project row changes, so RLS still decides visibility.
+    const unsubscribe = subscribeToTable('projects', `id=eq.${projectId}`, () => {
+      void fetchProject(projectId).then((p) => {
+        if (active) setProject(p);
+      });
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [projectId]);
 
   if (!project || !enterprise) return null;

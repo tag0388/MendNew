@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { User } from 'firebase/auth';
 import { Enterprise, Project } from '../types';
 import { Bell, Search, User as UserIcon, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -10,7 +9,7 @@ import { db } from '../firebase';
 import { doc, onSnapshot } from 'firebase/firestore';
 
 interface HeaderProps {
-  user: User;
+  user: { displayName: string | null; photoURL: string | null };
   enterprise: Enterprise | null;
 }
 
