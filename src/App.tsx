@@ -3,12 +3,11 @@ import { BrowserRouter, Routes, Route, useNavigate, useParams, Navigate, useLoca
 import { auth, db } from './firebase';
 import { onAuthStateChanged, signInWithPopup, GoogleAuthProvider, User, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendEmailVerification } from 'firebase/auth';
 import { collection, query, where, onSnapshot, addDoc, doc, updateDoc, getDoc, getDocs, limit } from 'firebase/firestore';
-import { Enterprise, Project, Sheet } from './types';
+import { Enterprise, Project } from './types';
 import Sidebar from './components/Sidebar';
 import Header from './components/Header';
 import EnterpriseDashboard from './components/EnterpriseDashboard';
 import ProjectDashboard from './components/ProjectDashboard';
-import ForecastGrid from './components/ForecastGrid';
 import SystemAdmin from './components/SystemAdmin';
 import EnterpriseAdmin from './components/EnterpriseAdmin';
 import ProjectAdmin from './components/ProjectAdmin';
@@ -23,9 +22,8 @@ export default function App() {
   const [currentEnterprise, setCurrentEnterprise] = useState<Enterprise | null>(null);
   const [currentProject, setCurrentProject] = useState<Project | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [currentSheet, setCurrentSheet] = useState<Sheet | null>(null);
   const [currentModule, setCurrentModule] = useState<string>('dashboard');
-  const [view, setView] = useState<'enterprise' | 'project' | 'sheet' | 'system-admin' | 'enterprise-admin' | 'project-admin' | 'profile'>('enterprise');
+  const [view, setView] = useState<'enterprise' | 'project' | 'system-admin' | 'enterprise-admin' | 'project-admin' | 'profile'>('enterprise');
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -54,9 +52,8 @@ export default function App() {
     } catch (e) {
       console.warn('LocalStorage access failed', e);
     }
-    // Reset current project and sheet when switching enterprises
+    // Reset the current project when switching enterprises
     setCurrentProject(null);
-    setCurrentSheet(null);
     setView('enterprise');
   }, [systemOwnerEnterpriseId]);
   useEffect(() => {
@@ -633,7 +630,6 @@ function AuthenticatedApp({
             <Route path="/project/:projectId" element={<ProjectView enterprise={currentEnterprise} user={user} setIsSidebarCollapsed={setIsSidebarCollapsed} />} />
             <Route path="/project/:projectId/:moduleId" element={<ProjectView enterprise={currentEnterprise} user={user} setIsSidebarCollapsed={setIsSidebarCollapsed} />} />
             <Route path="/project/:projectId/:moduleId/:subModuleId" element={<ProjectView enterprise={currentEnterprise} user={user} setIsSidebarCollapsed={setIsSidebarCollapsed} />} />
-            <Route path="/project/:projectId/sheet/:sheetId" element={<ProjectView enterprise={currentEnterprise} user={user} theme={theme} setIsSidebarCollapsed={setIsSidebarCollapsed} />} />
             
             <Route path="/system-admin" element={
               <SystemAdmin 
@@ -660,10 +656,9 @@ function AuthenticatedApp({
 }
 
 function ProjectView({ enterprise, user, theme, setIsSidebarCollapsed }: { enterprise: Enterprise | null, user: User, theme?: 'light' | 'dark', setIsSidebarCollapsed?: (c: boolean) => void }) {
-  const { projectId, moduleId, subModuleId, sheetId } = useParams();
+  const { projectId, moduleId, subModuleId } = useParams();
   const navigate = useNavigate();
   const [project, setProject] = useState<Project | null>(null);
-  const [sheet, setSheet] = useState<Sheet | null>(null);
 
   useEffect(() => {
     if (!projectId) return;
@@ -675,24 +670,7 @@ function ProjectView({ enterprise, user, theme, setIsSidebarCollapsed }: { enter
     return () => unsubscribe();
   }, [projectId]);
 
-  useEffect(() => {
-    if (!sheetId) {
-      setSheet(null);
-      return;
-    }
-    const unsubscribe = onSnapshot(doc(db, 'sheets', sheetId), (snapshot) => {
-      if (snapshot.exists()) {
-        setSheet({ ...snapshot.data() as Sheet, id: snapshot.id });
-      }
-    });
-    return () => unsubscribe();
-  }, [sheetId]);
-
   if (!project || !enterprise) return null;
-
-  if (sheetId && sheet) {
-    return <ForecastGrid sheet={sheet} project={project} enterprise={enterprise} theme={theme || 'light'} />;
-  }
 
   if (moduleId === 'project-admin') {
     return <ProjectAdmin project={project} enterprise={enterprise} />;
@@ -704,7 +682,6 @@ function ProjectView({ enterprise, user, theme, setIsSidebarCollapsed }: { enter
       enterprise={enterprise}
       currentModule={moduleId || 'dashboard'}
       subModuleId={subModuleId}
-      onSelectSheet={(sheet) => window.location.href = `/project/${project.id}/sheet/${sheet.id}`}
       setIsSidebarCollapsed={setIsSidebarCollapsed}
       user={user}
       theme={theme}

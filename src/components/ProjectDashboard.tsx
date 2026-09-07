@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { db } from '../firebase';
-import { collection, query, where, onSnapshot, addDoc, deleteDoc, doc, getDocs, writeBatch, collectionGroup } from 'firebase/firestore';
-import { Project, Sheet, Enterprise, ForecastRow } from '../types';
+import { Project, Enterprise } from '../types';
 import CostManagement from './CostManagement';
 import ChangeManagementSubPane from './ChangeManagementSubPane';
 import RiskManagementSubPane from './RiskManagementSubPane';
@@ -40,100 +38,12 @@ interface ProjectDashboardProps {
   enterprise: Enterprise;
   currentModule: string;
   subModuleId?: string;
-  onSelectSheet: (sheet: Sheet) => void;
   setIsSidebarCollapsed?: (c: boolean) => void;
   user: any;
   theme?: 'light' | 'dark';
 }
 
-export default function ProjectDashboard({ project, enterprise, currentModule, subModuleId, onSelectSheet, setIsSidebarCollapsed, user, theme = 'light' }: ProjectDashboardProps) {
-  const [sheets, setSheets] = useState<Sheet[]>([]);
-  const [sheetStats, setSheetStats] = useState<Record<string, { eac: number, etc: number }>>({});
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [newSheet, setNewSheet] = useState({ name: '', method: 'commitment' as const });
-  const [sheetToDelete, setSheetToDelete] = useState<Sheet | null>(null);
-  const [isDeleting, setIsDeleting] = useState(false);
-
-  useEffect(() => {
-    const q = query(collection(db, 'sheets'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const s = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Sheet));
-      setSheets(s);
-      
-      // Fetch stats for each sheet
-      s.forEach(async (sheet) => {
-        const rowsQuery = query(collection(db, `sheets/${sheet.id}/rows`));
-        const rowsSnapshot = await getDocs(rowsQuery);
-        const rows = rowsSnapshot.docs.map(doc => doc.data() as ForecastRow);
-        
-        let totalEac = 0;
-        let totalEtc = 0;
-        
-        rows.forEach(r => {
-          const eac = sheet.forecastMethod === 'commitment' 
-            ? (r.qty || 0) * (r.rate || 0) 
-            : (r.actualCostToDate || 0) + (r.costToGo || 0);
-          const etc = Math.max(0, eac - (r.actualCostToDate || 0));
-          
-          totalEac += eac;
-          totalEtc += etc;
-        });
-        
-        setSheetStats(prev => ({
-          ...prev,
-          [sheet.id]: { eac: totalEac, etc: totalEtc }
-        }));
-      });
-    }, (error) => {
-      console.error("Sheets fetch error:", error);
-    });
-    return () => unsubscribe();
-  }, [project]);
-
-  const handleCreateSheet = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await addDoc(collection(db, 'sheets'), {
-        projectId: project.id,
-        sheetName: newSheet.name,
-        forecastMethod: newSheet.method,
-        version: 'v1.0',
-        lockedStatus: false,
-        createdBy: 'System',
-        createdAt: new Date().toISOString()
-      });
-      setIsModalOpen(false);
-      setNewSheet({ name: '', method: 'commitment' });
-    } catch (error) {
-      console.error('Failed to create sheet', error);
-    }
-  };
-
-  const handleDeleteSheet = async () => {
-    if (!sheetToDelete) return;
-    setIsDeleting(true);
-    try {
-      const batch = writeBatch(db);
-      
-      // 1. Find all rows for this sheet
-      const rowsQuery = query(collection(db, `sheets/${sheetToDelete.id}/rows`));
-      const rowsSnapshot = await getDocs(rowsQuery);
-      rowsSnapshot.docs.forEach(rowDoc => {
-        batch.delete(rowDoc.ref);
-      });
-      
-      // 2. Delete the sheet
-      batch.delete(doc(db, 'sheets', sheetToDelete.id));
-      
-      await batch.commit();
-      setSheetToDelete(null);
-    } catch (error) {
-      console.error('Failed to delete sheet', error);
-      alert('Failed to delete sheet. Check console for details.');
-    } finally {
-      setIsDeleting(false);
-    }
-  };
+export default function ProjectDashboard({ project, enterprise, currentModule, subModuleId, setIsSidebarCollapsed, user, theme = 'light' }: ProjectDashboardProps) {
 
   const renderModuleContent = () => {
     switch (currentModule) {
@@ -142,9 +52,11 @@ export default function ProjectDashboard({ project, enterprise, currentModule, s
           <div className="space-y-8">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
               {[
-                { label: 'Total EAC', value: `$${(Object.values(sheetStats).reduce((acc, s) => acc + s.eac, 0) / 1e6).toFixed(1)}M`, icon: DollarSign, color: 'text-blue-600' },
-                { label: 'Total ETC', value: `$${(Object.values(sheetStats).reduce((acc, s) => acc + s.etc, 0) / 1e6).toFixed(1)}M`, icon: TrendingUp, color: 'text-emerald-600' },
-                { label: 'Active Sheets', value: sheets.length, icon: FileText, color: 'text-amber-600' },
+                // TODO(supabase-port): source these from cost_codes once the
+                // data layer lands -- they were previously derived from the
+                // forecast-sheet feature, which has been removed.
+                { label: 'Total EAC', value: '--', icon: DollarSign, color: 'text-blue-600' },
+                { label: 'Total ETC', value: '--', icon: TrendingUp, color: 'text-emerald-600' },
                 { label: 'Performance Index', value: '1.04', icon: Activity, color: 'text-[#FF6321]' },
               ].map((stat, i) => (
                 <div key={i} className="bg-white dark:bg-[#141414] p-6 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm transition-colors">
@@ -159,25 +71,7 @@ export default function ProjectDashboard({ project, enterprise, currentModule, s
               ))}
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="bg-white dark:bg-[#141414] p-6 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm">
-                <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-6">Recent Activity</h3>
-                <div className="space-y-4">
-                  {sheets.slice(0, 5).map((sheet, i) => (
-                    <div key={i} className="flex items-center gap-4 p-3 rounded-xl hover:bg-gray-50 dark:hover:bg-white/5 transition-colors cursor-pointer" onClick={() => onSelectSheet(sheet)}>
-                      <div className="w-8 h-8 bg-blue-50 dark:bg-blue-500/10 rounded-lg flex items-center justify-center text-blue-600 dark:text-blue-400">
-                        <FileText className="w-4 h-4" />
-                      </div>
-                      <div className="flex-1">
-                        <p className="text-sm font-bold dark:text-white">{sheet.sheetName} updated</p>
-                        <p className="text-[10px] text-gray-400 uppercase tracking-widest">{new Date(sheet.createdAt).toLocaleDateString()}</p>
-                      </div>
-                      <ChevronRight className="w-4 h-4 text-gray-300" />
-                    </div>
-                  ))}
-                </div>
-              </div>
-
+            <div className="grid grid-cols-1 gap-6">
               <div className="bg-white dark:bg-[#141414] p-6 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm">
                 <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-6">Module Status</h3>
                 <div className="grid grid-cols-2 gap-4">
@@ -206,11 +100,6 @@ export default function ProjectDashboard({ project, enterprise, currentModule, s
           <CostManagement 
             project={project} 
             enterprise={enterprise}
-            sheets={sheets}
-            sheetStats={sheetStats}
-            onSelectSheet={onSelectSheet}
-            onDeleteSheet={setSheetToDelete}
-            onCreateSheet={() => setIsModalOpen(true)}
             setIsSidebarCollapsed={setIsSidebarCollapsed}
           />
         );
@@ -348,94 +237,6 @@ export default function ProjectDashboard({ project, enterprise, currentModule, s
         </div>
       </div>
 
-      {/* Delete Confirmation Modal */}
-      {sheetToDelete && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[60]">
-          <div className="bg-white dark:bg-[#141414] rounded-2xl p-8 w-full max-w-md shadow-2xl border dark:border-white/10">
-            <div className="flex items-center gap-3 text-red-600 mb-4">
-              <AlertTriangle className="w-6 h-6" />
-              <h2 className="text-xl font-bold">Delete Sheet?</h2>
-            </div>
-            <p className="text-gray-900 dark:text-gray-400 text-sm mb-6">
-              Are you sure you want to delete <span className="font-bold text-gray-900 dark:text-white">"{sheetToDelete.sheetName}"</span>? 
-              This action is permanent and will delete all associated forecast data.
-            </p>
-            <div className="flex gap-3">
-              <button 
-                disabled={isDeleting}
-                onClick={() => setSheetToDelete(null)}
-                className="flex-1 py-3 border border-gray-200 dark:border-white/10 rounded-xl text-sm font-medium hover:bg-gray-50 dark:hover:bg-white/5 transition-colors dark:text-white disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button 
-                disabled={isDeleting}
-                onClick={handleDeleteSheet}
-                className="flex-1 py-3 bg-red-600 text-white rounded-xl text-sm font-bold hover:bg-red-700 transition-colors shadow-lg shadow-red-600/20 disabled:opacity-50 flex items-center justify-center gap-2"
-              >
-                {isDeleting ? (
-                  <>
-                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                    Deleting...
-                  </>
-                ) : 'Delete Sheet'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {isModalOpen && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-[#141414] rounded-2xl p-8 w-full max-w-md shadow-2xl border dark:border-white/10">
-            <div className="flex justify-between items-center mb-6">
-              <h2 className="text-xl font-bold dark:text-white">Create New Sheet</h2>
-              <button onClick={() => setIsModalOpen(false)} className="text-gray-400 hover:text-gray-600">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            <form onSubmit={handleCreateSheet} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold uppercase tracking-widest text-gray-400 mb-1">Sheet Name</label>
-                <input 
-                  required
-                  type="text" 
-                  value={newSheet.name}
-                  onChange={e => setNewSheet({...newSheet, name: e.target.value})}
-                  className="w-full p-3 bg-gray-50 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-black/5 dark:focus:ring-white/5 dark:text-white"
-                  placeholder="e.g. Structural Steel Forecast"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase tracking-widest text-gray-400 mb-1">Forecast Method</label>
-                <select 
-                  value={newSheet.method}
-                  onChange={e => setNewSheet({...newSheet, method: e.target.value as any})}
-                  className="w-full p-3 bg-gray-50 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-xl focus:outline-none focus:ring-2 focus:ring-black/5 dark:focus:ring-white/5 dark:text-white"
-                >
-                  <option value="commitment">Commitment Based (Subcontractors)</option>
-                  <option value="time-based">Time-Based (Labour/Self-Perform)</option>
-                </select>
-              </div>
-              <div className="flex gap-3 pt-4">
-                <button 
-                  type="button"
-                  onClick={() => setIsModalOpen(false)}
-                  className="flex-1 py-3 border border-gray-200 dark:border-white/10 rounded-xl text-sm font-medium hover:bg-gray-50 dark:hover:bg-white/5 transition-colors dark:text-white"
-                >
-                  Cancel
-                </button>
-                <button 
-                  type="submit"
-                  className="flex-1 py-3 bg-black dark:bg-white text-white dark:text-black rounded-xl text-sm font-medium hover:bg-black/90 dark:hover:bg-white/90 transition-colors"
-                >
-                  Create Sheet
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

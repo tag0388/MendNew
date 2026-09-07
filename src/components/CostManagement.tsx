@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Project, Sheet, Enterprise } from '../types';
+import { Project, Enterprise } from '../types';
 import { DollarSign, Tag, List, ChevronLeft, Menu, Settings, Hash, Database, Calendar, Target, ClipboardList } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
@@ -7,9 +7,6 @@ import { auth } from '../firebase';
 import ProjectCostCodeAttributes from './ProjectCostCodeAttributes';
 import ProjectResourceRates from './ProjectResourceRates';
 import CostReportingPeriod from './CostReportingPeriod';
-import CostDashboard from './CostDashboard';
-import CostTasks from './CostTasks';
-import CostForecasting from './CostForecasting';
 import CostCodes from './CostCodes';
 import ActualCost from './ActualCost';
 import BaselineBudget from './BaselineBudget';
@@ -19,11 +16,6 @@ import BulkEtcDetails from './BulkEtcDetails';
 interface CostManagementProps {
   project: Project;
   enterprise: Enterprise;
-  sheets?: Sheet[];
-  sheetStats?: Record<string, { eac: number, etc: number }>;
-  onSelectSheet?: (sheet: Sheet) => void;
-  onDeleteSheet?: (sheet: Sheet) => void;
-  onCreateSheet?: () => void;
   setIsSidebarCollapsed?: (c: boolean) => void;
 }
 
@@ -32,11 +24,6 @@ type CostTab = 'costCodes' | 'timephasing' | 'actualCost' | 'baselineBudget' | '
 const CostManagement: React.FC<CostManagementProps> = ({ 
   project, 
   enterprise,
-  sheets = [], 
-  sheetStats = {}, 
-  onSelectSheet, 
-  onDeleteSheet,
-  onCreateSheet,
   setIsSidebarCollapsed
 }) => {
   const navigate = useNavigate();

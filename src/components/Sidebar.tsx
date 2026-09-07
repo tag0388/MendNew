@@ -24,7 +24,7 @@ import {
   GanttChartSquare
 } from 'lucide-react';
 import { useNavigate, useLocation, useParams, matchPath } from 'react-router-dom';
-import { Enterprise, Project, Sheet } from '../types';
+import { Enterprise, Project } from '../types';
 import { auth, db } from '../firebase';
 import { signOut } from 'firebase/auth';
 import { collection, query, where, onSnapshot, doc } from 'firebase/firestore';
@@ -59,15 +59,10 @@ export default function Sidebar({
   const projectMatch = matchPath({ path: '/project/:projectId', end: false }, location.pathname);
   const projectId = projectMatch?.params.projectId;
 
-  const sheetMatch = matchPath({ path: '/project/:projectId/sheet/:sheetId', end: false }, location.pathname);
-  const sheetId = sheetMatch?.params.sheetId;
-
   const moduleMatch = matchPath({ path: '/project/:projectId/:moduleId', end: false }, location.pathname);
   let moduleId = moduleMatch?.params.moduleId;
-  if (moduleId === 'sheet') moduleId = undefined;
 
   const [project, setProject] = useState<Project | null>(null);
-  const [sheet, setSheet] = useState<Sheet | null>(null);
 
   useEffect(() => {
     if (!projectId) {
@@ -81,19 +76,6 @@ export default function Sidebar({
     });
     return () => unsubscribe();
   }, [projectId]);
-
-  useEffect(() => {
-    if (!sheetId) {
-      setSheet(null);
-      return;
-    }
-    const unsubscribe = onSnapshot(doc(db, 'sheets', sheetId), (snapshot) => {
-      if (snapshot.exists()) {
-        setSheet({ ...snapshot.data() as Sheet, id: snapshot.id });
-      }
-    });
-    return () => unsubscribe();
-  }, [sheetId]);
 
   const isSystemAdmin = userEmail?.toLowerCase() === 'tarek.guindy@gmail.com' || userEmail?.toLowerCase() === 'tarek_guindy@hotmail.com';
   const isEnterpriseAdmin = userId && enterprise?.users?.[userId]?.role === 'Enterprise System Admin';
@@ -214,22 +196,6 @@ export default function Sidebar({
                       </Button>
                     );
                   })}
-                  {/* Forecast Sheet Link if active */}
-                  {sheet && (
-                    <Button
-                      variant={sheetId ? "default" : "ghost"}
-                      onClick={() => navigate(`/project/${projectId}/sheet/${sheetId}`)}
-                      className={cn(
-                        "w-full justify-start gap-3 px-3 py-2 h-auto font-normal",
-                        !sheetId && "text-black dark:text-white/40 hover:text-black dark:hover:text-white/70",
-                        isCollapsed && "justify-center px-0"
-                      )}
-                      title={isCollapsed ? "Forecast Sheet" : ""}
-                    >
-                      <FileText className="w-4 h-4 shrink-0" />
-                      {!isCollapsed && <span className="flex-1 text-left whitespace-nowrap">Forecast Sheet</span>}
-                    </Button>
-                  )}
                 </nav>
               </div>
             )}

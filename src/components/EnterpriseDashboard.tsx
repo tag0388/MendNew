@@ -124,22 +124,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
     try {
       const batch = writeBatch(db);
       
-      // 1. Find all sheets for this project
-      const sheetsQuery = query(collection(db, 'sheets'), where('projectId', '==', projectToDelete.id));
-      const sheetsSnapshot = await getDocs(sheetsQuery);
-      
-      for (const sheetDoc of sheetsSnapshot.docs) {
-        // 2. Find all rows for each sheet
-        const rowsQuery = query(collection(db, `sheets/${sheetDoc.id}/rows`));
-        const rowsSnapshot = await getDocs(rowsQuery);
-        rowsSnapshot.docs.forEach(rowDoc => {
-          batch.delete(rowDoc.ref);
-        });
-        // 3. Delete the sheet
-        batch.delete(sheetDoc.ref);
-      }
-      
-      // 4. Delete the project
+      // Delete the project
       batch.delete(doc(db, 'projects', projectToDelete.id));
       
       await batch.commit();
@@ -843,9 +828,9 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
             </div>
             <DialogDescription>
               {deleteConfirm?.type === 'bulk' ? (
-                <>Are you sure you want to delete <span className="font-bold text-gray-900 dark:text-white">{deleteConfirm.count}</span> projects? This action is permanent and will delete all associated sheets and forecast data.</>
+                <>Are you sure you want to delete <span className="font-bold text-gray-900 dark:text-white">{deleteConfirm.count}</span> projects? This action is permanent and will delete all associated project data.</>
               ) : (
-                <>Are you sure you want to delete <span className="font-bold text-gray-900 dark:text-white">"{projectToDelete?.projectName}"</span>? This action is permanent and will delete all associated sheets and forecast data.</>
+                <>Are you sure you want to delete <span className="font-bold text-gray-900 dark:text-white">"{projectToDelete?.projectName}"</span>? This action is permanent and will delete all associated project data.</>
               )}
             </DialogDescription>
           </DialogHeader>

@@ -1,6 +1,3 @@
-export type ForecastMethod = 'commitment' | 'time-based';
-export type DistributionMethod = 'manual' | 'even' | 'front' | 'back' | 'bell';
-
 export type ProjectStatus = 'Active' | 'On Hold' | 'Closed' | 'Archived';
 
 export interface ProjectAttributeValue {
@@ -317,44 +314,6 @@ export interface Project {
   firstCostReportingMonth?: string;
   currentReportingMonth?: string;
   lastReportingMonth?: string;
-}
-
-export interface Sheet {
-  id: string;
-  projectId: string;
-  sheetName: string;
-  forecastMethod: ForecastMethod;
-  version: string;
-  lockedStatus: boolean;
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
-  users?: string[]; // UIDs
-}
-
-export interface ForecastRow {
-  id: string;
-  sheetId: string;
-  costCode: string;
-  description: string;
-  vendor: string;
-  qty?: number;
-  rate?: number;
-  budget: number;
-  committedCost: number;
-  actualCostToDate: number;
-  costToGo: number;
-  eac: number;
-  startDate?: string;
-  endDate?: string;
-  timePhasing: Record<string, number>;
-  distributionMethod: DistributionMethod;
-  enterpriseCostCodeAttributes?: Record<string, string>;
-  enterpriseLineItemAttributes?: Record<string, string>;
-  enterpriseSubcontractAttributes?: Record<string, string>;
-  enterpriseChangeAttributes?: Record<string, string>;
-  projectAttributes?: Record<string, string>;
-  attributes?: Record<string, any>; // Keep for backward compatibility if needed
 }
 
 export interface UserProfile {

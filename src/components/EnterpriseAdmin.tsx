@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { db, auth } from '../firebase';
 import { doc, updateDoc, collection, query, where, onSnapshot, deleteDoc, getDocs, addDoc, writeBatch } from 'firebase/firestore';
-import { Enterprise, Project, Sheet, ProjectAttribute, ProjectAttributeValue, SavedView } from '../types';
+import { Enterprise, Project, ProjectAttribute, ProjectAttributeValue, SavedView } from '../types';
 import { Users, Briefcase, Settings, Plus, Trash2, Tag, Search, X, ChevronRight, ChevronDown, UserPlus, ExternalLink, AlertTriangle, Edit2, Download, Upload, Eye, Lock, Unlock, MoreVertical, Bookmark, Filter, Layout, CheckCircle2, PieChart, DollarSign, RefreshCw, Receipt, Calendar, Hash, Menu, ChevronLeft, Building2, ShieldAlert, ShoppingCart, Activity } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
@@ -136,7 +136,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     setExpandedSections(newExpanded);
   };
   const [projects, setProjects] = useState<Project[]>([]);
-  const [sheets, setSheets] = useState<Sheet[]>([]);
   
   // Search and Selection States
   const [userSearch, setUserSearch] = useState('');
@@ -213,7 +212,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   // Table Control States
   const [visibleColumns, setVisibleColumns] = useState<Record<string, string[]>>({
     users: ['photo', 'name', 'email', 'joined', 'access'],
-    projects: ['photo', 'name', 'code', 'created', 'users', 'sheets'],
+    projects: ['photo', 'name', 'code', 'created', 'users'],
     lineItemAttributes: ['id', 'description', 'sortOrder'],
     costCodeAttributes: ['id', 'description', 'sortOrder'],
     projectAttributes: ['id', 'description', 'sortOrder'],
@@ -381,16 +380,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     });
     return () => unsubscribe();
   }, [enterprise.id]);
-
-  useEffect(() => {
-    const q = query(collection(db, 'sheets'));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setSheets(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Sheet)));
-    }, (error) => {
-      console.error("Sheets fetch error:", error);
-    });
-    return () => unsubscribe();
-  }, []);
 
   const bulkDeleteResourceRates = async () => {
     if (!enterprise.id || selectedRateIds.size === 0) return;
@@ -995,8 +984,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       'Project Name': p.projectName,
       'Project Code': p.projectCode,
       'Date Created': p.dateCreated ? new Date(p.dateCreated).toLocaleDateString() : '',
-      'Users Count': Object.keys(p.users || {}).length,
-      'Sheets Count': sheets.filter(s => s.projectId === p.id).length
+      'Users Count': Object.keys(p.users || {}).length
     }));
     const ws = XLSX.utils.json_to_sheet(data);
     const wb = XLSX.utils.book_new();
@@ -1635,8 +1623,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
             attributes: newAttributes,
             dateCreated: new Date().toISOString(),
             dateLastModified: new Date().toISOString(),
-            users: { [auth.currentUser?.uid || '']: 'Project Admin' },
-            sheets: []
+            users: { [auth.currentUser?.uid || '']: 'Project Admin' }
           });
         }
       }
@@ -1696,7 +1683,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
         createdByEmail: user?.email || '',
         modifiedBy: user?.uid || '',
         modifiedByEmail: user?.email || '',
-        sheets: [],
         status: 'Active'
       });
       setIsCreateProjectModalOpen(false);

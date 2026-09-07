@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { User } from 'firebase/auth';
-import { Enterprise, Project, Sheet } from '../types';
+import { Enterprise, Project } from '../types';
 import { Bell, Search, User as UserIcon, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -22,11 +22,7 @@ export default function Header({ user, enterprise }: HeaderProps) {
   const projectMatch = matchPath({ path: '/project/:projectId', end: false }, location.pathname);
   const projectId = projectMatch?.params.projectId;
 
-  const sheetMatch = matchPath({ path: '/project/:projectId/sheet/:sheetId', end: false }, location.pathname);
-  const sheetId = sheetMatch?.params.sheetId;
-
   const [project, setProject] = useState<Project | null>(null);
-  const [sheet, setSheet] = useState<Sheet | null>(null);
 
   useEffect(() => {
     if (!projectId) {
@@ -41,21 +37,7 @@ export default function Header({ user, enterprise }: HeaderProps) {
     return () => unsubscribe();
   }, [projectId]);
 
-  useEffect(() => {
-    if (!sheetId) {
-      setSheet(null);
-      return;
-    }
-    const unsubscribe = onSnapshot(doc(db, 'sheets', sheetId), (snapshot) => {
-      if (snapshot.exists()) {
-        setSheet({ ...snapshot.data() as Sheet, id: snapshot.id });
-      }
-    });
-    return () => unsubscribe();
-  }, [sheetId]);
-
   const isProjectView = location.pathname.startsWith('/project/');
-  const isSheetView = location.pathname.includes('/sheet/');
 
   return (
     <header className="h-16 bg-white dark:bg-[#0A0A0A] border-b border-gray-200 dark:border-white/10 flex items-center justify-between px-6 z-10 transition-colors duration-300">
@@ -83,13 +65,6 @@ export default function Header({ user, enterprise }: HeaderProps) {
             >
               {project.projectName}
             </Button>
-          </>
-        )}
-
-        {isSheetView && sheet && (
-          <>
-            <ChevronRight className="w-3 h-3 text-gray-300 dark:text-gray-600" />
-            <span className="font-medium text-gray-900 dark:text-white px-2">{sheet.sheetName}</span>
           </>
         )}
       </div>

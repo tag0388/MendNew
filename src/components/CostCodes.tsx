@@ -4234,54 +4234,6 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }
   };
 
-  const handleOpenForecast = async (code: CostCode) => {
-    try {
-      const q = query(
-        collection(db, 'sheets'), 
-        where('projectId', '==', project.id),
-        where('sheetName', '==', `Forecast: ${code.code}`)
-      );
-      const snapshot = await getDocs(q);
-      
-      let sheetId = '';
-      if (!snapshot.empty) {
-        sheetId = snapshot.docs[0].id;
-      } else {
-        const newSheet = {
-          projectId: project.id,
-          sheetName: `Forecast: ${code.code}`,
-          forecastMethod: 'time-based',
-          version: '1.0',
-          lockedStatus: false,
-          createdBy: auth.currentUser?.uid || 'system',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        const docRef = await addDoc(collection(db, 'sheets'), newSheet);
-        sheetId = docRef.id;
-        
-        await addDoc(collection(db, `sheets/${sheetId}/rows`), {
-          sheetId,
-          costCode: code.code,
-          description: code.name,
-          vendor: '',
-          budget: code.baselineBudget || 0,
-          committedCost: 0,
-          actualCostToDate: code.actualCostToDate || 0,
-          costToGo: 0,
-          eac: code.baselineBudget || 0,
-          timePhasing: {},
-          distributionMethod: 'even',
-          attributes: {}
-        });
-      }
-      navigate(`/project/${project.id}/sheet/${sheetId}`);
-    } catch (error) {
-      console.error('Error opening forecast sheet:', error);
-      toast.error('Failed to open forecast sheet.');
-    }
-  };
-
   useEffect(() => {
     if (gridApi) {
       gridApi.setGridOption('quickFilterText', quickFilterText);
