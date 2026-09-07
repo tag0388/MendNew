@@ -1,16 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { Project, CostCode, EtcDetail } from '../types';
-import { db, auth, handleFirestoreError, OperationType } from '../firebase';
-import { 
-  doc, 
-  updateDoc, 
-  collection, 
-  query, 
-  where, 
-  getDocs, 
-  writeBatch,
-  addDoc
-} from 'firebase/firestore';
+import { getCurrentUser } from '../lib/currentUser';
+import { fetchMyProjectRole } from '../lib/projects';
+import {
+  generatePeriods, setCurrentPeriod, closeCostPeriod, deletePeriod, fetchPeriods,
+} from '../lib/periods';
 import { Calendar, Save, Calculator, Trash2, Lock, Unlock, Plus, AlertTriangle, RefreshCw } from 'lucide-react';
 import { addMonths, addWeeks, subDays, format, parseISO } from 'date-fns';
 import { toast } from 'sonner';
@@ -47,8 +41,19 @@ const CostReportingPeriod: React.FC<CostReportingPeriodProps> = ({ project }) =>
   const [isRollOverConfirmOpen, setIsRollOverConfirmOpen] = useState(false);
   const [isRollingOver, setIsRollingOver] = useState(false);
 
-  const currentUser = auth.currentUser;
-  const isAdmin = project.users[currentUser?.uid || ''] === 'Project Admin';
+  // Whether to offer the control. The database decides whether the write is
+  // allowed -- close_cost_period() refuses a non-admin regardless.
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    const uid = getCurrentUser()?.uid;
+    if (!uid) return;
+    let active = true;
+    void fetchMyProjectRole(project.id, uid).then(role => {
+      if (active) setIsAdmin(role === 'Project Admin' || role === 'Enterprise System Admin');
+    });
+    return () => { active = false; };
+  }, [project.id]);
+
   const hasClosedPeriods = periods.some(p => p.status === 'closed');
 
   useEffect(() => {
@@ -157,225 +162,31 @@ const CostReportingPeriod: React.FC<CostReportingPeriodProps> = ({ project }) =>
 
     setIsRollingOver(true);
     setIsRollOverConfirmOpen(false);
-    const toastId = toast.loading('Rolling over cost period... This may take a minute.');
+    const toastId = toast.loading('Closing cost period...');
     try {
-      const firstOpenPeriod = openPeriods[0];
-      const nextOpenPeriod = openPeriods[1];
+      // The whole roll-over -- netting accruals off each cost code, freezing
+      // ETC totals, keeping the closing EAC curve, reversing accruals into the
+      // next period and moving the current marker -- runs as one transaction
+      // in close_cost_period(). The Firestore version committed it in chunks
+      // of 450 writes that were not atomic with each other, so a failure
+      // part-way left the project's figures inconsistent.
+      const result = await closeCostPeriod(project.id);
 
-      // 1. Fetch all necessary data
-      toast.loading('Fetching cost data...', { id: toastId });
-      const costCodesSnap = await getDocs(query(collection(db, 'costCodes'), where('projectId', '==', project.id)));
-      
-      if (costCodesSnap.empty) {
-        toast.loading('No cost codes found. Proceeding with period update...', { id: toastId });
-      } else {
-        toast.loading(`Processing ${costCodesSnap.size} cost codes...`, { id: toastId });
-      }
-      
-      const etcDetailsSnap = await getDocs(query(collection(db, 'etcDetails'), where('projectId', '==', project.id)));
-      const costPhasingSnap = await getDocs(query(collection(db, 'costPhasing'), where('projectId', '==', project.id)));
-      const actualCostsSnap = await getDocs(query(collection(db, 'actualCosts'), where('projectId', '==', project.id)));
+      const refreshed = await fetchPeriods(project.id, 'cost');
+      setPeriods(refreshed.map(p => ({
+        id: p.id, name: p.name, startDate: p.startDate, endDate: p.endDate, status: p.status,
+      })));
+      setCurrentPeriodId(refreshed.find(p => p.isCurrent)?.id);
 
-      const costCodes = costCodesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as CostCode));
-      const etcDetails = etcDetailsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as EtcDetail));
-      const allPhasing = costPhasingSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
-      const allActuals = actualCostsSnap.docs.map(doc => doc.data() as any);
-
-      let batch = writeBatch(db);
-      let opCount = 0;
-
-      // Helper to commit and start a new batch if limit reached
-      const checkBatch = async () => {
-        opCount++;
-        if (opCount >= 450) {
-          toast.loading('Saving batch...', { id: toastId });
-          await batch.commit();
-          batch = writeBatch(db);
-          opCount = 0;
-        }
-      };
-
-      if (!costCodesSnap.empty) {
-        // 2. Update Cost Codes
-        toast.loading('Updating cost codes...', { id: toastId });
-        for (const code of costCodes) {
-          const codeActuals = allActuals.filter(a => a.costCodeId === code.id || a.costCodeId === code.code);
-          const codeAccruals = codeActuals.filter(a => a.reportingPeriodId === firstOpenPeriod.id && a.source === 'ACC');
-          
-          // New Actual Cost To Date = Current Total + Reversals (which are -1 * Accruals)
-          const reversalSum = codeAccruals.reduce((sum, a) => sum + (Number(a.cost) || 0) * -1, 0);
-          const newActualCostToDate = (code.actualCostToDate || 0) + reversalSum;
-          
-          // New Actual Cost This Period = Reversals (since next period is now current)
-          const newActualCostThisPeriod = nextOpenPeriod ? reversalSum : 0;
-
-          batch.update(doc(db, 'costCodes', code.id), {
-            approvedBudgetPrevious: code.approvedBudget || 0,
-            approvedBudgetMovement: 0,
-            estimateAtCompletionPrevious: code.estimateAtCompletion || 0,
-            estimateAtCompletionMovement: 0,
-            actualCostToDate: newActualCostToDate,
-            actualCostThisPeriod: newActualCostThisPeriod,
-            updatedAt: new Date().toISOString()
-          });
-          await checkBatch();
-        }
-
-        // 3. Update ETC Details
-        const futurePeriods = periods.slice(periods.findIndex(p => p.id === firstOpenPeriod.id) + 1);
-        for (const etc of etcDetails) {
-          const periodValues = etc.periodValues || {};
-          const qty = futurePeriods.reduce((acc, p) => acc + (Number(periodValues[p.id]) || 0), 0);
-          const totalEtc = qty * (etc.rate || 0);
-
-          batch.update(doc(db, 'etcDetails', etc.id), {
-            totalEtcPrevious: totalEtc,
-            etcMvmt: 0,
-            updatedAt: new Date().toISOString()
-          });
-          await checkBatch();
-        }
-
-        // 4. Store Previous EAC Phasing
-        const currentPeriodIndex = periods.findIndex(p => p.id === firstOpenPeriod.id);
-        for (const code of costCodes) {
-          const codePhasing = allPhasing.filter((p: any) => p.costCodeId === code.code);
-          const eacDoc = codePhasing.find((p: any) => p.type === 'eac');
-          
-          const filteredActuals = allActuals.filter((a: any) => a.costCodeId === code.id || a.costCodeId === code.code);
-          const actualsByPeriod: Record<string, number> = {};
-          filteredActuals.forEach((a: any) => {
-            actualsByPeriod[a.reportingPeriodId] = (actualsByPeriod[a.reportingPeriodId] || 0) + (a.cost || 0);
-          });
-
-          const codeEtcDetails = etcDetails.filter((etc: any) => etc.costCode === code.code);
-          const etcByPeriod: Record<string, number> = {};
-          const futurePeriodIds = periods.slice(currentPeriodIndex + 1).map(p => p.id);
-          codeEtcDetails.forEach((etc: any) => {
-            if (etc.periodValues) {
-              Object.entries(etc.periodValues).forEach(([periodId, value]) => {
-                if (futurePeriodIds.includes(periodId)) {
-                  etcByPeriod[periodId] = (etcByPeriod[periodId] || 0) + (Number(value) || 0) * (etc.rate || 0);
-                }
-              });
-            }
-          });
-
-          const currentEacPhasing = periods.reduce((acc, p, idx) => {
-            const phasingSource = eacDoc?.phasingSource || 'ETC Details';
-            if (phasingSource === 'ETC Details') {
-              if (idx <= currentPeriodIndex) {
-                acc[p.id] = actualsByPeriod[p.id] || 0;
-              } else {
-                acc[p.id] = etcByPeriod[p.id] || 0;
-              }
-            } else {
-              acc[p.id] = eacDoc?.periodValues?.[p.id] || 0;
-            }
-            return acc;
-          }, {} as Record<string, number>);
-
-          // Store as eacPrevious
-          const prevEacDoc = codePhasing.find((p: any) => p.type === 'eacPrevious');
-          const payload = {
-            projectId: project.id,
-            costCodeId: code.code,
-            type: 'eacPrevious',
-            periodValues: currentEacPhasing,
-            updatedAt: new Date().toISOString()
-          };
-
-          if (prevEacDoc) {
-            batch.update(doc(db, 'costPhasing', prevEacDoc.id), payload);
-          } else {
-            batch.set(doc(collection(db, 'costPhasing')), payload);
-          }
-          await checkBatch();
-        }
-
-        // 5. Create Period Snapshot
-        const snapshotData = {
-          projectId: project.id,
-          periodId: firstOpenPeriod.id,
-          periodName: firstOpenPeriod.name,
-          snapshotDate: new Date().toISOString(),
-          costCodes: costCodes.map(c => ({ ...c })),
-          etcDetails: etcDetails.map(e => ({ ...e })),
-          costPhasing: allPhasing.map(p => ({ ...p })),
-          actualCosts: allActuals.map(a => ({ ...a }))
-        };
-
-        batch.set(doc(collection(db, 'periodSnapshots')), snapshotData);
-        await checkBatch();
-
-        // 5.5 Reverse Accruals
-        if (nextOpenPeriod) {
-          const accruals = allActuals.filter((a: any) => 
-            a.reportingPeriodId === firstOpenPeriod.id && 
-            a.source === 'ACC'
-          );
-
-          for (const acc of accruals) {
-            const reversal = {
-              ...acc,
-              cost: (acc.cost || 0) * -1,
-              source: 'REV',
-              reportingPeriodId: nextOpenPeriod.id,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString()
-            };
-            // Ensure we don't carry over the old document ID if it was in the data
-            delete (reversal as any).id;
-            
-            batch.set(doc(collection(db, 'actualCosts')), reversal);
-            await checkBatch();
-          }
-        }
-      }
-
-      // 6. Update Reporting Periods
-      const newPeriods = periods.map(p => 
-        p.id === firstOpenPeriod.id ? { ...p, status: 'closed' as const } : p
+      toast.success(
+        result.nextPeriodName
+          ? `${result.closedPeriodName} closed. Current period is now ${result.nextPeriodName}.`
+          : `${result.closedPeriodName} closed. No more open periods.`,
+        { id: toastId }
       );
-      
-      let newCurrentId: string | undefined = undefined;
-      if (nextOpenPeriod) {
-        newCurrentId = nextOpenPeriod.id;
-      }
-
-      batch.update(doc(db, 'projects', project.id), {
-        reportingPeriods: {
-          baseDate,
-          duration,
-          numberOfPeriods,
-          periods: newPeriods,
-          currentPeriodId: newCurrentId || null
-        }
-      });
-      await checkBatch();
-
-      await batch.commit();
-
-      setPeriods(newPeriods);
-      setCurrentPeriodId(newCurrentId);
-
-      if (nextOpenPeriod) {
-        toast.success(`${firstOpenPeriod.name} closed. Current period is now ${nextOpenPeriod.name}.`, { id: toastId });
-      } else {
-        toast.success(`${firstOpenPeriod.name} closed. No more open periods.`, { id: toastId });
-      }
-      setIsRollOverConfirmOpen(false);
     } catch (error: any) {
       console.error('Error during roll over:', error);
-      // Catch permission errors or other critical Firestore failures for diagnosis
-      const shouldLog = error.code === 'permission-denied' || 
-                        error.code === 'invalid-argument' || 
-                        error.code === 'resource-exhausted' ||
-                        (error.message && error.message.includes('permissions'));
-      if (shouldLog) {
-        handleFirestoreError(error, OperationType.WRITE, 'cost_roll_over');
-      }
-      toast.error(`Failed to roll over period: ${error.message || 'Unknown error'}. Please try again.`, { id: toastId });
+      toast.error(`Failed to close period: ${error?.message || 'Unknown error'}`, { id: toastId });
     } finally {
       setIsRollingOver(false);
     }
@@ -390,18 +201,27 @@ const CostReportingPeriod: React.FC<CostReportingPeriodProps> = ({ project }) =>
   ) => {
     setSaving(true);
     try {
-      await updateDoc(doc(db, 'projects', project.id), {
-        reportingPeriods: {
-          baseDate: updatedBaseDate,
-          duration: updatedDuration,
-          numberOfPeriods: updatedNum,
-          periods: updatedPeriods,
-          currentPeriodId: updatedCurrent
-        }
-      });
+      // Existing period ids are preserved by name, so regenerating the
+      // calendar cannot detach the periodValues maps that key off them.
+      await generatePeriods(
+        project.id,
+        'cost',
+        { baseDate: updatedBaseDate, duration: updatedDuration, numberOfPeriods: updatedNum },
+        updatedPeriods.map(p => ({ name: p.name, startDate: p.startDate, endDate: p.endDate }))
+      );
+
+      const refreshed = await fetchPeriods(project.id, 'cost');
+      setPeriods(refreshed.map(p => ({
+        id: p.id, name: p.name, startDate: p.startDate, endDate: p.endDate, status: p.status,
+      })));
+
+      if (updatedCurrent) {
+        const stillThere = refreshed.find(p => p.id === updatedCurrent);
+        if (stillThere) await setCurrentPeriod(project.id, 'cost', stillThere.id);
+      }
     } catch (error) {
       console.error('Error saving reporting periods:', error);
-      toast.error('Failed to save changes to database.');
+      toast.error(error instanceof Error ? error.message : 'Failed to save changes to database.');
     } finally {
       setSaving(false);
     }

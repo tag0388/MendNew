@@ -198,3 +198,37 @@ export async function reopenPeriod(periodId: string): Promise<void> {
     .eq('id', periodId);
   raise('reopen period', error);
 }
+
+export interface ClosePeriodResult {
+  closedPeriodId: string;
+  closedPeriodName: string;
+  nextPeriodId: string | null;
+  nextPeriodName: string | null;
+}
+
+/**
+ * Closes the earliest open cost period and rolls the project into the next.
+ *
+ * The client used to do this itself in Firestore batches committed in chunks
+ * of 450, which were not atomic with each other -- a failure part-way left
+ * cost codes rolled forward but ETC details not. It is one database function
+ * now, so one transaction: it all lands or none of it does.
+ */
+export async function closeCostPeriod(projectId: string): Promise<ClosePeriodResult> {
+  const { data, error } = await supabase.rpc('close_cost_period', { p_project_id: projectId });
+  raise('close cost period', error);
+  const row = (data as any[])?.[0];
+  return {
+    closedPeriodId: row?.closed_period_id,
+    closedPeriodName: row?.closed_period_name,
+    nextPeriodId: row?.next_period_id ?? null,
+    nextPeriodName: row?.next_period_name ?? null,
+  };
+}
+
+export async function deletePeriod(periodId: string): Promise<void> {
+  // Refused if actuals or baselines still reference it (ON DELETE RESTRICT),
+  // rather than orphaning those rows.
+  const { error } = await supabase.from('reporting_periods').delete().eq('id', periodId);
+  raise('delete period', error);
+}

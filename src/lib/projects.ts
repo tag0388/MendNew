@@ -235,3 +235,38 @@ export async function upsertProjects(
   );
   raise('import projects', error);
 }
+
+/**
+ * The caller's own role on a project, for deciding what the UI offers.
+ *
+ * Authorization is not this value's job -- RLS and close_cost_period() refuse
+ * the write regardless. This only avoids showing a control that would fail.
+ */
+export async function fetchMyProjectRole(
+  projectId: string,
+  userId: string
+): Promise<ProjectRole | 'Enterprise System Admin' | null> {
+  const [memberRes, projectRes] = await Promise.all([
+    supabase
+      .from('project_members')
+      .select('role')
+      .eq('project_id', projectId)
+      .eq('user_id', userId)
+      .maybeSingle(),
+    supabase.from('projects').select('enterprise_id').eq('id', projectId).maybeSingle(),
+  ]);
+  raise('load project role', memberRes.error);
+
+  // An enterprise admin acts as a project admin everywhere in the enterprise.
+  const enterpriseId = (projectRes.data as any)?.enterprise_id;
+  if (enterpriseId) {
+    const { data: em } = await supabase
+      .from('enterprise_members')
+      .select('role')
+      .eq('enterprise_id', enterpriseId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if ((em as any)?.role === 'Enterprise System Admin') return 'Enterprise System Admin';
+  }
+  return ((memberRes.data as any)?.role as ProjectRole) ?? null;
+}
