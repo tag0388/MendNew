@@ -56,14 +56,8 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Test connection
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error("Please check your Firebase configuration.");
-    }
-  }
-}
-testConnection();
+// NOTE: this module is still imported by the components that have not yet
+// been ported off Firestore. Its startup connection probe was removed: it ran
+// on import and blocked for ten seconds against a backend the app no longer
+// uses, delaying every page load. Delete this file once no component imports
+// from it.

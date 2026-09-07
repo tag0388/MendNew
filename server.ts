@@ -6,7 +6,15 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Constructed lazily. The Resend client throws from its constructor when no
+// key is set, and doing that at module load crashed the whole dev server for
+// anyone who had not configured email -- the app would not start at all.
+let resend: Resend | null = null;
+function getResend(): Resend | null {
+  if (!process.env.RESEND_API_KEY) return null;
+  if (!resend) resend = new Resend(process.env.RESEND_API_KEY);
+  return resend;
+}
 
 async function startServer() {
   const app = express();
@@ -22,17 +30,20 @@ async function startServer() {
       return res.status(400).json({ error: "Email is required" });
     }
 
-    if (!process.env.RESEND_API_KEY) {
-      console.error("RESEND_API_KEY is missing from environment variables.");
-      return res.status(500).json({ 
-        error: "Email service is not configured. Please set RESEND_API_KEY." 
+    const client = getResend();
+    if (!client) {
+      // Not fatal: the admin screen still shows the invitation link to copy,
+      // so invitations work without email configured.
+      console.warn("RESEND_API_KEY is not set; skipping invitation email.");
+      return res.status(503).json({
+        error: "Email service is not configured. Copy the invitation link instead.",
       });
     }
 
     try {
       // Note: onboarding@resend.dev only works for the account owner's email 
       // until a custom domain is verified in the Resend dashboard.
-      const { data, error } = await resend.emails.send({
+      const { data, error } = await client.emails.send({
         from: "onboarding@resend.dev",
         to: [email],
         subject: `Invitation: Join ${enterpriseName}`,
