@@ -1,5 +1,6 @@
 import { supabase, fromRow, fromRows, raise } from './supabase';
 import type { Enterprise, Project } from '../types';
+import { hydratePeriods } from './periods';
 
 export type EnterpriseRole = 'Enterprise System Admin' | 'Enterprise User';
 export type ProjectRole = 'Project Admin' | 'Project User';
@@ -101,7 +102,9 @@ export async function fetchProjects(enterpriseId: string): Promise<Project[]> {
     .eq('enterprise_id', enterpriseId)
     .order('project_name');
   raise('load projects', error);
-  return fromRows<Project>(data);
+  // Reporting periods are rows now, but the components still read
+  // project.reportingPeriods.periods, so the shape is rebuilt here.
+  return hydratePeriods(fromRows<Project>(data));
 }
 
 // ------------------------------------------------------------ membership ----

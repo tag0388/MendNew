@@ -1,11 +1,14 @@
 import { supabase, fromRow, fromRows, toRow, raise } from './supabase';
 import type { Project } from '../types';
+import { hydratePeriods } from './periods';
 import type { ProjectRole } from './session';
 
 export async function fetchProject(projectId: string): Promise<Project | null> {
   const { data, error } = await supabase.from('projects').select('*').eq('id', projectId).maybeSingle();
   raise('load project', error);
-  return fromRow<Project>(data);
+  const project = fromRow<Project>(data);
+  if (!project) return null;
+  return (await hydratePeriods([project]))[0];
 }
 
 export async function createProject(
