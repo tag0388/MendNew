@@ -1,0 +1,532 @@
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Regex check for ISO 8601 strings (YYYY-MM-DDTHH:MM:SS.SSSZ)
+    function isValidTimestamp(ts) {
+      return ts is string && ts.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*");
+    }
+
+    function isSystemAdmin() {
+      return isAuthenticated() && 
+             (request.auth.token.email.lower() == "tarek.guindy@gmail.com" || request.auth.token.email.lower() == "tarek_guindy@hotmail.com");
+    }
+
+    function isAdminOfEnterprise(enterpriseId) {
+      return isAuthenticated() && (
+        isSystemAdmin() || 
+        request.auth.uid in get(/databases/$(database)/documents/enterprises/$(enterpriseId)).data.adminUsers
+      );
+    }
+
+    function canAccessProject(projectId) {
+      return isAuthenticated() && (
+        isSystemAdmin() ||
+        request.auth.uid in get(/databases/$(database)/documents/projects/$(projectId)).data.users || 
+        isAdminOfEnterprise(get(/databases/$(database)/documents/projects/$(projectId)).data.enterpriseId)
+      );
+    }
+
+    function isProjectAdmin(projectId) {
+      return isAuthenticated() && (
+        isSystemAdmin() ||
+        isAdminOfEnterprise(get(/databases/$(database)/documents/projects/$(projectId)).data.enterpriseId) ||
+        (request.auth.uid in get(/databases/$(database)/documents/projects/$(projectId)).data.users && 
+         get(/databases/$(database)/documents/projects/$(projectId)).data.users[request.auth.uid] == 'Project Admin')
+      );
+    }
+
+    function canAccessSheet(sheetId) {
+      return canAccessProject(get(/databases/$(database)/documents/sheets/$(sheetId)).data.projectId);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidCostCode(data) {
+      return data.code is string && 
+             data.projectId is string &&
+             (!('name' in data) || (data.name is string && data.name.size() <= 600)) &&
+             (!('eacMethod' in data) || data.eacMethod in ['Manual', 'Change Management', 'ETC Details', 'Sub-Contract Management']) &&
+             (!('sortOrder' in data) || data.sortOrder is number);
+    }
+
+    function isValidEtcDetail(data) {
+      return data.projectId is string &&
+             data.costCode is string &&
+             data.item is string && data.item.size() <= 200 &&
+             data.description is string && data.description.size() <= 1000 &&
+             data.qty is number &&
+             data.rate is number &&
+             data.periodValues is map &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidActualCost(data) {
+      return data.projectId is string &&
+             data.costCodeId is string &&
+             data.cost is number &&
+             data.reportingPeriodId is string &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidBaselineBudget(data) {
+      return data.projectId is string &&
+             data.costCodeId is string &&
+             data.amount is number &&
+             data.reportingPeriodId is string &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidCalendar(data) {
+      return (data.projectId is string || data.enterpriseId is string) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.weekends is list &&
+             data.holidays is list &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidSavedView(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.tableId is string &&
+             data.userId == request.auth.uid &&
+             isValidTimestamp(data.createdAt) &&
+             data.columns is list &&
+             (!('gridState' in data) || data.gridState is list);
+    }
+
+    function isValidChange(data) {
+      return data.projectId is string &&
+             data.changeId is string && data.changeId.size() > 0 && data.changeId.size() <= 20 &&
+             data.description is string &&
+             data.type is string &&
+             data.status in ['Approved', 'Pending', 'Rejected', 'Withdrawn'] &&
+             data.initiator is string && data.initiator.size() <= 50 &&
+             data.reference is string && data.reference.size() <= 50 &&
+             data.budget is number &&
+             data.eac is number &&
+             isValidTimestamp(data.createdAt) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidChangeRecord(data) {
+      return data.projectId is string &&
+             data.changeId is string &&
+             data.costCodeId is string &&
+             data.scope is string && data.scope.size() <= 100 &&
+             data.enterpriseAttributes is map &&
+             data.projectAttributes is map &&
+             data.budgetAmount is number &&
+             data.eacAmount is number &&
+             isValidTimestamp(data.createdAt) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidSubcontract(data) {
+      return data.projectId is string &&
+             data.enterpriseId is string &&
+             data.orderId is string && data.orderId.size() <= 100 &&
+             data.orderName is string &&
+             (!('status' in data) || data.status in ['Active', 'Complete', 'On Hold']) &&
+             (!('paymentType' in data) || data.paymentType in ['LumpSum', 'Schedule of Rates', 'Re-measurable']) &&
+             (!('vendorId' in data) || data.vendorId is string) &&
+             (!('vendorUsers' in data) || data.vendorUsers is list) &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidSubcontractLineItem(data) {
+      return data.subcontractId is string &&
+             data.projectId is string &&
+             data.itemNo is string &&
+             data.description is string &&
+             data.qty is number &&
+             data.rate is number &&
+             data.total is number &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidInvoice(data) {
+      return data.subcontractId is string &&
+             data.projectId is string &&
+             data.invoiceId is string &&
+             data.status in ['Draft', 'Submitted', 'Certified', 'Rejected', 'Paid'] &&
+             data.initiator is string &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidInvoiceItem(data) {
+      return data.invoiceId is string &&
+             data.subcontractItemId is string &&
+             data.itemNo is string &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidRisk(data) {
+      return data.projectId is string &&
+             data.riskId is string && data.riskId.size() > 0 && data.riskId.size() <= 100 &&
+             (!('description' in data) || data.description is string) &&
+             (!('type' in data) || data.type is string) &&
+             (!('status' in data) || data.status in ['Open', 'Mitigated', 'Closed', 'Realized']) &&
+             (!('strategy' in data) || data.strategy in ['Avoid', 'Mitigate', 'Transfer', 'Accept']) &&
+             (!('exposure' in data) || data.exposure is number) &&
+             (!('mitigation' in data) || data.mitigation is number) &&
+             (!('residualExposure' in data) || data.residualExposure is number) &&
+             (!('createdAt' in data) || isValidTimestamp(data.createdAt)) &&
+             (!('updatedAt' in data) || isValidTimestamp(data.updatedAt));
+    }
+
+    function isValidRiskRecord(data) {
+      return data.projectId is string &&
+             data.riskId is string &&
+             (!('costCodeId' in data) || data.costCodeId is string) &&
+             (!('scope' in data) || data.scope is string) &&
+             (!('probability' in data) || data.probability is number) &&
+             (!('impactAmount' in data) || data.impactAmount is number) &&
+             (!('mitigationCost' in data) || data.mitigationCost is number) &&
+             (!('residualProbability' in data) || data.residualProbability is number) &&
+             (!('residualImpactAmount' in data) || data.residualImpactAmount is number) &&
+             (!('createdAt' in data) || isValidTimestamp(data.createdAt)) &&
+             (!('updatedAt' in data) || isValidTimestamp(data.updatedAt));
+    }
+
+    function isValidProcurementStepDefinition(data) {
+      return data.name is string && data.name.size() > 0 &&
+             data.order is number &&
+             (!('projectId' in data) || data.projectId is string) &&
+             (!('enterpriseId' in data) || data.enterpriseId is string) &&
+             (!('isEnterpriseStandard' in data) || data.isEnterpriseStandard is bool);
+    }
+
+    function isValidProcurementItem(data) {
+      return data.projectId is string &&
+             data.packageId is string &&
+             data.description is string &&
+             (!('calendarId' in data) || data.calendarId is string) &&
+             (!('category' in data) || data.category is string) &&
+             data.stepData is map &&
+             (!('enterpriseAttributes' in data) || data.enterpriseAttributes is map) &&
+             (!('projectAttributes' in data) || data.projectAttributes is map) &&
+             (!('status' in data) || data.status in ['Not Started', 'In Progress', 'Issued', 'Completed', 'Delayed']) &&
+             (!('createdAt' in data) || isValidTimestamp(data.createdAt)) &&
+             (!('updatedAt' in data) || isValidTimestamp(data.updatedAt));
+    }
+
+    function isValidProgressPackage(data) {
+      return data.projectId is string &&
+             data.packageId is string && data.packageId.size() <= 20 &&
+             data.description is string &&
+             (!('ruleOfCreditId' in data) || (data.ruleOfCreditId is string && data.ruleOfCreditId.size() <= 128)) &&
+             (!('attributes' in data) || data.attributes is map) &&
+             (!('createdAt' in data) || isValidTimestamp(data.createdAt)) &&
+             (!('updatedAt' in data) || isValidTimestamp(data.updatedAt));
+    }
+
+    function isValidProgressItem(data) {
+      return data.projectId is string &&
+             data.packageId is string &&
+             data.itemId is string &&
+             data.description is string &&
+             (!('totalQty' in data) || data.totalQty is number) &&
+             (!('unit' in data) || data.unit is string) &&
+             (!('phasingMethod' in data) || data.phasingMethod in ['Auto', 'Manual']) &&
+             (!('createdAt' in data) || isValidTimestamp(data.createdAt)) &&
+             (!('updatedAt' in data) || isValidTimestamp(data.updatedAt));
+    }
+
+    function isValidProgressReportingPeriod(data) {
+      return data.projectId is string &&
+             data.periodName is string &&
+             data.startDate is string &&
+             data.endDate is string &&
+             (!('status' in data) || data.status in ['Open', 'Closed']);
+    }
+
+    function isValidProgressAttribute(data) {
+      return data.projectId is string &&
+             data.title is string &&
+             data.type in ['text', 'dropdown', 'date', 'number'];
+    }
+
+    function isValidRuleOfCredit(data) {
+      return data.projectId is string &&
+             data.ruleId is string && data.ruleId.size() <= 20 &&
+             (!('description' in data) || data.description is string) &&
+             (!('packageId' in data) || data.packageId is string) &&
+             (!('userField1' in data) || data.userField1 is string) &&
+             (!('userField2' in data) || data.userField2 is string) &&
+             (!('userField3' in data) || data.userField3 is string) &&
+             (!('userField4' in data) || data.userField4 is string) &&
+             (!('userField5' in data) || data.userField5 is string) &&
+             (!('steps' in data) || data.steps is list) &&
+             (!('createdAt' in data) || isValidTimestamp(data.createdAt));
+    }
+
+    function isValidScheduleItem(data) {
+      return data.projectId is string &&
+             data.activityId is string && data.activityId.size() <= 128 &&
+             data.description is string && data.description.size() <= 2000 &&
+             (!('baselineStartDate' in data) || data.baselineStartDate is string) &&
+             (!('baselineEndDate' in data) || data.baselineEndDate is string) &&
+             (!('currentStartDate' in data) || data.currentStartDate is string) &&
+             (!('currentEndDate' in data) || data.currentEndDate is string) &&
+             (!('plannedStartDate' in data) || data.plannedStartDate is string) &&
+             (!('plannedEndDate' in data) || data.plannedEndDate is string) &&
+             (!('updatedAt' in data) || isValidTimestamp(data.updatedAt)) &&
+             (!('createdAt' in data) || isValidTimestamp(data.createdAt));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /enterprises/{enterpriseId} {
+      allow read: if isAuthenticated() && (request.auth.uid in resource.data.adminUsers || isSystemAdmin());
+      allow create: if isAuthenticated(); 
+      allow update: if isAuthenticated() && isAdminOfEnterprise(enterpriseId);
+      allow delete: if isSystemAdmin();
+    }
+
+    match /projects/{projectId} {
+      allow read: if canAccessProject(projectId);
+      allow create: if isAuthenticated() && isAdminOfEnterprise(request.resource.data.enterpriseId);
+      allow update: if canAccessProject(projectId);
+      allow delete: if isAuthenticated() && isAdminOfEnterprise(resource.data.enterpriseId);
+    }
+
+    match /sheets/{sheetId} {
+      allow read: if canAccessSheet(sheetId);
+      allow create: if isAuthenticated() && canAccessProject(request.resource.data.projectId);
+      allow update: if canAccessSheet(sheetId);
+      allow delete: if isAuthenticated() && canAccessProject(resource.data.projectId);
+
+      match /rows/{rowId} {
+        allow read: if canAccessSheet(sheetId);
+        allow write: if canAccessSheet(sheetId);
+      }
+    }
+
+    match /costCodes/{costCodeId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidCostCode(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidCostCode(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /etcDetails/{etcId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidEtcDetail(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidEtcDetail(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /actualCosts/{actualCostId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if isProjectAdmin(request.resource.data.projectId) && isValidActualCost(request.resource.data);
+      allow update: if isProjectAdmin(resource.data.projectId) && isValidActualCost(request.resource.data);
+      allow delete: if isProjectAdmin(resource.data.projectId);
+    }
+
+    match /baselineBudgets/{baselineBudgetId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if isProjectAdmin(request.resource.data.projectId) && isValidBaselineBudget(request.resource.data);
+      allow update: if isProjectAdmin(resource.data.projectId) && isValidBaselineBudget(request.resource.data);
+      allow delete: if isProjectAdmin(resource.data.projectId);
+    }
+
+    match /costPhasing/{phasingId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId);
+      allow update: if canAccessProject(resource.data.projectId);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /invitations/{invitationId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isAdminOfEnterprise(request.resource.data.enterpriseId);
+      allow update: if isAuthenticated() && 
+                      request.auth.token.email.lower() == resource.data.email.lower() &&
+                      request.resource.data.status == 'accepted' &&
+                      resource.data.status == 'pending';
+    }
+
+    match /auditLogs/{logId} {
+      allow read: if isSystemAdmin();
+      allow create: if isAuthenticated();
+    }
+
+    match /savedViews/{viewId} {
+      allow read, delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated() && isValidSavedView(request.resource.data);
+      allow update: if isAuthenticated() && 
+                      resource.data.userId == request.auth.uid && 
+                      isValidSavedView(request.resource.data);
+    }
+
+    match /calendars/{calendarId} {
+      allow read: if isAuthenticated() && (
+        (resource.data.projectId is string && canAccessProject(resource.data.projectId)) ||
+        (resource.data.enterpriseId is string && isAdminOfEnterprise(resource.data.enterpriseId)) ||
+        isSystemAdmin()
+      );
+      allow create: if isAuthenticated() && (
+        (request.resource.data.projectId is string && canAccessProject(request.resource.data.projectId)) ||
+        (request.resource.data.enterpriseId is string && isAdminOfEnterprise(request.resource.data.enterpriseId))
+      ) && isValidCalendar(request.resource.data);
+      allow update: if isAuthenticated() && (
+        (resource.data.projectId is string && canAccessProject(resource.data.projectId)) ||
+        (resource.data.enterpriseId is string && isAdminOfEnterprise(resource.data.enterpriseId))
+      ) && isValidCalendar(request.resource.data);
+      allow delete: if isAuthenticated() && (
+        (resource.data.projectId is string && canAccessProject(resource.data.projectId)) ||
+        (resource.data.enterpriseId is string && isAdminOfEnterprise(resource.data.enterpriseId))
+      );
+    }
+
+    match /changes/{changeId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidChange(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidChange(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /changeRecords/{recordId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidChangeRecord(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidChangeRecord(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /periodSnapshots/{snapshotId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if isProjectAdmin(request.resource.data.projectId);
+      allow update: if isProjectAdmin(request.resource.data.projectId);
+      allow delete: if isProjectAdmin(request.resource.data.projectId);
+    }
+
+    match /subcontracts/{subcontractId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow read: if isAuthenticated() && request.auth.token.email.lower() in resource.data.vendorUsers;
+      allow create: if isProjectAdmin(request.resource.data.projectId) && isValidSubcontract(request.resource.data);
+      allow update: if isProjectAdmin(request.resource.data.projectId) && isValidSubcontract(request.resource.data);
+      allow delete: if isProjectAdmin(request.resource.data.projectId);
+    }
+
+    match /subcontractLineItems/{itemId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow read: if isAuthenticated() && request.auth.token.email.lower() in get(/databases/$(database)/documents/subcontracts/$(resource.data.subcontractId)).data.vendorUsers;
+      allow create: if isProjectAdmin(request.resource.data.projectId) && isValidSubcontractLineItem(request.resource.data);
+      allow update: if isProjectAdmin(request.resource.data.projectId) && isValidSubcontractLineItem(request.resource.data);
+      allow delete: if isProjectAdmin(request.resource.data.projectId);
+    }
+
+    match /invoices/{invoiceId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow read: if isAuthenticated() && request.auth.token.email.lower() in get(/databases/$(database)/documents/subcontracts/$(resource.data.subcontractId)).data.vendorUsers;
+      allow create: if isAuthenticated() && (
+        isProjectAdmin(request.resource.data.projectId) || 
+        request.auth.token.email.lower() in get(/databases/$(database)/documents/subcontracts/$(request.resource.data.subcontractId)).data.vendorUsers
+      ) && isValidInvoice(request.resource.data);
+      allow update: if isAuthenticated() && (
+        isProjectAdmin(resource.data.projectId) || 
+        (request.auth.token.email.lower() in get(/databases/$(database)/documents/subcontracts/$(resource.data.subcontractId)).data.vendorUsers && 
+         resource.data.status in ['Draft', 'Rejected'])
+      ) && isValidInvoice(request.resource.data);
+      allow delete: if isAuthenticated() && (
+        isProjectAdmin(resource.data.projectId) || 
+        (request.auth.token.email.lower() in get(/databases/$(database)/documents/subcontracts/$(resource.data.subcontractId)).data.vendorUsers && 
+         resource.data.status == 'Draft')
+      );
+    }
+
+    match /invoiceItems/{itemId} {
+      allow read: if isAuthenticated() && (
+        canAccessProject(get(/databases/$(database)/documents/invoices/$(resource.data.invoiceId)).data.projectId)
+      );
+      allow read: if isAuthenticated() && (
+        request.auth.token.email.lower() in get(/databases/$(database)/documents/subcontracts/$(get(/databases/$(database)/documents/invoices/$(resource.data.invoiceId)).data.subcontractId)).data.vendorUsers
+      );
+      allow write: if isAuthenticated() && (
+        isProjectAdmin(get(/databases/$(database)/documents/invoices/$(request.resource.data.invoiceId)).data.projectId) || 
+        request.auth.token.email.lower() in get(/databases/$(database)/documents/subcontracts/$(get(/databases/$(database)/documents/invoices/$(request.resource.data.invoiceId)).data.subcontractId)).data.vendorUsers
+      ) && isValidInvoiceItem(request.resource.data);
+    }
+
+    match /risks/{riskId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidRisk(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidRisk(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /riskRecords/{recordId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidRiskRecord(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidRiskRecord(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /procurementStepDefinitions/{stepId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidProcurementStepDefinition(request.resource.data);
+      allow update: if isAuthenticated() && isValidProcurementStepDefinition(request.resource.data);
+      allow delete: if isAuthenticated();
+    }
+
+    match /procurementItems/{itemId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidProcurementItem(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidProcurementItem(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /progressPackages/{packageId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidProgressPackage(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidProgressPackage(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /progressItems/{itemId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidProgressItem(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidProgressItem(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /progressReportingPeriods/{periodId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidProgressReportingPeriod(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidProgressReportingPeriod(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /progressAttributes/{attrId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidProgressAttribute(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidProgressAttribute(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /rulesOfCredit/{ruleId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidRuleOfCredit(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidRuleOfCredit(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+
+    match /scheduleItems/{itemId} {
+      allow read: if canAccessProject(resource.data.projectId);
+      allow create: if canAccessProject(request.resource.data.projectId) && isValidScheduleItem(request.resource.data);
+      allow update: if canAccessProject(resource.data.projectId) && isValidScheduleItem(request.resource.data);
+      allow delete: if canAccessProject(resource.data.projectId);
+    }
+  }
+}

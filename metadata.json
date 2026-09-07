@@ -1,0 +1,6 @@
+{
+  "name": "Mend",
+  "description": "Construction Month-End (Mend) reporting and performance tracking platform for cost, schedule, risk, and procurement.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
