@@ -183,20 +183,6 @@ create trigger resource_rates_set_updated_at
   before update on resource_rates
   for each row execute function set_updated_at();
 
-create table cost_elements (
-  id            uuid primary key default gen_random_uuid(),
-  enterprise_id uuid not null references enterprises(id) on delete cascade,
-  description   text not null,
-  sort_code     text not null,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  unique (enterprise_id, sort_code)
-);
-
-create trigger cost_elements_set_updated_at
-  before update on cost_elements
-  for each row execute function set_updated_at();
-
 create table vendors (
   id            uuid primary key default gen_random_uuid(),
   enterprise_id uuid not null references enterprises(id) on delete cascade,
@@ -284,22 +270,6 @@ create table project_members (
 );
 
 create index project_members_user_idx on project_members (user_id);
-
--- Project-level cost elements (may point back at an enterprise standard).
-create table project_cost_elements (
-  id                       uuid primary key default gen_random_uuid(),
-  project_id               uuid not null references projects(id) on delete cascade,
-  description              text not null,
-  sort_code                text not null,
-  enterprise_cost_element_id uuid references cost_elements(id) on delete set null,
-  created_at               timestamptz not null default now(),
-  updated_at               timestamptz not null default now(),
-  unique (project_id, sort_code)
-);
-
-create trigger project_cost_elements_set_updated_at
-  before update on project_cost_elements
-  for each row execute function set_updated_at();
 
 create table project_resource_rates (
   id                   uuid primary key default gen_random_uuid(),

@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Mend Cost Management -- Cost domain
--- Cost codes, ETC details, actuals, baselines, time-phasing, period snapshots
+-- Cost codes, ETC details, actuals, baselines, time-phasing
 -- ============================================================================
 
 create type cost_phasing_type as enum ('budget','baseline','approved','eac','eacPrevious');
@@ -184,22 +184,3 @@ create index cost_phasing_project_idx on cost_phasing (project_id, type);
 create trigger cost_phasing_set_updated_at
   before update on cost_phasing
   for each row execute function set_updated_at();
-
--- ------------------------------------------------------ period snapshots ----
--- Immutable archive written at period close. Deliberately JSONB: it is a frozen
--- copy of the whole cost picture, never queried field-by-field.
-
-create table period_snapshots (
-  id                  uuid primary key default gen_random_uuid(),
-  project_id          uuid not null references projects(id) on delete cascade,
-  reporting_period_id uuid not null references reporting_periods(id) on delete restrict,
-  period_name         text not null,
-  snapshot_date       timestamptz not null default now(),
-  cost_codes    jsonb not null default '[]'::jsonb,
-  etc_details   jsonb not null default '[]'::jsonb,
-  cost_phasing  jsonb not null default '[]'::jsonb,
-  actual_costs  jsonb not null default '[]'::jsonb,
-  created_by    uuid references auth.users(id)
-);
-
-create index period_snapshots_project_idx on period_snapshots (project_id, snapshot_date desc);
