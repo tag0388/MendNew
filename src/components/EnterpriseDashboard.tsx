@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { db } from '../firebase';
-import { collection, query, where, onSnapshot, addDoc, deleteDoc, doc, getDocs, writeBatch, updateDoc } from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  createProject, deleteProjects, updateProject, upsertProjects,
+  fetchProjectCostTotals, type ProjectCostTotals,
+} from '../lib/projects';
+import { fetchProjects } from '../lib/session';
 import { Enterprise, Project } from '../types';
 import { Plus, Briefcase, AlertTriangle, ArrowUpRight, Trash2, ArrowUp, ArrowDown, Maximize2, Minimize2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -24,9 +28,10 @@ interface EnterpriseDashboardProps {
   enterprise: Enterprise | null;
   userId: string;
   isSystemOwner: boolean;
+  enterpriseRole?: 'Enterprise System Admin' | 'Enterprise User';
 }
 
-export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner }: EnterpriseDashboardProps) {
+export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner, enterpriseRole }: EnterpriseDashboardProps) {
   const navigate = useNavigate();
   const [projects, setProjects] = useState<Project[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -60,26 +65,34 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
 
   const codeExists = !isSubmitting && projects.some(p => p.projectCode === newProject.code);
 
-  const isEnterpriseAdmin = isSystemOwner || enterprise?.users?.[userId]?.role === 'Enterprise System Admin' || enterprise?.adminUsers.includes(userId);
+  // Role comes from enterprise_members via the session, not from a map on the
+  // enterprise document.
+  const isEnterpriseAdmin = isSystemOwner || enterpriseRole === 'Enterprise System Admin';
 
+  // RLS decides which projects come back: an enterprise admin gets all of the
+  // enterprise's, a normal user only those they are a member of. The old
+  // client-side filter is gone -- a user's own browser was deciding what they
+  // were allowed to see.
   useEffect(() => {
     if (!enterprise) return;
+    let active = true;
 
-    const q = query(collection(db, 'projects'), where('enterpriseId', '==', enterprise.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const allProjects = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Project));
-      
-      // Filter projects if not enterprise admin
-      const filtered = isEnterpriseAdmin 
-        ? allProjects 
-        : allProjects.filter(p => p.users && p.users[userId]);
-        
-      setProjects(filtered);
-    }, (error) => {
-      console.error("Projects fetch error:", error);
-    });
-    return () => unsubscribe();
-  }, [enterprise, isEnterpriseAdmin, userId]);
+    const load = async () => {
+      try {
+        const rows = await fetchProjects(enterprise.id);
+        if (active) setProjects(rows);
+      } catch (error) {
+        console.error('Projects fetch error:', error);
+      }
+    };
+
+    void load();
+    const unsubscribe = subscribeToTable('projects', `enterprise_id=eq.${enterprise.id}`, () => void load());
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [enterprise]);
 
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -92,27 +105,18 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
 
     try {
       setIsSubmitting(true);
-      const now = new Date().toISOString();
-      const finalName = newProject.name.trim() || 'Project Name';
-      await addDoc(collection(db, 'projects'), {
-        enterpriseId: enterprise.id,
-        projectName: finalName,
+      // The creator is made Project Admin by a database trigger, so the client
+      // no longer asserts its own role. (project_code) is unique per
+      // enterprise, so a duplicate is refused by the database as well.
+      await createProject(enterprise.id, {
+        projectName: newProject.name.trim() || 'Project Name',
         projectCode: newProject.code,
-        projectBudget: 0,
-        startDate: now.split('T')[0],
-        endDate: now.split('T')[0],
-        cutoffDate: now.split('T')[0],
-        users: { [userId]: 'Project Admin' },
-        dateCreated: now,
-        dateLastModified: now,
-        firstCostReportingMonth: '',
-        currentReportingMonth: '',
-        lastReportingMonth: ''
       });
       setIsModalOpen(false);
       setNewProject({ name: '', code: '' });
     } catch (error) {
       console.error('Failed to create project', error);
+      alert(error instanceof Error ? error.message : 'Failed to create project.');
     } finally {
       setIsSubmitting(false);
     }
@@ -122,12 +126,9 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
     if (!projectToDelete) return;
     setIsDeleting(true);
     try {
-      const batch = writeBatch(db);
-      
-      // Delete the project
-      batch.delete(doc(db, 'projects', projectToDelete.id));
-      
-      await batch.commit();
+      // Cost codes, subcontracts, changes, risks and progress all cascade from
+      // the project, so this is one statement.
+      await deleteProjects([projectToDelete.id]);
       setProjectToDelete(null);
     } catch (error) {
       console.error('Failed to delete project', error);
@@ -141,11 +142,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
     if (!deleteConfirm) return;
     try {
       if (deleteConfirm.type === 'bulk') {
-        const batch = writeBatch(db);
-        selectedIds.forEach(id => {
-          batch.delete(doc(db, 'projects', id));
-        });
-        await batch.commit();
+        await deleteProjects(Array.from(selectedIds));
         toast.success(`Deleted ${selectedIds.size} projects.`);
       }
       setSelectedIds(new Set());
@@ -158,16 +155,14 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
 
   const handleBulkUpdate = async () => {
     try {
-      const batch = writeBatch(db);
-      selectedIds.forEach(id => {
-        const updateObj: any = { dateLastModified: new Date().toISOString() };
-        const p = projects.find(p => p.id === id);
-        if (p) {
-          updateObj.attributes = { ...(p.attributes || {}), ...bulkUpdateData.attributes };
-        }
-        batch.update(doc(db, 'projects', id), updateObj);
-      });
-      await batch.commit();
+      await Promise.all(
+        Array.from(selectedIds).map((id) => {
+          const p = projects.find((x) => x.id === id);
+          return updateProject(id, {
+            attributes: { ...(p?.attributes || {}), ...bulkUpdateData.attributes },
+          });
+        })
+      );
       toast.success(`Updated ${selectedIds.size} projects.`);
       setIsBulkUpdating(false);
       setSelectedIds(new Set());
@@ -242,10 +237,6 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
             return;
           }
 
-          let duplicateCount = 0;
-          let addedCount = 0;
-          const batch = writeBatch(db);
-
           const enterpriseAttributesMap = new Map();
           (enterprise?.projectAttributes || []).forEach(attr => {
              if (attr.title) {
@@ -253,10 +244,11 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
              }
           });
 
+          const toUpsert: Array<{ projectCode: string; projectName: string; attributes: Record<string, string> }> = [];
+
           rows.forEach((row: any) => {
             const projectCode = row['Project ID'] || row['projectCode'];
             const projectName = row['Project Name'] || row['projectName'];
-
             if (!projectCode || !projectName) return;
 
             const attributes: Record<string, string> = {};
@@ -264,50 +256,29 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
                const attr = enterpriseAttributesMap.get(key.toLowerCase());
                if (attr) {
                  const rawVal = String(row[key]);
-                 let finalVal = rawVal;
-                 if (rawVal.includes(' | ')) {
-                   finalVal = rawVal.split(' | ')[0].trim();
-                 }
-                 attributes[attr.id] = finalVal;
+                 attributes[attr.id] = rawVal.includes(' | ') ? rawVal.split(' | ')[0].trim() : rawVal;
                }
             });
 
-            // If it exists, only update Name and attributes
-            const existingProject = projects.find(p => p.projectCode === projectCode);
-            if (existingProject) {
-              const ref = doc(db, 'projects', existingProject.id);
-              batch.update(ref, {
-                projectName: String(projectName),
-                attributes: { ...(existingProject.attributes || {}), ...attributes },
-                dateLastModified: new Date().toISOString()
-              });
-              duplicateCount++; // Tracking as updated duplicate
-              return;
-            }
-
-            const newProjectData: any = {
-              enterpriseId: enterprise?.id || '',
+            // Existing rows keep the attributes they already had.
+            const existing = projects.find(p => p.projectCode === String(projectCode));
+            toUpsert.push({
               projectCode: String(projectCode),
               projectName: String(projectName),
-              projectBudget: 0,
-              startDate: new Date().toISOString(),
-              endDate: new Date().toISOString(),
-              cutoffDate: new Date().toISOString(),
-              users: {},
-              attributes,
-              dateCreated: new Date().toISOString(),
-              dateLastModified: new Date().toISOString()
-            };
-
-            const ref = doc(collection(db, 'projects'));
-            batch.set(ref, newProjectData);
-            addedCount++;
+              attributes: { ...(existing?.attributes || {}), ...attributes },
+            });
           });
 
-          if (addedCount > 0 || duplicateCount > 0) {
-            await batch.commit();
-            if (addedCount > 0) toast.success(`Imported ${addedCount} new projects.`);
-            if (duplicateCount > 0) toast.success(`Updated ${duplicateCount} existing projects.`);
+          if (toUpsert.length > 0 && enterprise) {
+            const existingCodes = new Set(projects.map(p => p.projectCode));
+            const added = toUpsert.filter(r => !existingCodes.has(r.projectCode)).length;
+            const updated = toUpsert.length - added;
+            // One upsert keyed on (enterprise_id, project_code) -- the unique
+            // constraint decides insert vs update, so a code cannot be
+            // duplicated by two imports racing.
+            await upsertProjects(enterprise.id, toUpsert);
+            if (added > 0) toast.success(`Imported ${added} new projects.`);
+            if (updated > 0) toast.success(`Updated ${updated} existing projects.`);
           }
         } catch (err) {
           console.error("Import error:", err);
@@ -321,72 +292,47 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
 
   const handleUpdateField = async (id: string, field: string, value: any) => {
     try {
-      await updateDoc(doc(db, 'projects', id), {
-        [field]: value,
-        dateLastModified: new Date().toISOString()
-      });
+      await updateProject(id, { [field]: value } as any);
     } catch (e) {
       console.error(e);
     }
   };
 
-  const [costAggregations, setCostAggregations] = useState<Record<string, any>>({});
+  const [costAggregations, setCostAggregations] = useState<Record<string, ProjectCostTotals>>({});
 
+  // Firestore had to download every cost code and sum it in the browser, in
+  // chunks of ten because `in` accepted at most ten values. This is one
+  // grouped aggregate on the server.
   useEffect(() => {
     if (projects.length === 0) {
       setCostAggregations({});
       return;
     }
+    let active = true;
+    const ids = projects.map(p => p.id);
 
-    const unsubscribes: (() => void)[] = [];
-    
-    // Firestore 'in' query supports max 10 values
-    const chunkArray = (arr: any[], size: number) => 
-      Array.from({ length: Math.ceil(arr.length / size) }, (v, i) => arr.slice(i * size, i * size + size));
-      
-    const projectChunks = chunkArray(projects.map(p => p.id), 10);
+    const load = async () => {
+      try {
+        const totals = await fetchProjectCostTotals(ids);
+        if (active) setCostAggregations(totals);
+      } catch (error) {
+        console.error('Cost totals fetch error:', error);
+      }
+    };
 
-    projectChunks.forEach(chunk => {
-      const q = query(collection(db, 'costCodes'), where('projectId', 'in', chunk));
-      const unsubscribe = onSnapshot(q, (snapshot) => {
-        const aggs: Record<string, any> = {};
-        chunk.forEach(id => {
-          aggs[id] = {
-            baselineBudget: 0,
-            budgetChanges: 0,
-            approvedBudget: 0,
-            actualCost: 0,
-            etc: 0,
-            eac: 0
-          };
-        });
-
-        snapshot.forEach(doc => {
-          const data = doc.data();
-          const pId = data.projectId;
-          if (pId && aggs[pId]) {
-            aggs[pId].baselineBudget += (data.baselineBudget || 0);
-            aggs[pId].budgetChanges += (data.budgetChanges || 0);
-            aggs[pId].approvedBudget += (data.approvedBudget || 0);
-            aggs[pId].actualCost += (data.actualCostToDate || 0);
-            aggs[pId].etc += (data.estimateToComplete || 0);
-            aggs[pId].eac += (data.estimateAtCompletion || 0);
-          }
-        });
-
-        setCostAggregations(prev => ({ ...prev, ...aggs }));
-      });
-      unsubscribes.push(unsubscribe);
-    });
-
-    return () => unsubscribes.forEach(unsub => unsub());
+    void load();
+    const unsubscribe = subscribeToTable('cost_codes', undefined, () => void load());
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [projects]);
 
   const projectColumnDefs = useMemo(() => {
-    const canEdit = (data: any) => {
-      if (!data) return false;
-      return isEnterpriseAdmin || (data.users && data.users[userId] === 'Project Admin');
-    };
+    // Project-level editing is gated by RLS; the grid only needs to know
+    // whether to offer the control. Enterprise admins always may; a project
+    // admin's own writes are accepted, a plain member's are refused.
+    const canEdit = (data: any) => Boolean(data) && isEnterpriseAdmin;
 
     const baseColumns = [
       {
@@ -672,7 +618,8 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner 
     let totalEac = 0;
 
     projects.forEach(p => {
-      const aggs = costAggregations[p.id] || {};
+      const aggs = costAggregations[p.id];
+      if (!aggs) return;
       totalBaseline += (aggs.baselineBudget || 0);
       totalChanges += (aggs.budgetChanges || 0);
       totalApproved += (aggs.approvedBudget || 0);

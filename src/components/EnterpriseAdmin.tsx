@@ -1,6 +1,23 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { db, auth } from '../firebase';
-import { doc, updateDoc, collection, query, where, onSnapshot, deleteDoc, getDocs, addDoc, writeBatch } from 'firebase/firestore';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { subscribeToTable } from '../lib/supabase';
+import { getCurrentUser } from '../lib/currentUser';
+import { fetchSavedViews, createSavedView, deleteSavedView } from '../lib/savedViews';
+import {
+  updateAttributeSet, updateEnterpriseProfile,
+  upsertVendor, deleteVendors as deleteVendorRows,
+  upsertResourceRate, deleteResourceRates,
+  type AttributeSet,
+} from '../lib/enterpriseSettings';
+import {
+  fetchEnterpriseUsers, setEnterpriseRole, removeEnterpriseUser,
+  createInvitation, type EnterpriseUser,
+} from '../lib/session';
+import {
+  createProject, deleteProjects, updateProject, upsertProjects,
+  assignProjectMember, removeProjectMember, fetchProjectMembers,
+  type ProjectMember,
+} from '../lib/projects';
+import { fetchProjects } from '../lib/session';
 import { Enterprise, Project, ProjectAttribute, ProjectAttributeValue, SavedView } from '../types';
 import { Users, Briefcase, Settings, Plus, Trash2, Tag, Search, X, ChevronRight, ChevronDown, UserPlus, ExternalLink, AlertTriangle, Edit2, Download, Upload, Eye, Lock, Unlock, MoreVertical, Bookmark, Filter, Layout, CheckCircle2, PieChart, DollarSign, RefreshCw, Receipt, Calendar, Hash, Menu, ChevronLeft, Building2, ShieldAlert, ShoppingCart, Activity } from 'lucide-react';
 import * as XLSX from 'xlsx';
@@ -161,6 +178,9 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'user' | 'bulk-user' | 'project' | 'bulk-project' | 'bulk-attr-value' | 'rate' | 'bulk-rate' | 'costElement' | 'bulk-costElement' | 'vendor' | 'bulk-vendor', id?: string, name?: string, count?: number } | null>(null);
   const [inviteModal, setInviteModal] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
+  // The inviter chooses the role; accept_invitation() grants exactly this and
+  // nothing more.
+  const [inviteRole, setInviteRole] = useState<'Enterprise System Admin' | 'Enterprise User'>('Enterprise User');
   const [isInviting, setIsInviting] = useState(false);
   const [generatedLink, setGeneratedLink] = useState<string | null>(null);
 
@@ -275,26 +295,29 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     }
   };
 
+  const currentUserId = getCurrentUser()?.uid ?? null;
+
+  const reloadSavedViews = useCallback(async () => {
+    if (!currentUserId) return;
+    try {
+      setSavedViews((await fetchSavedViews(currentUserId)) as any);
+    } catch (error) {
+      console.error('Saved views fetch error:', error);
+    }
+  }, [currentUserId]);
+
   useEffect(() => {
-    if (!auth.currentUser) return;
-    const q = query(collection(db, 'savedViews'), where('userId', '==', auth.currentUser.uid));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const views = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as SavedView));
-      setSavedViews(views);
-    }, (error) => {
-      console.error("Saved views fetch error:", error);
-    });
-    return () => unsubscribe();
-  }, [auth.currentUser?.uid]);
+    void reloadSavedViews();
+  }, [reloadSavedViews]);
 
   const saveView = async (tableId: string, name: string) => {
-    if (!name.trim() || !auth.currentUser) return;
+    if (!name.trim() || !currentUserId) return;
     try {
       const newView: Omit<SavedView, 'id'> = {
         name,
         tableId,
         columns: visibleColumns[tableId],
-        userId: auth.currentUser.uid,
+        userId: currentUserId,
         createdAt: new Date().toISOString(),
         config: {
           isFrozen: isFrozen[tableId],
@@ -305,7 +328,15 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
           columnFilters: columnFilters[tableId]
         }
       } as any;
-      await addDoc(collection(db, 'savedViews'), newView);
+      // The grid's own layout state (frozen columns, sort, filters) goes into
+      // the grid_state JSONB column.
+      await createSavedView(currentUserId, {
+        name,
+        tableId,
+        columns: visibleColumns[tableId],
+        gridState: (newView as any).config,
+      });
+      await reloadSavedViews();
       setNewViewName('');
       setIsSavedViewMenuOpen(null);
     } catch (error) {
@@ -320,8 +351,8 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       [view.tableId]: view.columns
     }));
     
-    if ((view as any).config) {
-      const config = (view as any).config;
+    const config = (view as any).gridState ?? (view as any).config;
+    if (config) {
       setIsFrozen(prev => ({ ...prev, [view.tableId]: config.isFrozen }));
       setColumnFilters(prev => ({ ...prev, [view.tableId]: config.columnFilters }));
       
@@ -337,15 +368,15 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
 
   const deleteView = async (viewId: string) => {
     try {
-      await deleteDoc(doc(db, 'savedViews', viewId));
+      await deleteSavedView(viewId);
+      await reloadSavedViews();
     } catch (error) {
       console.error('Failed to delete view', error);
     }
   };
 
   const getAttributes = (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress') => {
-    const field = type === 'project' ? 'projectAttributes' : type === 'costCode' ? 'costCodeAttributes' : type === 'subcontract' ? 'subcontractAttributes' : type === 'procurement' ? 'procurementAttributes' : type === 'change' ? 'changeAttributes' : type === 'risk' ? 'riskAttributes' : type === 'progress' ? 'progressAttributes' : 'lineItemAttributes';
-    const attrs = (enterprise as any)[field] || [];
+    const attrs = (enterprise as any)[attributeSetFor(type)] || [];
     
     // Legacy check: if it's an array of strings, convert to new structure
     if (attrs.length > 0 && typeof attrs[0] === 'string') {
@@ -371,21 +402,64 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const resourceIdExists = !isSubmitting && !isEditingResource?.id && (enterprise.resourceRates || []).some(r => r.id === resourceFormData.id);
   const valueIdExists = !isSubmitting && !isEditingValue?.valueId && isEditingValue && (getAttributes(isEditingValue.type).find(a => a.id === isEditingValue.attrId)?.values || []).some(v => v.id === valueFormData.id);
 
-  useEffect(() => {
-    const q = query(collection(db, 'projects'), where('enterpriseId', '==', enterprise.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setProjects(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Project)));
-    }, (error) => {
-      console.error("Projects fetch error:", error);
-    });
-    return () => unsubscribe();
+  const reloadProjects = useCallback(async () => {
+    try {
+      setProjects(await fetchProjects(enterprise.id));
+    } catch (error) {
+      console.error('Projects fetch error:', error);
+    }
   }, [enterprise.id]);
+
+  useEffect(() => {
+    void reloadProjects();
+    return subscribeToTable('projects', `enterprise_id=eq.${enterprise.id}`, () => void reloadProjects());
+  }, [reloadProjects, enterprise.id]);
+
+  // Enterprise users come from enterprise_members joined to user_profiles,
+  // replacing the users map that used to hang off the enterprise document.
+  const [enterpriseUsers, setEnterpriseUsers] = useState<EnterpriseUser[]>([]);
+
+  const reloadUsers = useCallback(async () => {
+    try {
+      setEnterpriseUsers(await fetchEnterpriseUsers(enterprise.id));
+    } catch (error) {
+      console.error('Enterprise users fetch error:', error);
+    }
+  }, [enterprise.id]);
+
+  useEffect(() => {
+    void reloadUsers();
+    return subscribeToTable('enterprise_members', `enterprise_id=eq.${enterprise.id}`, () => void reloadUsers());
+  }, [reloadUsers, enterprise.id]);
+
+  // Project assignments, loaded per project rather than read from a users map
+  // embedded in the project document.
+  const [projectMembers, setProjectMembers] = useState<Record<string, ProjectMember[]>>({});
+
+  const reloadProjectMembers = useCallback(async (projectId: string) => {
+    try {
+      const members = await fetchProjectMembers(projectId);
+      setProjectMembers(prev => ({ ...prev, [projectId]: members }));
+    } catch (error) {
+      console.error('Project members fetch error:', error);
+    }
+  }, []);
+
+  const roleInProject = (projectId: string, uid: string): 'Project Admin' | 'Project User' | undefined =>
+    projectMembers[projectId]?.find(m => m.userId === uid)?.role;
+
+  // The access matrix shows one user against every project, or one project
+  // against every user, so both panes need the assignments loaded.
+  useEffect(() => {
+    if (!selectedUserId && !selectedProjectId) return;
+    const ids = selectedProjectId ? [selectedProjectId] : projects.map(p => p.id);
+    void Promise.all(ids.map(id => reloadProjectMembers(id)));
+  }, [selectedUserId, selectedProjectId, projects, reloadProjectMembers]);
 
   const bulkDeleteResourceRates = async () => {
     if (!enterprise.id || selectedRateIds.size === 0) return;
     try {
-      const newRates = (enterprise.resourceRates || []).filter(r => !selectedRateIds.has(r.id));
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { resourceRates: newRates });
+      await deleteResourceRates(Array.from(selectedRateIds));
       setSelectedRateIds(new Set());
       setDeleteConfirm(null);
     } catch (error) {
@@ -410,18 +484,13 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
 
     setIsSubmitting(true);
     try {
-      const currentVendors = enterprise.vendors || [];
-      const updatedVendorId = isEditingVendor?.id;
-      
-      let newVendors;
-      if (updatedVendorId) {
-        // When editing, preserve the original ID but update other fields
-        newVendors = currentVendors.map(v => v.id === updatedVendorId ? { ...vendorFormData } : v);
-      } else {
-        // When adding new, use the inputed ID
-        newVendors = [...currentVendors, { ...vendorFormData }];
-      }
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { vendors: newVendors });
+      // One row written, rather than rewriting the whole vendor array from
+      // local state -- two admins editing different vendors no longer clobber
+      // each other.
+      await upsertVendor(enterprise.id, {
+        ...vendorFormData,
+        id: isEditingVendor?.id,
+      } as any);
       setIsEditingVendor(null);
       setVendorFormData({ id: '', name: '', code: '', contactEmail: '', contactName: '' });
     } catch (error) {
@@ -435,8 +504,9 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const deleteVendor = async (id: string) => {
     if (!enterprise.id) return;
     try {
-      const newVendors = (enterprise.vendors || []).filter(v => v.id !== id);
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { vendors: newVendors });
+      // Subcontracts and invoices reference vendors with ON DELETE RESTRICT,
+      // so a vendor still in use is refused rather than orphaning its history.
+      await deleteVendorRows([id]);
       setDeleteConfirm(null);
     } catch (error) {
       console.error('Delete vendor failed', error);
@@ -447,8 +517,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const bulkDeleteVendors = async () => {
     if (!enterprise.id || selectedVendorIds.size === 0) return;
     try {
-      const newVendors = (enterprise.vendors || []).filter(v => !selectedVendorIds.has(v.id));
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { vendors: newVendors });
+      await deleteVendorRows(Array.from(selectedVendorIds));
       setSelectedVendorIds(new Set());
       setDeleteConfirm(null);
     } catch (error) {
@@ -458,20 +527,19 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   };
 
   const toggleUserRole = async (uid: string) => {
-    const user = enterprise.users?.[uid];
+    const user = enterpriseUsers.find(u => u.userId === uid);
     if (!user) return;
     const newRole = user.role === 'Enterprise System Admin' ? 'Enterprise User' : 'Enterprise System Admin';
-    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-      [`users.${uid}.role`]: newRole
-    });
+    await setEnterpriseRole(enterprise.id, uid, newRole);
+    await reloadUsers();
   };
 
   const deleteUser = async (uid: string) => {
-    const newUsers = { ...enterprise.users };
-    delete newUsers[uid];
-    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-      users: newUsers
-    });
+    // project_members and cost_code_users cascade from the membership row, so
+    // removing someone here also drops every project and cost code they held
+    // in this enterprise.
+    await removeEnterpriseUser(enterprise.id, uid);
+    await reloadUsers();
     setDeleteConfirm(null);
     if (selectedUserId === uid) setSelectedUserId(null);
   };
@@ -479,13 +547,10 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const bulkDeleteUsers = async () => {
     if (!enterprise.id || selectedUserIds.size === 0) return;
     try {
-      const newUsers = { ...enterprise.users };
-      selectedUserIds.forEach(uid => {
-        delete newUsers[uid];
-      });
-      await updateDoc(doc(db, 'enterprises', enterprise.id), {
-        users: newUsers
-      });
+      await Promise.all(
+        Array.from(selectedUserIds).map(uid => removeEnterpriseUser(enterprise.id, uid))
+      );
+      await reloadUsers();
       setSelectedUserIds(new Set());
       setDeleteConfirm(null);
       if (selectedUserId && selectedUserIds.has(selectedUserId)) setSelectedUserId(null);
@@ -496,7 +561,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   };
 
   const deleteProject = async (projectId: string) => {
-    await deleteDoc(doc(db, 'projects', projectId));
+    await deleteProjects([projectId]);
     setDeleteConfirm(null);
     if (selectedProjectId === projectId) setSelectedProjectId(null);
     const newSelected = new Set(selectedProjectIds);
@@ -512,10 +577,10 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   };
 
   const filteredUsers = useMemo(() => {
-    let result = Object.entries(enterprise.users || {})
-      .map(([uid, data]) => ({ uid, ...data }))
-      .filter(user => 
-        (user.displayName || user.name || '').toLowerCase().includes(userSearch.toLowerCase()) ||
+    let result: any[] = enterpriseUsers
+      .map(u => ({ uid: u.userId, ...u, name: u.displayName }))
+      .filter(user =>
+        (user.displayName || '').toLowerCase().includes(userSearch.toLowerCase()) ||
         user.email.toLowerCase().includes(userSearch.toLowerCase())
       );
 
@@ -536,7 +601,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       if (userSort.direction === 'asc') return aVal > bVal ? 1 : -1;
       return aVal < bVal ? 1 : -1;
     });
-  }, [enterprise.users, userSearch, userSort, columnFilters.users]);
+  }, [enterpriseUsers, userSearch, userSort, columnFilters.users]);
 
   const sortedProjects = useMemo(() => {
     let result = [...projects]
@@ -622,16 +687,21 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     });
   }, [enterprise.vendors, vendorSearch, vendorSort, columnFilters.vendors]);
 
+  // Maps the component's short type name onto the attribute set the data
+  // layer knows. Previously an inline chain of ternaries repeated at a dozen
+  // call sites.
+  const attributeSetFor = (
+    type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress'
+  ): AttributeSet => `${type}Attributes` as AttributeSet;
+
   const bulkDeleteProjects = async () => {
-    const promises = Array.from(selectedProjectIds).map((id: string) => deleteDoc(doc(db, 'projects', id)));
-    await Promise.all(promises);
+    await deleteProjects(Array.from(selectedProjectIds));
     setSelectedProjectIds(new Set());
     setDeleteConfirm(null);
     setSelectedProjectId(null);
   };
 
   const bulkDeleteAttributeValues = async (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress', attrId: string) => {
-    const field = type === 'project' ? 'projectAttributes' : type === 'costCode' ? 'costCodeAttributes' : type === 'subcontract' ? 'subcontractAttributes' : type === 'procurement' ? 'procurementAttributes' : type === 'change' ? 'changeAttributes' : type === 'risk' ? 'riskAttributes' : type === 'progress' ? 'progressAttributes' : 'lineItemAttributes';
     const currentAttrs = getAttributes(type);
     const newAttrs = currentAttrs.map(a => {
       if (a.id === attrId) {
@@ -639,16 +709,13 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       }
       return a;
     });
-    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-      [field]: newAttrs
-    });
+    await updateAttributeSet(enterprise.id, attributeSetFor(type), newAttrs);
     setSelectedAttrValueIds(new Set());
     setDeleteConfirm(null);
   };
 
   const deleteAttributeValue = async (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress', attrId: string, valueId: string) => {
     try {
-      const field = type === 'project' ? 'projectAttributes' : type === 'costCode' ? 'costCodeAttributes' : type === 'subcontract' ? 'subcontractAttributes' : type === 'procurement' ? 'procurementAttributes' : type === 'change' ? 'changeAttributes' : type === 'risk' ? 'riskAttributes' : type === 'progress' ? 'progressAttributes' : 'lineItemAttributes';
       const currentAttrs = getAttributes(type);
       const newAttrs = currentAttrs.map(a => {
         if (a.id === attrId) {
@@ -657,9 +724,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
         }
         return a;
       });
-      await updateDoc(doc(db, 'enterprises', enterprise.id), {
-        [field]: newAttrs
-      });
+      await updateAttributeSet(enterprise.id, attributeSetFor(type), newAttrs);
       toast.success('Value deleted successfully');
     } catch (error) {
       console.error('Failed to delete attribute value', error);
@@ -670,48 +735,34 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const handleInvite = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inviteEmail || isInviting) return;
-    
+
     setIsInviting(true);
     try {
-      // 1. Generate a secure token
-      const token = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-      
-      // 2. Create invitation document in Firestore
-      await addDoc(collection(db, 'invitations'), {
-        enterpriseId: enterprise.id,
-        email: inviteEmail.toLowerCase().trim(),
-        token: token,
-        status: 'pending',
-        invitedBy: auth.currentUser?.uid,
-        createdAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString() // 7 days
-      });
+      // The token is generated with crypto.getRandomValues, not Math.random:
+      // it is what grants access to the enterprise.
+      //
+      // The pending invite is no longer also pushed onto the enterprise
+      // document -- the invitations table is the single source of truth, and
+      // redemption grants exactly the role chosen here.
+      const { link } = await createInvitation(
+        enterprise.id,
+        inviteEmail,
+        inviteRole,
+        currentUserId ?? ''
+      );
+      setGeneratedLink(link);
 
-      // 3. Generate the secure link
-      const inviteLink = `${window.location.origin}?token=${token}`;
-      setGeneratedLink(inviteLink);
-
-      // 4. Try to send real email via our backend
+      const me = getCurrentUser();
       await fetch('/api/invite', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: inviteEmail,
           enterpriseName: enterprise.name,
-          inviterName: auth.currentUser?.displayName || auth.currentUser?.email || 'A colleague',
-          appUrl: inviteLink
-        })
+          inviterName: me?.displayName || me?.email || 'A colleague',
+          appUrl: link,
+        }),
       }).catch(err => console.warn('Email sending failed, but link was generated:', err));
-
-      // 5. Track pending invite in Enterprise doc
-      const pendingInvites = (enterprise as any).pendingInvites || [];
-      if (!pendingInvites.includes(inviteEmail)) {
-        await updateDoc(doc(db, 'enterprises', enterprise.id), {
-          pendingInvites: [...pendingInvites, inviteEmail]
-        });
-      }
-      
-      // We don't close the modal immediately so they can copy the link
     } catch (error) {
       console.error('Invitation failed:', error);
       alert(error instanceof Error ? error.message : 'Failed to generate invitation. Please try again.');
@@ -731,37 +782,28 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     const project = projects.find(p => p.id === projectId);
     if (!project) return;
 
-    const newUsers = { ...project.users };
+    // Assigning someone to a project requires them to be an enterprise member
+    // -- the composite foreign key on project_members enforces it, so an
+    // assignment that would break that rule is refused by the database.
     if (currentRole) {
-      delete newUsers[uid];
+      await removeProjectMember(projectId, uid);
     } else {
-      newUsers[uid] = 'Project User';
+      await assignProjectMember(projectId, enterprise.id, uid, 'Project User');
     }
-    await updateDoc(doc(db, 'projects', projectId), { 
-      users: newUsers,
-      dateLastModified: new Date().toISOString()
-    });
+    await reloadProjectMembers(projectId);
   };
 
   const updateProjectRole = async (projectId: string, uid: string, role: 'Project Admin' | 'Project User') => {
-    await updateDoc(doc(db, 'projects', projectId), {
-      [`users.${uid}`]: role,
-      dateLastModified: new Date().toISOString()
-    });
+    await assignProjectMember(projectId, enterprise.id, uid, role);
+    await reloadProjectMembers(projectId);
   };
 
   const handleUpdateProjectStatus = async (projectId: string, status: string) => {
-    await updateDoc(doc(db, 'projects', projectId), {
-      status,
-      dateLastModified: new Date().toISOString()
-    });
+    await updateProject(projectId, { status } as any);
   };
 
   const handleUpdateProjectPhoto = async (projectId: string, photoURL: string) => {
-    await updateDoc(doc(db, 'projects', projectId), {
-      photoURL,
-      dateLastModified: new Date().toISOString()
-    });
+    await updateProject(projectId, { photoUrl: photoURL } as any);
   };
 
   const handleReplaceProjectId = async () => {
@@ -778,31 +820,20 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     setReplaceError('');
 
     try {
-      // Check for duplicates
-      const q = query(
-        collection(db, 'projects'),
-        where('enterpriseId', '==', enterprise.id),
-        where('projectCode', '==', newProjectCode.trim())
-      );
-      const querySnapshot = await getDocs(q);
-      
-      if (!querySnapshot.empty) {
-        setReplaceError('This Project ID already exists in the enterprise.');
-        setIsReplacing(false);
-        return;
-      }
-
-      await updateDoc(doc(db, 'projects', projectToReplace.id), {
-        projectCode: newProjectCode.trim(),
-        dateLastModified: new Date().toISOString()
-      });
+      // (enterprise_id, project_code) is unique, so a clash is refused by the
+      // database rather than by a check-then-write that could race.
+      await updateProject(projectToReplace.id, { projectCode: newProjectCode.trim() } as any);
 
       setIsReplaceIdModalOpen(false);
       setNewProjectCode('');
       setProjectToReplace(null);
     } catch (error) {
       console.error('Replace ID failed', error);
-      setReplaceError('Failed to replace Project ID.');
+      setReplaceError(
+        error instanceof Error && error.message.includes('duplicate key')
+          ? 'This Project ID already exists in the enterprise.'
+          : 'Failed to replace Project ID.'
+      );
     } finally {
       setIsReplacing(false);
     }
@@ -820,38 +851,25 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       const { type } = isBulkUpdateModalOpen;
       
       if (type === 'rate') {
-        const currentResources = enterprise.resourceRates || [];
-        const newResources = currentResources.map(r => {
-          if (selectedRateIds.has(r.id)) {
-            return { ...r, ...bulkUpdateFormData };
-          }
-          return r;
-        });
-        await updateDoc(doc(db, 'enterprises', enterprise.id), {
-          resourceRates: newResources
-        });
+        await Promise.all(
+          Array.from(selectedRateIds).map(id => {
+            const r = (enterprise.resourceRates || []).find(x => x.id === id);
+            return upsertResourceRate(enterprise.id, { ...r, ...bulkUpdateFormData } as any);
+          })
+        );
         setSelectedRateIds(new Set());
       } else if (type === 'project') {
-        const batch = writeBatch(db);
-        selectedProjectIds.forEach(id => {
-          batch.update(doc(db, 'projects', id), {
-            ...bulkUpdateFormData,
-            dateLastModified: new Date().toISOString()
-          });
-        });
-        await batch.commit();
+        await Promise.all(
+          Array.from(selectedProjectIds).map(id => updateProject(id, bulkUpdateFormData as any))
+        );
         setSelectedProjectIds(new Set());
       } else if (type === 'vendor') {
-        const currentVendors = enterprise.vendors || [];
-        const newVendors = currentVendors.map(v => {
-          if (selectedVendorIds.has(v.id)) {
-            return { ...v, ...bulkUpdateFormData };
-          }
-          return v;
-        });
-        await updateDoc(doc(db, 'enterprises', enterprise.id), {
-          vendors: newVendors
-        });
+        await Promise.all(
+          Array.from(selectedVendorIds).map(id => {
+            const v = (enterprise.vendors || []).find(x => x.id === id);
+            return upsertVendor(enterprise.id, { ...v, ...bulkUpdateFormData } as any);
+          })
+        );
         setSelectedVendorIds(new Set());
       }
 
@@ -868,7 +886,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
 
   const handleUpdateEnterprise = async (updates: Partial<Enterprise>) => {
     try {
-      await updateDoc(doc(db, 'enterprises', enterprise.id), updates);
+      await updateEnterpriseProfile(enterprise.id, updates as any);
     } catch (error) {
       console.error('Enterprise update failed', error);
       alert('Failed to update enterprise settings.');
@@ -984,7 +1002,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       'Project Name': p.projectName,
       'Project Code': p.projectCode,
       'Date Created': p.dateCreated ? new Date(p.dateCreated).toLocaleDateString() : '',
-      'Users Count': Object.keys(p.users || {}).length
+      'Users Count': (projectMembers[p.id] || []).length
     }));
     const ws = XLSX.utils.json_to_sheet(data);
     const wb = XLSX.utils.book_new();
@@ -1001,7 +1019,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
 
   const filteredProjects = sortedProjects;
 
-  const selectedUser = selectedUserId ? enterprise.users?.[selectedUserId] : null;
+  const selectedUser = selectedUserId ? enterpriseUsers.find(u => u.userId === selectedUserId) ?? null : null;
   const selectedProject = selectedProjectId ? projects.find(p => p.id === selectedProjectId) : null;
 
   const toggleProjectSelection = (id: string) => {
@@ -1390,7 +1408,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
 
 
   const updateAttributeTitle = async (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress', id: string, title: string) => {
-    const field = type === 'project' ? 'projectAttributes' : type === 'costCode' ? 'costCodeAttributes' : type === 'subcontract' ? 'subcontractAttributes' : type === 'procurement' ? 'procurementAttributes' : type === 'change' ? 'changeAttributes' : type === 'risk' ? 'riskAttributes' : type === 'progress' ? 'progressAttributes' : 'lineItemAttributes';
     const currentAttrs = getAttributes(type);
     const newAttrs = currentAttrs.map(a => a.id === id ? { ...a, title } : a);
     
@@ -1399,9 +1416,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     if (currentAttr && currentAttr.title === title) return;
 
     try {
-      await updateDoc(doc(db, 'enterprises', enterprise.id), {
-        [field]: newAttrs
-      });
+      await updateAttributeSet(enterprise.id, attributeSetFor(type), newAttrs);
     } catch (e) {
       console.error(e);
       toast.error('Failed to update attribute title');
@@ -1411,7 +1426,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const addAttributeValue = async (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress', attrId: string, value: ProjectAttributeValue) => {
     try {
       setIsSubmitting(true);
-      const field = type === 'project' ? 'projectAttributes' : type === 'costCode' ? 'costCodeAttributes' : type === 'subcontract' ? 'subcontractAttributes' : type === 'procurement' ? 'procurementAttributes' : type === 'change' ? 'changeAttributes' : type === 'risk' ? 'riskAttributes' : type === 'progress' ? 'progressAttributes' : 'lineItemAttributes';
       const currentAttrs = getAttributes(type);
       const finalValue = {
         ...value,
@@ -1430,9 +1444,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
         }
         return a;
       });
-      await updateDoc(doc(db, 'enterprises', enterprise.id), {
-        [field]: newAttrs
-      });
+      await updateAttributeSet(enterprise.id, attributeSetFor(type), newAttrs);
     } catch (error) {
       console.error('Failed to add attribute value', error);
     } finally {
@@ -1441,7 +1453,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   };
 
   const updateAttributeValue = async (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress', attrId: string, valueId: string, updates: Partial<ProjectAttributeValue>) => {
-    const field = type === 'project' ? 'projectAttributes' : type === 'costCode' ? 'costCodeAttributes' : type === 'subcontract' ? 'subcontractAttributes' : type === 'procurement' ? 'procurementAttributes' : type === 'change' ? 'changeAttributes' : type === 'risk' ? 'riskAttributes' : type === 'progress' ? 'progressAttributes' : 'lineItemAttributes';
     const currentAttrs = getAttributes(type);
     const newAttrs = currentAttrs.map(a => {
       if (a.id === attrId) {
@@ -1452,9 +1463,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       }
       return a;
     });
-    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-      [field]: newAttrs
-    });
+    await updateAttributeSet(enterprise.id, attributeSetFor(type), newAttrs);
   };
 
   const handleInlineUpdate = (valueId: string, field: 'description' | 'sortOrder', newValue: string) => {
@@ -1550,7 +1559,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
         }
         return a;
       });
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { [type]: newAttrs });
+      await updateAttributeSet(enterprise.id, type as AttributeSet, newAttrs);
     } else if (type === 'resourceRates') {
       const currentResources = [...(enterprise.resourceRates || [])];
       data.forEach(row => {
@@ -1567,31 +1576,48 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
           currentResources.push({ id, name, category, unit, rate });
         }
       });
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { resourceRates: currentResources });
+      // Written per row rather than as one replaced array.
+      await Promise.all(
+        currentResources.map(r => upsertResourceRate(enterprise.id, r as any))
+      );
     } else if (type === 'users') {
-      const currentUsers = { ...(enterprise.users || {}) };
-      data.forEach(row => {
-        const email = row.Email?.toString() || row.email?.toString();
-        if (!email) return;
-        const name = row.Name?.toString() || row.name?.toString() || row.DisplayName?.toString() || row.displayName?.toString() || '';
-        const role = row.Role?.toString() || row.role?.toString() || 'Enterprise User';
-        
-        // Find existing user by email
-        const existingUid = Object.keys(currentUsers).find(uid => currentUsers[uid].email.toLowerCase() === email.toLowerCase());
-        if (existingUid) {
-          currentUsers[existingUid] = { ...currentUsers[existingUid], displayName: name || currentUsers[existingUid].displayName, role };
+      // A spreadsheet cannot create accounts. The Firestore version invented
+      // uids like `imported_ab12cd3` and wrote them into the users map, so
+      // those rows could never match a real sign-in -- they were dead on
+      // arrival. Importing users now issues invitations instead: the person
+      // signs in with that address and accept_invitation() grants them the
+      // role named in the sheet.
+      const existingByEmail = new Map(
+        enterpriseUsers.map(u => [u.email.toLowerCase(), u])
+      );
+      let invited = 0;
+      let updated = 0;
+
+      for (const row of data) {
+        const email = (row.Email?.toString() || row.email?.toString() || '').trim();
+        if (!email) continue;
+        const role = (row.Role?.toString() || row.role?.toString() || 'Enterprise User') === 'Enterprise System Admin'
+          ? 'Enterprise System Admin'
+          : 'Enterprise User';
+
+        const existing = existingByEmail.get(email.toLowerCase());
+        if (existing) {
+          if (existing.role !== role) {
+            await setEnterpriseRole(enterprise.id, existing.userId, role);
+            updated++;
+          }
         } else {
-          // For new users via import, we can't create a real Firebase Auth user here easily, 
-          // but we can add them to the enterprise users map. 
-          // They'll need to sign up with that email to gain access.
-          const tempUid = `imported_${Math.random().toString(36).substring(2, 9)}`;
-          currentUsers[tempUid] = { email, displayName: name, role, joinedAt: new Date().toISOString() };
+          await createInvitation(enterprise.id, email, role, currentUserId ?? '');
+          invited++;
         }
-      });
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { users: currentUsers });
+      }
+
+      await reloadUsers();
+      if (invited > 0) toast.success(`Invited ${invited} ${invited === 1 ? 'person' : 'people'}.`);
+      if (updated > 0) toast.success(`Updated ${updated} existing ${updated === 1 ? 'role' : 'roles'}.`);
     } else if (type === 'projects') {
       const activeAttrs = (enterprise.projectAttributes || []).filter(attr => attr.title);
-      const batch = writeBatch(db);
+      const toUpsert: Array<{ projectCode: string; projectName: string; attributes: Record<string, string> }> = [];
 
       for (const row of data) {
         const code = row.Code?.toString() || row.code?.toString() || row.ProjectCode?.toString() || row.projectCode?.toString() || row['Project ID']?.toString();
@@ -1599,35 +1625,24 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
         if (!code) continue;
 
         const existingProject = projects.find(p => p.projectCode === code);
-        const updates: any = {};
-        if (name) updates.projectName = name;
-        
-        // Attributes
-        const newAttributes: any = existingProject?.attributes ? { ...existingProject.attributes } : {};
+        const newAttributes: Record<string, string> = { ...(existingProject?.attributes || {}) };
         activeAttrs.forEach(attr => {
           if (row[attr.title] !== undefined) {
             newAttributes[attr.id] = row[attr.title].toString();
           }
         });
-        updates.attributes = newAttributes;
 
-        if (existingProject) {
-          updates.dateLastModified = new Date().toISOString();
-          batch.update(doc(db, 'projects', existingProject.id), updates);
-        } else {
-          const newProjRef = doc(collection(db, 'projects'));
-          batch.set(newProjRef, {
-            enterpriseId: enterprise.id,
-            projectCode: code,
-            projectName: name,
-            attributes: newAttributes,
-            dateCreated: new Date().toISOString(),
-            dateLastModified: new Date().toISOString(),
-            users: { [auth.currentUser?.uid || '']: 'Project Admin' }
-          });
-        }
+        toUpsert.push({
+          projectCode: code,
+          projectName: name || existingProject?.projectName || 'Project Name',
+          attributes: newAttributes,
+        });
       }
-      await batch.commit();
+
+      // One upsert keyed on (enterprise_id, project_code); the unique
+      // constraint decides insert versus update.
+      await upsertProjects(enterprise.id, toUpsert);
+      await reloadProjects();
     } else if (type === 'vendors') {
       const currentVendors = [...(enterprise.vendors || [])];
       data.forEach(row => {
@@ -1646,7 +1661,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
           currentVendors.push({ id, name, code, contactName, contactEmail });
         }
       });
-      await updateDoc(doc(db, 'enterprises', enterprise.id), { vendors: currentVendors });
+      await Promise.all(currentVendors.map(v => upsertVendor(enterprise.id, v as any)));
     }
 
     setImportPreview(null);
@@ -1665,30 +1680,17 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
 
     try {
       setIsSubmitting(true);
-      const now = new Date().toISOString();
-      const finalName = newProjectData.name.trim() || 'Project Name';
-      const user = auth.currentUser;
-      await addDoc(collection(db, 'projects'), {
-        enterpriseId: enterprise.id,
-        projectName: finalName,
+      // created_by is stamped by the row default; the creator is made Project
+      // Admin by a database trigger.
+      await createProject(enterprise.id, {
+        projectName: newProjectData.name.trim() || 'Project Name',
         projectCode: newProjectData.code,
-        projectBudget: 0,
-        startDate: now.split('T')[0],
-        endDate: now.split('T')[0],
-        cutoffDate: now.split('T')[0],
-        users: { [user?.uid || '']: 'Project Admin' },
-        dateCreated: now,
-        dateLastModified: now,
-        createdBy: user?.uid || '',
-        createdByEmail: user?.email || '',
-        modifiedBy: user?.uid || '',
-        modifiedByEmail: user?.email || '',
-        status: 'Active'
       });
       setIsCreateProjectModalOpen(false);
       setNewProjectData({ name: '', code: '' });
     } catch (error) {
       console.error('Failed to create project', error);
+      alert(error instanceof Error ? error.message : 'Failed to create project.');
     } finally {
       setIsSubmitting(false);
     }
@@ -1703,19 +1705,10 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
         setIsSubmitting(false);
         return;
       }
-      const finalResource = {
+      await upsertResourceRate(enterprise.id, {
         ...resource,
-        name: resource.name.trim() || 'Resource Name'
-      };
-      
-      if (typeof index === 'number') {
-        currentResources.splice(index, 0, finalResource);
-      } else {
-        currentResources.push(finalResource);
-      }
-
-      await updateDoc(doc(db, 'enterprises', enterprise.id), {
-        resourceRates: currentResources
+        name: resource.name.trim() || 'Resource Name',
+        sortOrder: typeof index === 'number' ? index : currentResources.length,
       });
     } catch (error) {
       console.error('Failed to add resource rate', error);
@@ -1725,27 +1718,17 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   };
 
   const updateResourceRate = async (id: string, updates: any) => {
-    const currentResources = enterprise.resourceRates || [];
-    const newResources = currentResources.map(r => r.id === id ? { ...r, ...updates } : r);
-    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-      resourceRates: newResources
-    });
+    const existing = (enterprise.resourceRates || []).find(r => r.id === id);
+    await upsertResourceRate(enterprise.id, { ...existing, ...updates, id } as any);
   };
 
   const updateVendor = async (id: string, updates: any) => {
-    const currentVendors = enterprise.vendors || [];
-    const newVendors = currentVendors.map(v => v.id === id ? { ...v, ...updates } : v);
-    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-      vendors: newVendors
-    });
+    const existing = (enterprise.vendors || []).find(v => v.id === id);
+    await upsertVendor(enterprise.id, { ...existing, ...updates, id } as any);
   };
 
   const deleteResourceRate = async (id: string) => {
-    const currentResources = enterprise.resourceRates || [];
-    const newResources = currentResources.filter(r => r.id !== id);
-    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-      resourceRates: newResources
-    });
+    await deleteResourceRates([id]);
   };
 
   const { duplicateIds, hasImportDuplicates, systemDuplicateIds } = useMemo(() => {
@@ -2003,7 +1986,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                         </div>
                         <div className="flex justify-between text-xs">
                           <span className="text-gray-500">Active Users</span>
-                          <span className="font-bold">{Object.keys(enterprise.users || {}).length}</span>
+                          <span className="font-bold">{enterpriseUsers.length}</span>
                         </div>
                         <div className="flex justify-between text-xs">
                           <span className="text-gray-500">Storage Used</span>
@@ -2038,9 +2021,12 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                   onCellValueChanged={async (event) => {
                     const { data, colDef, newValue } = event;
                     if (!data.uid) return;
-                    await updateDoc(doc(db, 'enterprises', enterprise.id), {
-                      [`users.${data.uid}.${colDef.field}`]: newValue
-                    });
+                    // Role is the only field an admin owns. Display name and
+                    // email live on the person's own user_profiles row, which
+                    // RLS restricts to that user, so they are not editable here.
+                    if (colDef.field !== 'role') return;
+                    await setEnterpriseRole(enterprise.id, data.uid, newValue);
+                    await reloadUsers();
                   }}
                   gridProps={{
                     rowSelection: 'multiple',
@@ -2104,10 +2090,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                 onCellValueChanged={async (event) => {
                   const { data, colDef, newValue } = event;
                   if (!data.id) return;
-                  await updateDoc(doc(db, 'projects', data.id), {
-                    [colDef.field!]: newValue,
-                    dateLastModified: new Date().toISOString()
-                  });
+                  await updateProject(data.id, { [colDef.field!]: newValue } as any);
                 }}
                 gridProps={{
                   rowSelection: 'multiple',
@@ -2358,8 +2341,9 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                       currentVendors.push(vendorData);
                     }
                   });
-                  updateDoc(doc(db, 'enterprises', enterprise.id), { vendors: currentVendors });
-                  toast.success(`Imported ${data.length} vendors`);
+                  void Promise.all(currentVendors.map(v => upsertVendor(enterprise.id, v as any)))
+                    .then(() => toast.success(`Imported ${data.length} vendors`))
+                    .catch((e) => toast.error(e instanceof Error ? e.message : 'Vendor import failed'));
                 }}
                 onQuickFilterChange={setVendorSearch}
                 quickFilterText={vendorSearch}
@@ -2368,8 +2352,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                 onCellValueChanged={(event) => {
                   const { data, colDef, newValue } = event;
                   if (!data.id) return;
-                  const newVendors = (enterprise.vendors || []).map(v => v.id === data.id ? { ...v, [colDef.field!]: newValue } : v);
-                  updateDoc(doc(db, 'enterprises', enterprise.id), { vendors: newVendors });
+                  void updateVendor(data.id, { [colDef.field!]: newValue });
                 }}
                 onBulkUpdate={() => {
                   setIsBulkUpdateModalOpen({ type: 'vendor', count: selectedVendorIds.size });
@@ -2405,7 +2388,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
               <div className="flex items-center gap-4">
                 <div className="w-12 h-12 rounded-full bg-gray-100 dark:bg-white/5 flex items-center justify-center border border-gray-200 dark:border-white/10 overflow-hidden">
                   {selectedUser ? (
-                    selectedUser.photoURL ? <img src={selectedUser.photoURL} alt="" /> : <Users className="w-6 h-6 text-gray-400" />
+                    selectedUser.photoUrl ? <img src={selectedUser.photoUrl} alt="" /> : <Users className="w-6 h-6 text-gray-400" />
                   ) : (
                     selectedProject?.photoURL ? <img src={selectedProject.photoURL} alt="" /> : <Briefcase className="w-6 h-6 text-gray-400" />
                   )}
@@ -2431,7 +2414,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                     <h4 className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mb-4">Project Assignments</h4>
                     <div className="space-y-2">
                       {projects.map(project => {
-                        const userRole = project.users[selectedUserId];
+                        const userRole = roleInProject(project.id, selectedUserId);
                         return (
                           <div key={project.id} className="flex items-center justify-between p-3 bg-gray-50 dark:bg-white/5 rounded-xl border border-gray-100 dark:border-white/5">
                             <div className="flex-1 min-w-0 mr-4">
@@ -2516,8 +2499,9 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                   <div>
                     <h4 className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mb-4">Assigned Users</h4>
                     <div className="space-y-2">
-                      {Object.entries(enterprise.users || {}).map(([uid, data]) => {
-                        const userRole = selectedProject.users[uid];
+                      {enterpriseUsers.map((data) => {
+                        const uid = data.userId;
+                        const userRole = roleInProject(selectedProject.id, uid);
                         return (
                           <div key={uid} className="flex items-center justify-between p-3 bg-gray-50 dark:bg-white/5 rounded-xl border border-gray-100 dark:border-white/5">
                             <div className="flex-1 min-w-0 mr-4">
@@ -3236,7 +3220,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                   </button>
                   <button 
                     onClick={() => {
-                      setDeleteConfirm({ type: 'user', id: contextMenu.id, name: enterprise.users?.[contextMenu.id]?.email });
+                      setDeleteConfirm({ type: 'user', id: contextMenu.id, name: enterpriseUsers.find(u => u.userId === contextMenu.id)?.email });
                       setContextMenu(null);
                     }}
                     className="w-full text-left p-2 text-xs text-red-600 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg flex items-center gap-2"
@@ -3405,14 +3389,13 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                 if (!projectToEdit) return;
                 try {
                   setIsSubmitting(true);
-                  const user = auth.currentUser;
-                  await updateDoc(doc(db, 'projects', projectToEdit.id), {
+                  const me = getCurrentUser();
+                  await updateProject(projectToEdit.id, {
                     projectName: editingProjectDetails.projectName,
                     attributes: editingProjectDetails.attributes,
-                    dateLastModified: new Date().toISOString(),
-                    modifiedBy: user?.uid || '',
-                    modifiedByEmail: user?.email || ''
-                  });
+                    modifiedBy: me?.uid,
+                    modifiedByEmail: me?.email ?? undefined,
+                  } as any);
                   toast.success('Project details updated successfully');
                   setIsEditProjectDetailsOpen(false);
                 } catch (error) {

@@ -230,3 +230,69 @@ export async function acceptInvitation(token: string): Promise<string> {
   raise('accept invitation', error);
   return data as string;
 }
+
+// --------------------------------------------------------- own profile ----
+
+export interface OwnProfile {
+  displayName: string;
+  email: string;
+  photoUrl: string | null;
+  preferences: Record<string, any>;
+  role: EnterpriseRole | null;
+  joinedAt: string | null;
+}
+
+export async function fetchOwnProfile(
+  userId: string,
+  enterpriseId: string
+): Promise<OwnProfile | null> {
+  const [profileRes, memberRes] = await Promise.all([
+    supabase
+      .from('user_profiles')
+      .select('email, display_name, photo_url, preferences')
+      .eq('id', userId)
+      .maybeSingle(),
+    supabase
+      .from('enterprise_members')
+      .select('role, joined_at')
+      .eq('enterprise_id', enterpriseId)
+      .eq('user_id', userId)
+      .maybeSingle(),
+  ]);
+  raise('load profile', profileRes.error);
+  raise('load membership', memberRes.error);
+  if (!profileRes.data) return null;
+
+  const p = profileRes.data as any;
+  const m = memberRes.data as any;
+  return {
+    displayName: p.display_name ?? '',
+    email: p.email ?? '',
+    photoUrl: p.photo_url ?? null,
+    preferences: p.preferences ?? {},
+    role: m?.role ?? null,
+    joinedAt: m?.joined_at ?? null,
+  };
+}
+
+/**
+ * Writes the caller's own profile. RLS restricts user_profiles updates to
+ * `id = auth.uid()`, so this cannot touch anyone else's row.
+ *
+ * TODO: photoUrl currently holds a base64 data URL, as it did in Firestore.
+ * It belongs in Supabase Storage with only the URL kept here -- worth doing
+ * before real avatars go in, but it no longer bloats the enterprise document.
+ */
+export async function updateOwnProfile(
+  userId: string,
+  patch: { displayName?: string; photoUrl?: string; preferences?: Record<string, any> }
+): Promise<void> {
+  const row: Record<string, any> = {};
+  if (patch.displayName !== undefined) row.display_name = patch.displayName;
+  if (patch.photoUrl !== undefined) row.photo_url = patch.photoUrl;
+  if (patch.preferences !== undefined) row.preferences = patch.preferences;
+  if (Object.keys(row).length === 0) return;
+
+  const { error } = await supabase.from('user_profiles').update(row).eq('id', userId);
+  raise('update profile', error);
+}

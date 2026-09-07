@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { db, auth } from '../firebase';
-import { doc, onSnapshot, updateDoc } from 'firebase/firestore';
+import { fetchOwnProfile, updateOwnProfile } from '../lib/session';
 import { Enterprise } from '../types';
 import { 
   User, 
@@ -28,21 +27,31 @@ export default function UserProfile({ userId, enterprise }: UserProfileProps) {
   const [isSaving, setIsSaving] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Reads the caller's own row rather than picking their entry out of a map
+  // on the enterprise document.
   useEffect(() => {
     if (!enterprise || !userId) return;
-    const user = enterprise.users?.[userId] as any;
-    if (user) {
-      setUserData({
-        ...user,
-        displayName: user.displayName || auth.currentUser?.displayName || '',
-        email: user.email || auth.currentUser?.email || '',
-        preferences: user.preferences || {
-          notifications: true,
-          darkMode: true,
-          language: 'en'
-        }
-      });
-    }
+    let active = true;
+
+    void fetchOwnProfile(userId, enterprise.id)
+      .then((profile) => {
+        if (!active || !profile) return;
+        setUserData({
+          ...profile,
+          photoURL: profile.photoUrl,
+          preferences: {
+            notifications: true,
+            darkMode: true,
+            language: 'en',
+            ...profile.preferences,
+          },
+        });
+      })
+      .catch((error) => console.error('Failed to load profile', error));
+
+    return () => {
+      active = false;
+    };
   }, [enterprise, userId]);
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -66,9 +75,7 @@ export default function UserProfile({ userId, enterprise }: UserProfileProps) {
       
       // Auto-save photo
       try {
-        await updateDoc(doc(db, 'enterprises', enterprise.id), {
-          [`users.${userId}.photoURL`]: base64String
-        });
+        await updateOwnProfile(userId, { photoUrl: base64String });
       } catch (error) {
         console.error('Failed to save photo', error);
       }
@@ -79,9 +86,9 @@ export default function UserProfile({ userId, enterprise }: UserProfileProps) {
   const handleSavePreferences = async () => {
     setIsSaving(true);
     try {
-      await updateDoc(doc(db, 'enterprises', enterprise.id), {
-        [`users.${userId}.displayName`]: userData.displayName,
-        [`users.${userId}.preferences`]: userData.preferences
+      await updateOwnProfile(userId, {
+        displayName: userData.displayName,
+        preferences: userData.preferences,
       });
     } catch (error) {
       console.error('Failed to save preferences', error);

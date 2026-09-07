@@ -604,6 +604,7 @@ function AuthenticatedApp({
                 enterprise={currentEnterprise} 
                 userId={user.id}
                 isSystemOwner={isSystemOwner}
+                enterpriseRole={session?.memberships.find(m => m.enterpriseId === currentEnterprise?.id)?.role}
               />
             } />
             <Route path="/project/:projectId" element={<ProjectView enterprise={currentEnterprise} user={user} setIsSidebarCollapsed={setIsSidebarCollapsed} />} />
