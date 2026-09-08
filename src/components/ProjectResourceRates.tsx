@@ -1,7 +1,11 @@
-import React, { useState, useMemo, useRef } from 'react';
-import { db } from '../firebase';
-import { doc, updateDoc } from 'firebase/firestore';
+import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Project, ResourceRate } from '../types';
+import {
+  fetchProjectResourceRates,
+  upsertProjectResourceRate,
+  deleteProjectResourceRates,
+  importProjectResourceRates,
+} from '../lib/projectSettings';
 import { Plus, Trash2, Edit2, Download, Upload, DollarSign } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
@@ -19,8 +23,11 @@ interface ProjectResourceRatesProps {
 export default function ProjectResourceRates({ project }: ProjectResourceRatesProps) {
   const [selectedRateIds, setSelectedRateIds] = useState<Set<string>>(new Set());
   const [isEditingResource, setIsEditingResource] = useState<{ id: string | null } | null>(null);
-  const [resourceFormData, setResourceFormData] = useState<ResourceRate>({ 
-    id: '', 
+  const [rates, setRates] = useState<ResourceRate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [resourceFormData, setResourceFormData] = useState<ResourceRate>({
+    id: '',
+    code: '',
     name: '', 
     unit: '', 
     rate: 0, 
@@ -42,10 +49,11 @@ export default function ProjectResourceRates({ project }: ProjectResourceRatesPr
       lockPosition: true,
       suppressMenu: true,
     },
-    { 
-      field: 'id', 
-      headerName: 'ID', 
-      width: 120, 
+    {
+      // The code people type, not the row's uuid.
+      field: 'code',
+      headerName: 'ID',
+      width: 120,
       pinned: 'left',
       fontFamily: 'monospace'
     },
@@ -80,31 +88,44 @@ export default function ProjectResourceRates({ project }: ProjectResourceRatesPr
     }
   ], []);
 
+  const reload = useCallback(async () => {
+    try {
+      setRates(await fetchProjectResourceRates(project.id));
+    } catch (error) {
+      console.error('Failed to load project resources', error);
+      toast.error('Failed to load project resources.');
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
   const handleSaveResource = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isSubmitting) return;
     setIsSubmitting(true);
 
     try {
-      const currentRates = project.resourceRates || [];
-      let newRates;
-      if (isEditingResource?.id) {
-        newRates = currentRates.map(r => r.id === isEditingResource.id ? resourceFormData : r);
-      } else {
-        if (currentRates.some(r => r.id === resourceFormData.id)) {
-          toast.error('Resource ID already exists');
-          setIsSubmitting(false);
-          return;
-        }
-        newRates = [...currentRates, resourceFormData];
-      }
-
-      await updateDoc(doc(db, 'projects', project.id), { resourceRates: newRates });
+      // One row written, not the whole library rewritten. The duplicate check
+      // is the database's: (project_id, code) is unique, so it holds even when
+      // two people add the same code at the same moment.
+      await upsertProjectResourceRate(project.id, {
+        ...resourceFormData,
+        id: isEditingResource?.id || undefined,
+      });
+      await reload();
       setIsEditingResource(null);
       toast.success(isEditingResource?.id ? 'Resource updated' : 'Resource added');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to save resource', error);
-      toast.error('Failed to save resource');
+      toast.error(
+        error?.code === '23505'
+          ? `Resource ID "${resourceFormData.code}" already exists in this project.`
+          : `Failed to save resource: ${error?.message || 'Unknown error'}`
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -114,13 +135,13 @@ export default function ProjectResourceRates({ project }: ProjectResourceRatesPr
     if (selectedRateIds.size === 0) return;
     
     try {
-      const newRates = (project.resourceRates || []).filter(r => !selectedRateIds.has(r.id));
-      await updateDoc(doc(db, 'projects', project.id), { resourceRates: newRates });
+      await deleteProjectResourceRates(Array.from(selectedRateIds));
+      await reload();
       setSelectedRateIds(new Set());
       toast.success('Resources deleted');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to delete resources', error);
-      toast.error('Failed to delete resources');
+      toast.error(`Failed to delete resources: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -137,29 +158,43 @@ export default function ProjectResourceRates({ project }: ProjectResourceRatesPr
         const ws = wb.Sheets[wsname];
         const data = XLSX.utils.sheet_to_json(ws) as any[];
 
+        // The sheet's ID column is the resource CODE; the row's uuid is
+        // assigned by the database.
         const newRates = data.map(row => ({
-          id: String(row.ID || row.id || ''),
-          name: String(row.Name || row.name || ''),
+          code: String(row.ID || row.id || '').trim(),
+          name: String(row.Name || row.name || '').trim(),
           category: String(row.Category || row.category || 'Labour'),
           unit: String(row.Unit || row.unit || ''),
           rate: Number(row.Rate || row.rate || 0),
           udf1: String(row.UDF1 || row.udf1 || ''),
           udf2: String(row.UDF2 || row.udf2 || ''),
           udf3: String(row.UDF3 || row.udf3 || '')
-        })).filter(r => r.id && r.name);
+        })).filter(r => r.code && r.name);
 
-        await updateDoc(doc(db, 'projects', project.id), { resourceRates: [...(project.resourceRates || []), ...newRates] });
-        toast.success(`Imported ${newRates.length} resources`);
-      } catch (error) {
+        if (newRates.length === 0) {
+          toast.error('No rows with both an ID and a Name were found in the sheet.');
+          return;
+        }
+
+        // One insert for the whole sheet -- imports are expected to run to
+        // thousands of rows, so this must not become a loop.
+        const imported = await importProjectResourceRates(project.id, newRates);
+        await reload();
+        toast.success(`Imported ${imported} resources`);
+      } catch (error: any) {
         console.error('Import failed', error);
-        toast.error('Import failed');
+        toast.error(
+          error?.code === '23505'
+            ? 'Import failed: the sheet contains a Resource ID that already exists in this project.'
+            : `Import failed: ${error?.message || 'Unknown error'}`
+        );
       }
     };
     reader.readAsBinaryString(file);
   };
 
   const handleExport = () => {
-    const ws = XLSX.utils.json_to_sheet(project.resourceRates || []);
+    const ws = XLSX.utils.json_to_sheet(rates);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Resources');
     XLSX.writeFile(wb, `${project.projectCode}_Resources.xlsx`);
@@ -170,7 +205,7 @@ export default function ProjectResourceRates({ project }: ProjectResourceRatesPr
       <DataGridModule
         title="Project Resource Rates"
         description="Manage project-specific resources and their base rates."
-        rowData={project.resourceRates || []}
+        rowData={rates}
         columnDefs={columnDefs}
         onImport={() => fileInputRef.current?.click()}
         onExport={handleExport}
@@ -186,7 +221,7 @@ export default function ProjectResourceRates({ project }: ProjectResourceRatesPr
             )}
             <button 
               onClick={() => {
-                setResourceFormData({ id: '', name: '', unit: '', rate: 0, category: 'Labour', udf1: '', udf2: '', udf3: '' });
+                setResourceFormData({ id: '', code: '', name: '', unit: '', rate: 0, category: 'Labour', udf1: '', udf2: '', udf3: '' });
                 setIsEditingResource({ id: null });
               }}
               className="flex items-center gap-2 bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-lg text-sm font-medium hover:opacity-90 transition-all"
@@ -228,8 +263,8 @@ export default function ProjectResourceRates({ project }: ProjectResourceRatesPr
                     <input 
                       required
                       disabled={!!isEditingResource.id}
-                      value={resourceFormData.id}
-                      onChange={e => setResourceFormData({ ...resourceFormData, id: e.target.value })}
+                      value={resourceFormData.code}
+                      onChange={e => setResourceFormData({ ...resourceFormData, code: e.target.value })}
                       className="w-full px-4 py-2 bg-gray-50 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-xl text-sm outline-none focus:ring-2 focus:ring-black dark:focus:ring-white dark:text-white disabled:opacity-50"
                     />
                   </div>

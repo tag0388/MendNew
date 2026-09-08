@@ -13,7 +13,12 @@ export interface ProjectAttribute {
 }
 
 export interface ResourceRate {
+  /** Row identity (uuid). Not shown to users. */
   id: string;
+  /** The identifier people type and read -- "LAB-01". Unique within its
+   *  enterprise or project, and copied into an ETC line's Item when the
+   *  resource is picked. */
+  code: string;
   name: string;
   unit: string;
   rate?: number;
@@ -400,7 +405,10 @@ export interface EtcDetail {
   createdAt: string;
   updatedAt?: string;
   isEnterpriseResource?: boolean;
+  /** Set when the line came from the ENTERPRISE resource library. */
   resourceId?: string;
+  /** Set when it came from the PROJECT library. At most one of the two. */
+  projectResourceId?: string;
   totalEtcPrevious?: number;
 }
 

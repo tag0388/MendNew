@@ -1,17 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Calendar as ProjectCalendar } from '../types';
-import { db, auth } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  doc, 
-  getDocs
-} from 'firebase/firestore';
+import {
+  fetchProjectCalendars,
+  upsertProjectCalendar,
+  deleteProjectCalendar,
+  copyEnterpriseCalendarToProject,
+} from '../lib/projectSettings';
+import {
+  fetchEnterpriseCalendars as fetchEnterpriseCalendarList,
+  upsertEnterpriseCalendar,
+} from '../lib/enterpriseSettings';
 import { 
   Plus, 
   Trash2, 
@@ -36,29 +34,6 @@ interface CalendarManagerProps {
   title: string;
   description: string;
   allowImport?: boolean;
-}
-
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-    },
-    operationType,
-    path
-  };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
 }
 
 const DAYS = [
@@ -87,40 +62,31 @@ export default function CalendarManager({ projectId, enterpriseId, title, descri
   // Multi-select state for holidays
   const [selectedHolidays, setSelectedHolidays] = useState<Date[]>([]);
 
-  useEffect(() => {
-    const q = query(
-      collection(db, 'calendars'),
-      where(projectId ? 'projectId' : 'enterpriseId', '==', projectId || enterpriseId)
-    );
-    const unsub = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ProjectCalendar));
-      setCalendars(data);
+  // This component serves both levels: a project calendar when projectId is
+  // given, otherwise the enterprise library.
+  const reloadCalendars = useCallback(async () => {
+    try {
+      setCalendars(projectId
+        ? await fetchProjectCalendars(projectId)
+        : await fetchEnterpriseCalendarList(enterpriseId!));
+    } catch (error) {
+      console.error('Error loading calendars:', error);
+      toast.error('Failed to load calendars.');
+    } finally {
       setLoading(false);
-    }, (error) => {
-      setLoading(false);
-      handleFirestoreError(error, OperationType.GET, 'calendars');
-    });
-    return () => unsub();
+    }
   }, [projectId, enterpriseId]);
+
+  useEffect(() => {
+    void reloadCalendars();
+  }, [reloadCalendars]);
 
   useEffect(() => {
     if (allowImport && projectId && enterpriseId) {
       // Fetch enterprise calendars for importing
-      const fetchEnterpriseCalendars = async () => {
-        try {
-          const q = query(
-            collection(db, 'calendars'), 
-            where('enterpriseId', '==', enterpriseId)
-          );
-          const snapshot = await getDocs(q);
-          const data = snapshot.docs
-            .map(doc => ({ id: doc.id, ...doc.data() } as ProjectCalendar));
-          setEnterpriseCalendars(data);
-        } catch (error) {
-          console.error('Error fetching enterprise calendars:', error);
-        }
-      };
-      fetchEnterpriseCalendars();
+      void fetchEnterpriseCalendarList(enterpriseId)
+        .then(setEnterpriseCalendars)
+        .catch((error) => console.error('Error fetching enterprise calendars:', error));
     }
   }, [allowImport, projectId, enterpriseId]);
 
@@ -152,20 +118,18 @@ export default function CalendarManager({ projectId, enterpriseId, title, descri
         createdAt: formData.createdAt || new Date().toISOString()
       };
 
-      if (isEditing) {
-        await updateDoc(doc(db, 'calendars', isEditing), dataToSave);
-        toast.success('Calendar updated');
+      const calendar = { ...dataToSave, id: isEditing || undefined } as any;
+      if (projectId) {
+        await upsertProjectCalendar(projectId, calendar);
       } else {
-        await addDoc(collection(db, 'calendars'), {
-          ...dataToSave,
-          projectId: projectId || null,
-          enterpriseId: enterpriseId || null,
-        });
-        toast.success('Calendar created');
+        await upsertEnterpriseCalendar(enterpriseId!, calendar);
       }
+      await reloadCalendars();
+      toast.success(isEditing ? 'Calendar updated' : 'Calendar created');
       resetForm();
-    } catch (error) {
-      handleFirestoreError(error, isEditing ? OperationType.UPDATE : OperationType.CREATE, 'calendars');
+    } catch (error: any) {
+      console.error('Error saving calendar:', error);
+      toast.error(`Failed to save calendar: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -183,27 +147,34 @@ export default function CalendarManager({ projectId, enterpriseId, title, descri
     }
 
     try {
-      await addDoc(collection(db, 'calendars'), {
-        name: importedName,
-        weekends: cal.weekends,
-        holidays: cal.holidays,
-        projectId: projectId,
-        createdAt: new Date().toISOString()
-      });
+      // Copied, not referenced: a project calendar gets adjusted for site
+      // shutdowns and local holidays, and a reference would let an
+      // enterprise-level edit silently reshape every project's forecast.
+      await copyEnterpriseCalendarToProject(projectId!, { ...cal, name: importedName });
+      await reloadCalendars();
       toast.success('Calendar imported from Enterprise');
       setIsImporting(false);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'calendars');
+    } catch (error: any) {
+      console.error('Error importing calendar:', error);
+      toast.error(`Failed to import calendar: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this calendar?')) return;
     try {
-      await deleteDoc(doc(db, 'calendars', id));
+      await deleteProjectCalendar(id);
+      await reloadCalendars();
       toast.success('Calendar deleted');
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, `calendars/${id}`);
+    } catch (error: any) {
+      console.error('Error deleting calendar:', error);
+      // A calendar still referenced by ETC rows is refused by the database
+      // rather than leaving those rows pointing at nothing.
+      toast.error(
+        error?.code === '23503'
+          ? 'This calendar is in use by ETC rows and cannot be deleted.'
+          : `Failed to delete calendar: ${error?.message || 'Unknown error'}`
+      );
     }
   };
 

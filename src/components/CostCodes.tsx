@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
-import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, Change, ChangeRecord, Subcontract, ScheduleItem } from '../types';
+import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, Change, ChangeRecord, Subcontract, ScheduleItem, ResourceRate} from '../types';
 import { subscribeToTable } from '../lib/supabase';
+import { fetchProjectResourceRates } from '../lib/projectSettings';
 import { resolvePhasingWindow, parsePastedDate, toStoredDate } from '../lib/phasing';
 import {
   fetchCostCodes,
@@ -696,13 +697,31 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     return costCodes.some(c => c.code.toLowerCase() === formData.code?.toLowerCase());
   }, [formData.code, costCodes, isEditing, isSaving]);
 
+  // The project's own resource library, loaded when the picker is opened.
+  const [projectResources, setProjectResources] = useState<ResourceRate[]>([]);
+  useEffect(() => {
+    if (!isResourceModalOpen) return;
+    let active = true;
+    void fetchProjectResourceRates(project.id)
+      .then((rows) => { if (active) setProjectResources(rows); })
+      .catch((error) => console.error('Failed to load project resources', error));
+    return () => { active = false; };
+  }, [isResourceModalOpen, project.id]);
+
   const groupedLibraryResources = useMemo(() => {
-    const library = resourceLibrarySource === 'enterprise' ? enterprise.resourceRates : project.resourceRates;
-    const filtered = library?.filter(r => 
-      r.name.toLowerCase().includes(resourceSearch.toLowerCase()) ||
-      r.id.toLowerCase().includes(resourceSearch.toLowerCase()) ||
-      r.category?.toLowerCase().includes(resourceSearch.toLowerCase())
-    ) || [];
+    // The project library is loaded from project_resource_rates rather than
+    // read off the project object: it used to be an array stored on the
+    // project row, and nothing hydrates it any more, so the project tab of
+    // this picker was always empty.
+    const library = resourceLibrarySource === 'enterprise'
+      ? (enterprise.resourceRates ?? [])
+      : projectResources;
+    const term = resourceSearch.toLowerCase();
+    const filtered = library.filter(r =>
+      r.name.toLowerCase().includes(term) ||
+      (r.code ?? '').toLowerCase().includes(term) ||
+      r.category?.toLowerCase().includes(term)
+    );
 
     const grouped = filtered.reduce((acc, resource) => {
       const category = resource.category || 'Uncategorized';
@@ -714,7 +733,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }, {} as Record<string, typeof filtered>);
 
     return Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b));
-  }, [resourceLibrarySource, enterprise.resourceRates, project.resourceRates, resourceSearch]);
+  }, [resourceLibrarySource, enterprise.resourceRates, projectResources, resourceSearch]);
 
   // Fetch ETC Details
   // Hoisted so the write handlers can refresh after their own writes rather
@@ -1223,13 +1242,19 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       // rows go over in one call, in order.
       const newRows = resources.flatMap((resource) =>
         Array.from({ length: count }, () => ({
-          item: resource.id,
+          // The line's Item shows the resource CODE ("LAB-01"), not the row's
+          // uuid. resourceId below keeps the link back to the library entry.
+          item: resource.code,
           description: resource.name,
           unit: resource.unit || 'HR',
           rate: resource.rate || 0,
           category: resource.category || '',
           isEnterpriseResource: source === 'enterprise',
-          resourceId: resource.id,
+          // Each library has its own link column, and the database refuses a
+          // row whose flag disagrees with which one is set.
+          ...(source === 'enterprise'
+            ? { resourceId: resource.id }
+            : { projectResourceId: resource.id }),
         }))
       );
 
@@ -5871,7 +5896,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                                 </div>
                                 
                                 <div className="text-xs font-mono text-gray-500 dark:text-gray-400">
-                                  {resource.id}
+                                  {resource.code}
                                 </div>
                                 
                                 <div className="text-sm font-bold text-gray-900 dark:text-white group-hover:text-blue-600 transition-colors truncate">

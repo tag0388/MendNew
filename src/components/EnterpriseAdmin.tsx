@@ -5,7 +5,7 @@ import { fetchSavedViews, createSavedView, deleteSavedView } from '../lib/savedV
 import {
   updateAttributeSet, updateEnterpriseProfile,
   upsertVendor, deleteVendors as deleteVendorRows,
-  upsertResourceRate, deleteResourceRates,
+  upsertResourceRate, deleteResourceRates, importResourceRates,
   type AttributeSet,
 } from '../lib/enterpriseSettings';
 import {
@@ -240,7 +240,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     procurementAttributes: ['id', 'description', 'sortOrder'],
     changeAttributes: ['id', 'description', 'sortOrder'],
     riskAttributes: ['id', 'description', 'sortOrder'],
-    resourceRates: ['id', 'name', 'category', 'unit', 'rate', 'udf1', 'udf2', 'udf3'],
+    resourceRates: ['code', 'name', 'category', 'unit', 'rate', 'udf1', 'udf2', 'udf3'],
     vendors: ['id', 'name', 'code', 'contactName', 'contactEmail']
   });
   const [isColumnMenuOpen, setIsColumnMenuOpen] = useState<string | null>(null);
@@ -1561,25 +1561,28 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       });
       await updateAttributeSet(enterprise.id, type as AttributeSet, newAttrs);
     } else if (type === 'resourceRates') {
-      const currentResources = [...(enterprise.resourceRates || [])];
-      data.forEach(row => {
-        const id = row.ID?.toString() || row.id?.toString();
-        const name = row.Name?.toString() || row.name?.toString() || '';
-        const category = row.Category?.toString() || row.category?.toString() || '';
-        const unit = row.Unit?.toString() || row.unit?.toString() || '';
-        const rate = parseFloat(row.Rate || row.rate) || 0;
-        if (!id) return;
-        const existingIndex = currentResources.findIndex(r => r.id === id);
-        if (existingIndex > -1) {
-          currentResources[existingIndex] = { ...currentResources[existingIndex], name, category, unit, rate };
-        } else {
-          currentResources.push({ id, name, category, unit, rate });
-        }
-      });
-      // Written per row rather than as one replaced array.
-      await Promise.all(
-        currentResources.map(r => upsertResourceRate(enterprise.id, r as any))
-      );
+      // The sheet's ID column is the resource CODE, not a row id -- the row's
+      // uuid is the database's. Matching on code is what makes re-importing a
+      // corrected sheet update the existing resources instead of duplicating
+      // them.
+      const rows = data
+        .map(row => ({
+          code: (row.ID?.toString() || row.id?.toString() || '').trim(),
+          name: row.Name?.toString() || row.name?.toString() || '',
+          category: row.Category?.toString() || row.category?.toString() || '',
+          unit: row.Unit?.toString() || row.unit?.toString() || '',
+          rate: parseFloat(row.Rate || row.rate) || 0,
+        }))
+        .filter(r => r.code);
+
+      if (rows.length === 0) {
+        toast.error('No rows with an ID were found in the sheet.');
+        return;
+      }
+
+      // One statement, not a Promise.all of individual writes: resource
+      // libraries are imported in the thousands (see ARCHITECTURE.md).
+      await importResourceRates(enterprise.id, rows as any);
     } else if (type === 'users') {
       // A spreadsheet cannot create accounts. The Firestore version invented
       // uids like `imported_ab12cd3` and wrote them into the users map, so

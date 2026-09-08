@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, Calendar as ProjectCalendar, EtcDetail, ResourceRate, ScheduleItem } from '../types';
 import { subscribeToTable } from '../lib/supabase';
+import { fetchProjectResourceRates } from '../lib/projectSettings';
 import { resolvePhasingWindow, parsePastedDate, toStoredDate } from '../lib/phasing';
 import {
   fetchCostCodes,
@@ -994,13 +995,31 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     e.target.value = '';
   };
 
+  // The project's own resource library, loaded when the picker is opened.
+  const [projectResources, setProjectResources] = useState<ResourceRate[]>([]);
+  useEffect(() => {
+    if (!isResourceModalOpen) return;
+    let active = true;
+    void fetchProjectResourceRates(project.id)
+      .then((rows) => { if (active) setProjectResources(rows); })
+      .catch((error) => console.error('Failed to load project resources', error));
+    return () => { active = false; };
+  }, [isResourceModalOpen, project.id]);
+
   const groupedLibraryResources = useMemo(() => {
-    const library = resourceLibrarySource === 'enterprise' ? enterprise.resourceRates : project.resourceRates;
-    const filtered = library?.filter(r => 
-      r.name.toLowerCase().includes(resourceSearch.toLowerCase()) ||
-      r.id.toLowerCase().includes(resourceSearch.toLowerCase()) ||
-      r.category?.toLowerCase().includes(resourceSearch.toLowerCase())
-    ) || [];
+    // The project library is loaded from project_resource_rates rather than
+    // read off the project object: it used to be an array stored on the
+    // project row, and nothing hydrates it any more, so the project tab of
+    // this picker was always empty.
+    const library = resourceLibrarySource === 'enterprise'
+      ? (enterprise.resourceRates ?? [])
+      : projectResources;
+    const term = resourceSearch.toLowerCase();
+    const filtered = library.filter(r =>
+      r.name.toLowerCase().includes(term) ||
+      (r.code ?? '').toLowerCase().includes(term) ||
+      r.category?.toLowerCase().includes(term)
+    );
 
     const grouped = filtered.reduce((acc, resource) => {
       const category = resource.category || 'Uncategorized';
@@ -1012,7 +1031,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     }, {} as Record<string, typeof filtered>);
 
     return Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b));
-  }, [resourceLibrarySource, enterprise.resourceRates, project.resourceRates, resourceSearch]);
+  }, [resourceLibrarySource, enterprise.resourceRates, projectResources, resourceSearch]);
 
   const handleAddResources = async (resources: any[], source: 'enterprise' | 'project' = 'enterprise') => {
     if (resources.length === 0) return;
@@ -1028,13 +1047,19 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
       const count = Math.max(1, Math.min(500, addRowsCount));
       const newRows = resources.flatMap((resource) =>
         Array.from({ length: count }, () => ({
-          item: resource.id,
+          // The line's Item shows the resource CODE ("LAB-01"), not the row's
+          // uuid. resourceId below keeps the link back to the library entry.
+          item: resource.code,
           description: resource.name,
           unit: resource.unit || 'HR',
           rate: resource.rate || 0,
           category: resource.category || '',
           isEnterpriseResource: source === 'enterprise',
-          resourceId: resource.id,
+          // Each library has its own link column, and the database refuses a
+          // row whose flag disagrees with which one is set.
+          ...(source === 'enterprise'
+            ? { resourceId: resource.id }
+            : { projectResourceId: resource.id }),
         }))
       );
 
@@ -2116,7 +2141,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
                               </div>
                               <div>
                                 <div className="text-sm font-bold text-slate-900 dark:text-white">{resource.name}</div>
-                                <div className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">{resource.id}</div>
+                                <div className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">{resource.code}</div>
                               </div>
                             </div>
                             <div className="text-right">
