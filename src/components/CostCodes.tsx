@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, Change, ChangeRecord, Subcontract, ScheduleItem } from '../types';
-import { db, auth } from '../firebase';
 import { subscribeToTable } from '../lib/supabase';
 import {
   fetchCostCodes,
@@ -12,9 +11,17 @@ import {
   bulkUpdateCostCodes,
   fetchScheduleItems,
   fetchEtcDetails,
+  insertEtcDetailsAt,
+  upsertEtcDetail,
+  upsertEtcDetails,
+  deleteEtcDetails,
+  bulkUpdateEtcDetails,
   fetchActualCosts,
   fetchBaselineBudgets,
   fetchCostPhasing,
+  upsertCostPhasing,
+  upsertCostPhasingMany,
+  type CostPhasingType,
   fetchChanges,
   fetchChangeRecords,
   fetchSubcontractsWithItems,
@@ -22,19 +29,6 @@ import {
   fetchCalendars,
   recalculateProjectCosts,
 } from '../lib/costCodes';
-import { 
-  doc, 
-  updateDoc, 
-  onSnapshot, 
-  collection, 
-  query, 
-  where, 
-  addDoc, 
-  deleteDoc, 
-  writeBatch,
-  getDocs,
-  orderBy
-} from 'firebase/firestore';
 import { 
   Calendar,
   Search, 
@@ -717,6 +711,33 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   }, [resourceLibrarySource, enterprise.resourceRates, project.resourceRates, resourceSearch]);
 
   // Fetch ETC Details
+  // Hoisted so the write handlers can refresh after their own writes rather
+  // than waiting for a change broadcast to tell them what they just did.
+  // Ordering is the database's job: sort_order then created_at, both NOT NULL.
+  // The old in-memory sort existed to cope with rows written before sortOrder
+  // was introduced, which defaulted to -1.
+  const reloadEtcRows = useCallback(async () => {
+    if (!selectedEtcCode) {
+      setEtcRows([]);
+      return;
+    }
+    try {
+      setEtcRows(await fetchEtcDetails(project.id, selectedEtcCode));
+    } catch (error) {
+      console.error('Error fetching ETC details:', error);
+    } finally {
+      setIsEtcLoading(false);
+    }
+  }, [project.id, selectedEtcCode]);
+
+  // Where "Add rows" puts them: below the last selected row, or at the end
+  // when nothing is selected. undefined means append.
+  const etcInsertIndex = useCallback((): number | undefined => {
+    const selected = etcGridRef.current?.api.getSelectedRows() || [];
+    if (selected.length === 0) return undefined;
+    return selected[selected.length - 1].sortOrder + 1;
+  }, []);
+
   useEffect(() => {
     if (!selectedEtcCode) {
       setEtcRows([]);
@@ -724,21 +745,9 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }
 
     setIsEtcLoading(true);
-    // Ordering is the database's job now: sort_order then created_at, both
-    // NOT NULL. The old in-memory sort existed to cope with rows written
-    // before sortOrder was introduced, which defaulted to -1.
-    const load = async () => {
-      try {
-        setEtcRows(await fetchEtcDetails(project.id, selectedEtcCode));
-      } catch (error) {
-        console.error('Error fetching ETC details:', error);
-      } finally {
-        setIsEtcLoading(false);
-      }
-    };
-    void load();
-    return subscribeToTable('etc_details', `cost_code_id=eq.${selectedEtcCode}`, () => void load());
-  }, [selectedEtcCode, project.id]);
+    void reloadEtcRows();
+    return subscribeToTable('etc_details', `cost_code_id=eq.${selectedEtcCode}`, () => void reloadEtcRows());
+  }, [selectedEtcCode, project.id, reloadEtcRows]);
 
   // Fetch Actual Cost Details
   useEffect(() => {
@@ -789,22 +798,38 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   }, [selectedActualsCode, project.id]);
 
   // Fetch Cost Phasing (Baseline/Approved)
+  // start_date and end_date are DATE columns, but the grid hands over Date
+  // objects, ISO strings, spreadsheet values and empty strings interchangeably.
+  // An empty string is not a date -- it has to become null, or the insert
+  // fails on a row the user simply left blank.
+  const toDateOnly = (val: unknown): string | null => {
+    if (!val) return null;
+    const d = val instanceof Date ? val : new Date(String(val));
+    if (isNaN(d.getTime())) return null;
+    return d.toISOString().slice(0, 10);
+  };
+
+  const reloadCostPhasing = useCallback(async () => {
+    if (!selectedTimephasingCode) {
+      setCostPhasing([]);
+      return;
+    }
+    try {
+      setCostPhasing(await fetchCostPhasing(project.id, undefined, selectedTimephasingCode));
+    } catch (error) {
+      console.error('Error fetching cost phasing:', error);
+    }
+  }, [project.id, selectedTimephasingCode]);
+
   useEffect(() => {
     if (!selectedTimephasingCode) {
       setCostPhasing([]);
       return;
     }
 
-    const load = async () => {
-      try {
-        setCostPhasing(await fetchCostPhasing(project.id, undefined, selectedTimephasingCode));
-      } catch (error) {
-        console.error('Error fetching cost phasing:', error);
-      }
-    };
-    void load();
-    return subscribeToTable('cost_phasing', `cost_code_id=eq.${selectedTimephasingCode}`, () => void load());
-  }, [selectedTimephasingCode, project.id]);
+    void reloadCostPhasing();
+    return subscribeToTable('cost_phasing', `cost_code_id=eq.${selectedTimephasingCode}`, () => void reloadCostPhasing());
+  }, [selectedTimephasingCode, project.id, reloadCostPhasing]);
 
   // Changes Effects
   useEffect(() => {
@@ -927,30 +952,17 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         const currentPeriodId = project.reportingPeriods?.currentPeriodId;
         const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
         
-        // 1. Get Actuals
-        const actualsQuery = query(
-          collection(db, 'actualCosts'),
-          where('projectId', '==', project.id)
-        );
-        const actualsSnap = await getDocs(actualsQuery);
-        const costCodeObj = costCodes.find(c => c.code === selectedTimephasingCode);
-        const filteredActuals = actualsSnap.docs
-          .map(doc => doc.data())
-          .filter((a: any) => a.costCodeId === costCodeObj?.id || a.costCodeId === selectedTimephasingCode);
-        
+        // 1. Get Actuals for this cost code, filtered by the database rather
+        //    than by downloading the project's whole ledger.
+        const filteredActuals = await fetchActualCosts(project.id, selectedTimephasingCode);
+
         const actualsByPeriod: Record<string, number> = {};
-        filteredActuals.forEach((a: any) => {
+        filteredActuals.forEach((a) => {
           actualsByPeriod[a.reportingPeriodId] = (actualsByPeriod[a.reportingPeriodId] || 0) + (a.cost || 0);
         });
 
         // 2. Get ETC Details
-        const etcQuery = query(
-          collection(db, 'etcDetails'),
-          where('projectId', '==', project.id),
-          where('costCode', '==', selectedTimephasingCode)
-        );
-        const etcSnap = await getDocs(etcQuery);
-        const etcDetails = etcSnap.docs.map(doc => doc.data());
+        const etcDetails = await fetchEtcDetails(project.id, selectedTimephasingCode);
         
         // 3. Get Subcontract Phasing
         const subphasingByPeriod: Record<string, number> = {};
@@ -1134,96 +1146,27 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     fetchData();
   }, [selectedTimephasingCode, project.id, costCodes, costPhasing, project.reportingPeriods, subcontracts]);
 
-  enum OperationType {
-    CREATE = 'create',
-    UPDATE = 'update',
-    DELETE = 'delete',
-    LIST = 'list',
-    GET = 'get',
-    WRITE = 'write',
-  }
-
-  const handleFirestoreError = (error: any, operationType: OperationType, path: string | null) => {
-    const errInfo = {
-      error: error instanceof Error ? error.message : String(error),
-      authInfo: {
-        userId: auth.currentUser?.uid,
-        email: auth.currentUser?.email,
-        emailVerified: auth.currentUser?.emailVerified,
-        isAnonymous: auth.currentUser?.isAnonymous,
-        tenantId: auth.currentUser?.tenantId,
-        providerInfo: auth.currentUser?.providerData.map(provider => ({
-          providerId: provider.providerId,
-          displayName: provider.displayName,
-          email: provider.email,
-          photoUrl: provider.photoURL
-        })) || []
-      },
-      operationType,
-      path
-    };
-    console.error('Firestore Error: ', JSON.stringify(errInfo));
-    return error;
-  };
-
   const handleAddEtcRow = async () => {
     if (!selectedEtcCode) return;
     try {
-      const batch = writeBatch(db);
+      // The 500 cap came from Firestore's batch limit, not from anything about
+      // ETC rows. The insert is one statement now, so the cap is only there to
+      // stop a typo in the spinner adding a hundred thousand rows.
       const count = Math.max(1, Math.min(500, addRowsCount));
-      
-      // Determine insertion point
-      let insertSortOrder: number;
-      const selectedRows = etcGridRef.current?.api.getSelectedRows() || [];
-      if (selectedRows.length > 0) {
-        // Insert after the last selected row
-        const lastSelected = selectedRows[selectedRows.length - 1];
-        insertSortOrder = lastSelected.sortOrder + 1;
-        
-        // Shift others
-        const toShift = etcRows.filter(r => r.sortOrder >= insertSortOrder);
-        toShift.forEach(r => {
-          batch.update(doc(db, 'etcDetails', r.id), { sortOrder: r.sortOrder + count });
-        });
-      } else {
-        // Add at the end
-        const maxSortOrder = etcRows.length > 0 ? Math.max(...etcRows.map(r => r.sortOrder || 0)) : -1;
-        insertSortOrder = maxSortOrder + 1;
-      }
-      
-      for (let i = 0; i < count; i++) {
-          const newRow = {
-            projectId: project.id,
-            costCode: selectedEtcCode,
-            item: '',
-            description: '',
-            qty: 0,
-            unit: '',
-            rate: 0,
-            phasingMethod: 'Manual',
-            phasingStartDate: '',
-            phasingEndDate: '',
-            phasingUnit: '',
-            phasingQty: 0,
-            category: '',
-            periodValues: {},
-            enterpriseAttributes: {},
-            projectAttributes: {},
-            userDefined: {},
-            sortOrder: insertSortOrder + i,
-            createdAt: new Date().toISOString(),
-            source: 'MANUAL',
-            isEnterpriseResource: false
-          };
-        const docRef = doc(collection(db, 'etcDetails'));
-        batch.set(docRef, newRow);
-      }
-      
-      await batch.commit();
-      toast.success(`${count} row(s) added successfully`);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'etcDetails');
-      toast.error("Failed to add row. Check console for details.");
+
+      // A blank row is {}: every column the database can default, it defaults.
+      const blankRows = Array.from({ length: count }, () => ({}));
+      const added = await insertEtcDetailsAt(
+        selectedEtcCode,
+        blankRows,
+        etcInsertIndex()
+      );
+
+      await reloadEtcRows();
+      toast.success(`${added} row(s) added successfully`);
+    } catch (error: any) {
+      console.error('Error adding ETC rows:', error);
+      toast.error(`Failed to add row: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1231,68 +1174,31 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   const handleAddResources = async (resources: any[], source: 'enterprise' | 'project' = 'enterprise') => {
     if (!selectedEtcCode || resources.length === 0) return;
     try {
-      const batch = writeBatch(db);
       const count = Math.max(1, Math.min(500, addRowsCount));
-      
-      // Determine insertion point
-      let insertSortOrder: number;
-      const selectedRows = etcGridRef.current?.api.getSelectedRows() || [];
-      if (selectedRows.length > 0) {
-        // Insert after the last selected row
-        const lastSelected = selectedRows[selectedRows.length - 1];
-        insertSortOrder = lastSelected.sortOrder + 1;
-        
-        // Shift others
-        const totalNewRows = count * resources.length;
-        const toShift = etcRows.filter(r => r.sortOrder >= insertSortOrder);
-        toShift.forEach(r => {
-          batch.update(doc(db, 'etcDetails', r.id), { sortOrder: r.sortOrder + totalNewRows });
-        });
-      } else {
-        // Add at the end
-        const maxSortOrder = etcRows.length > 0 ? Math.max(...etcRows.map(r => r.sortOrder || 0)) : -1;
-        insertSortOrder = maxSortOrder + 1;
-      }
 
-      let currentSortOrder = insertSortOrder;
-      for (const resource of resources) {
-        for (let i = 0; i < count; i++) {
-          const newRow = {
-            projectId: project.id,
-            costCode: selectedEtcCode,
-            item: resource.id,
-            description: resource.name,
-            qty: 0,
-            unit: resource.unit || 'HR',
-            rate: resource.rate || 0,
-            phasingMethod: 'Manual',
-            phasingStartDate: '',
-            phasingEndDate: '',
-            phasingUnit: '',
-            phasingQty: 0,
-            category: resource.category || '',
-            periodValues: {},
-            enterpriseAttributes: {},
-            projectAttributes: {},
-            userDefined: {},
-            sortOrder: currentSortOrder++,
-            createdAt: new Date().toISOString(),
-            isEnterpriseResource: source === 'enterprise',
-            source: source.toUpperCase(),
-            resourceId: resource.id
-          };
-          const docRef = doc(collection(db, 'etcDetails'));
-          batch.set(docRef, newRow);
-        }
-      }
-      
-      await batch.commit();
+      // Flattened rather than nested loops writing one document each: the
+      // rows go over in one call, in order.
+      const newRows = resources.flatMap((resource) =>
+        Array.from({ length: count }, () => ({
+          item: resource.id,
+          description: resource.name,
+          unit: resource.unit || 'HR',
+          rate: resource.rate || 0,
+          category: resource.category || '',
+          isEnterpriseResource: source === 'enterprise',
+          resourceId: resource.id,
+        }))
+      );
+
+      const added = await insertEtcDetailsAt(selectedEtcCode, newRows, etcInsertIndex());
+
+      await reloadEtcRows();
       setIsResourceModalOpen(false);
       setSelectedResourceIds(new Set());
-      toast.success(`${resources.length * count} row(s) added successfully`);
-    } catch (error) {
-      console.error("Error adding resources:", error);
-      toast.error("Failed to add resources");
+      toast.success(`${added} row(s) added successfully`);
+    } catch (error: any) {
+      console.error('Error adding resources:', error);
+      toast.error(`Failed to add resources: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1310,12 +1216,15 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       };
 
       // Define allowed fields
+      // 'source' and 'externalId' were on this list but are not columns --
+      // leftovers from the document model. Listing a field that cannot be
+      // stored reads as though it is persisted, so they are gone.
       const allowedFields = [
-        'item', 'description', 'category', 'unit', 'rate', 'qty', 
-        'phasingMethod', 'phasingStartDate', 'phasingEndDate', 
+        'item', 'description', 'category', 'unit', 'rate', 'qty',
+        'phasingMethod', 'phasingStartDate', 'phasingEndDate',
         'phasingUnit', 'phasingQty', 'calendarId', 'periodValues',
         'enterpriseAttributes', 'projectAttributes', 'userDefined',
-        'source', 'isEnterpriseResource', 'externalId', 'activityId'
+        'isEnterpriseResource', 'activityId'
       ];
 
       allowedFields.forEach(field => {
@@ -1330,6 +1239,13 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             } else if (field === 'periodValues' || field === 'enterpriseAttributes' || field === 'projectAttributes' || field === 'userDefined') {
               val = {};
             }
+          }
+
+          // The phasing dates are DATE columns. Clearing one in the grid gives
+          // an empty string, which is not a date -- it has to go over as null
+          // or the save fails on a field the user meant to blank.
+          if (field === 'phasingStartDate' || field === 'phasingEndDate') {
+            val = toDateOnly(val);
           }
           
           // CRITICAL: Zero out non-future periods for ETC
@@ -1349,10 +1265,10 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         }
       });
 
-      await updateDoc(doc(db, 'etcDetails', rowId), updates);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `etcDetails/${rowId}`);
-      toast.error("Failed to update row");
+      await upsertEtcDetail(project.id, { id: rowId, ...updates });
+    } catch (error: any) {
+      console.error('Error updating ETC row:', error);
+      toast.error(`Failed to update row: ${error?.message || 'Unknown error'}`);
     }
   }, [project.id, project.reportingPeriods]);
 
@@ -1386,7 +1302,10 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       return;
     }
 
-    const batch = writeBatch(db);
+    // Collected and written in one upsert, rather than accumulated into a
+    // Firestore batch. Only the columns being recalculated are sent; the rest
+    // of each row is left alone.
+    const phasedRows: Array<{ id: string; costCodeId: string; periodValues: Record<string, number>; qty: number }> = [];
     let updatedCount = 0;
 
     const parseDateToUTCMidnight = (val: any): Date | null => {
@@ -1453,12 +1372,13 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             });
           }
 
-          batch.update(doc(db, 'etcDetails', row.id), {
+          phasedRows.push({
+            id: row.id,
+            costCodeId: selectedEtcCode,
             periodValues: newPeriodValues,
             qty: Object.keys(newPeriodValues)
-              .filter(key => distributionPeriods.some(dp => dp.id === key)) 
+              .filter(key => distributionPeriods.some(dp => dp.id === key))
               .reduce((sum, key) => sum + (newPeriodValues[key] || 0), 0),
-            updatedAt: new Date().toISOString()
           });
           updatedCount++;
           continue;
@@ -1618,23 +1538,25 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           newPeriodValues[key] = Math.round(newPeriodValues[key] * 10000) / 10000;
         });
 
-        batch.update(doc(db, 'etcDetails', row.id), {
+        phasedRows.push({
+          id: row.id,
+          costCodeId: selectedEtcCode,
           periodValues: newPeriodValues,
           qty: Object.keys(newPeriodValues)
-            .filter(key => distributionPeriods.some(dp => dp.id === key)) 
+            .filter(key => distributionPeriods.some(dp => dp.id === key))
             .reduce((sum, key) => sum + (newPeriodValues[key] || 0), 0),
-          updatedAt: new Date().toISOString()
         });
         updatedCount++;
       }
 
     if (updatedCount > 0) {
       try {
-        await batch.commit();
+        await upsertEtcDetails(project.id, phasedRows);
+        await reloadEtcRows();
         toast.success(`Calculated phasing for ${updatedCount} rows`);
-      } catch (error) {
-        console.error("Error calculating phasing:", error);
-        toast.error("Failed to calculate phasing");
+      } catch (error: any) {
+        console.error('Error calculating phasing:', error);
+        toast.error(`Failed to calculate phasing: ${error?.message || 'Unknown error'}`);
       }
     } else {
       toast.warning("No valid rows to calculate. Check highlighted rows.");
@@ -1643,11 +1565,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
   const handleDeleteEtcRow = async (rowId: string) => {
     try {
-      await deleteDoc(doc(db, 'etcDetails', rowId));
-      toast.success("Row deleted");
-    } catch (error) {
-      console.error("Error deleting ETC row:", error);
-      toast.error("Failed to delete row");
+      await deleteEtcDetails([rowId]);
+      await reloadEtcRows();
+      toast.success('Row deleted');
+    } catch (error: any) {
+      console.error('Error deleting ETC row:', error);
+      toast.error(`Failed to delete row: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1663,16 +1586,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     if (!confirm(`Are you sure you want to delete ${type === 'selected' ? rowsToDelete.length : 'all'} row(s)?`)) return;
 
     try {
-      const batch = writeBatch(db);
-      rowsToDelete.forEach(id => {
-        batch.delete(doc(db, 'etcDetails', id));
-      });
-      await batch.commit();
+      // One statement, so "delete all" is no longer capped by a batch limit.
+      await deleteEtcDetails(rowsToDelete);
+      await reloadEtcRows();
       setSelectedEtcIds(new Set());
       toast.success(`${rowsToDelete.length} row(s) deleted`);
-    } catch (error) {
-      console.error("Error bulk deleting ETC rows:", error);
-      toast.error("Failed to delete rows");
+    } catch (error: any) {
+      console.error('Error bulk deleting ETC rows:', error);
+      toast.error(`Failed to delete rows: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1681,55 +1602,28 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     
     setIsSaving(true);
     try {
-      const batch = writeBatch(db);
-      selectedEtcIds.forEach(id => {
-        const row = etcRows.find(r => r.id === id);
-        const updateObj: any = {
-          updatedAt: new Date().toISOString()
-        };
-        
-        // Only allow category update if NOT a library resource
-        const isLibraryResource = row?.isEnterpriseResource || row?.source === 'PROJECT';
-        if (etcBulkUpdateData.category && !isLibraryResource) {
-          updateObj.category = etcBulkUpdateData.category;
-        }
-        
-        if (etcBulkUpdateData.calendarId) updateObj.calendarId = etcBulkUpdateData.calendarId;
-        if (etcBulkUpdateData.phasingMethod) updateObj.phasingMethod = etcBulkUpdateData.phasingMethod;
-        if (etcBulkUpdateData.phasingUnit) updateObj.phasingUnit = etcBulkUpdateData.phasingUnit;
-        
-        if (Object.keys(etcBulkUpdateData.enterpriseAttributes).length > 0) {
-          updateObj.enterpriseAttributes = { 
-            ...(row?.enterpriseAttributes || {}), 
-            ...etcBulkUpdateData.enterpriseAttributes 
-          };
-        }
-        
-        if (Object.keys(etcBulkUpdateData.projectAttributes).length > 0) {
-          updateObj.projectAttributes = { 
-            ...(row?.projectAttributes || {}), 
-            ...etcBulkUpdateData.projectAttributes 
-          };
-        }
-
-        if (Object.keys(etcBulkUpdateData.userDefined || {}).length > 0) {
-          updateObj.userDefined = {
-            ...(row?.userDefined || {}),
-            ...etcBulkUpdateData.userDefined
-          };
-        }
-        
-        batch.update(doc(db, 'etcDetails', id), updateObj);
+      // The maps merge server-side against each row's current value, and the
+      // "don't change a library resource's category" rule travels with the
+      // statement rather than being applied to whichever rows this grid
+      // happens to have loaded.
+      const updated = await bulkUpdateEtcDetails(Array.from(selectedEtcIds), {
+        category: etcBulkUpdateData.category,
+        calendarId: etcBulkUpdateData.calendarId,
+        phasingMethod: etcBulkUpdateData.phasingMethod,
+        phasingUnit: etcBulkUpdateData.phasingUnit,
+        enterpriseAttributes: etcBulkUpdateData.enterpriseAttributes,
+        projectAttributes: etcBulkUpdateData.projectAttributes,
+        userDefined: etcBulkUpdateData.userDefined,
       });
-      
-      await batch.commit();
+      await reloadEtcRows();
+      setIsEtcBulkUpdating(false);
       setIsEtcBulkUpdating(false);
       setSelectedEtcIds(new Set());
       setEtcBulkUpdateData({ enterpriseAttributes: {}, projectAttributes: {}, userDefined: {} });
-      toast.success(`Updated ${selectedEtcIds.size} rows`);
-    } catch (error) {
-      console.error("Error bulk updating ETC:", error);
-      toast.error("Failed to update rows");
+      toast.success(`Updated ${updated} row${updated === 1 ? '' : 's'}`);
+    } catch (error: any) {
+      console.error('Error bulk updating ETC:', error);
+      toast.error(`Failed to update rows: ${error?.message || 'Unknown error'}`);
     } finally {
       setIsSaving(false);
     }
@@ -1797,7 +1691,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
         const futurePeriodIds = allPeriods.slice(currentIndex + 1).map(p => p.id);
 
-        const batch = writeBatch(db);
+        const importedRows: Array<Record<string, unknown>> = [];
 
         data.forEach(row => {
           const periodValues: Record<string, number> = {};
@@ -1832,10 +1726,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             if (row[`Text ${i}`] !== undefined) userDefined[`text${i}`] = String(row[`Text ${i}`]);
           }
 
-          const newRowRef = doc(collection(db, 'etcDetails'));
-          batch.set(newRowRef, {
-            projectId: project.id,
-            costCode: selectedEtcCode,
+          importedRows.push({
             activityId: row['Activity ID'] || '',
             item: row['Item'] || '',
             description: row['Description'] || '',
@@ -1847,15 +1738,16 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             enterpriseAttributes,
             projectAttributes,
             userDefined,
-            createdAt: new Date().toISOString()
           });
         });
 
-        await batch.commit();
-        toast.success(`Imported ${data.length} rows successfully`);
-      } catch (error) {
-        console.error("Error importing ETC details:", error);
-        toast.error("Failed to import rows");
+        // Appended in one call, in the order the sheet listed them.
+        const added = await insertEtcDetailsAt(selectedEtcCode, importedRows);
+        await reloadEtcRows();
+        toast.success(`Imported ${added} rows successfully`);
+      } catch (error: any) {
+        console.error('Error importing ETC details:', error);
+        toast.error(`Failed to import rows: ${error?.message || 'Unknown error'}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -2747,7 +2639,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
     setIsTimephasingLoading(true);
     try {
-      const batch = writeBatch(db);
+      const phasingUpserts: Parameters<typeof upsertCostPhasingMany>[1] = [];
       const periods = project.reportingPeriods?.periods || [];
       const currentPeriodId = project.reportingPeriods?.currentPeriodId;
       const currentPeriod = periods.find(p => p.id === currentPeriodId);
@@ -2789,46 +2681,33 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             row.periodValues
           );
 
-          // Find doc to update
-          const q = query(
-            collection(db, 'costPhasing'),
-            where('projectId', '==', project.id),
-            where('costCodeId', '==', selectedTimephasingCode),
-            where('type', '==', row.id)
-          );
-          const snap = await getDocs(q);
-          
-          const updatePayload = {
-            projectId: project.id,
+          // No "read to find out whether it exists, then update or insert":
+          // (cost_code_id, type) is unique, so this is one upsert and two
+          // people phasing the same row at once cannot create two curves for
+          // it -- which the read-then-write version could.
+          phasingUpserts.push({
             costCodeId: selectedTimephasingCode,
             type: row.id,
             phasingSource: 'Auto',
-            startDate: row.startDate instanceof Date ? row.startDate.toISOString() : row.startDate,
-            endDate: row.endDate instanceof Date ? row.endDate.toISOString() : row.endDate,
+            startDate: toDateOnly(row.startDate),
+            endDate: toDateOnly(row.endDate),
             distribution: row.distribution,
             periodValues: newPhasing,
-            updatedAt: new Date().toISOString()
-          };
-
-          if (!snap.empty) {
-            batch.update(snap.docs[0].ref, updatePayload);
-          } else {
-            batch.set(doc(collection(db, 'costPhasing')), updatePayload);
-          }
+          });
           updatedCount++;
         }
       }
 
       if (updatedCount > 0) {
-        await batch.commit();
+        await upsertCostPhasingMany(project.id, phasingUpserts);
+        await reloadCostPhasing();
         toast.success(`Recalculated phasing for ${updatedCount} row(s)`);
       } else {
-        toast.warning("Incomplete auto-phasing settings (Dates or Distribution missing)");
+        toast.warning('Incomplete auto-phasing settings (Dates or Distribution missing)');
       }
-    } catch (error) {
-      console.error("Error calculating auto phasing:", error);
-      handleFirestoreError(error, OperationType.UPDATE, 'costPhasing/batch');
-      toast.error("Failed to calculate auto phasing");
+    } catch (error: any) {
+      console.error('Error calculating auto phasing:', error);
+      toast.error(`Failed to calculate auto phasing: ${error?.message || 'Unknown error'}`);
     } finally {
       setIsTimephasingLoading(false);
     }
@@ -2877,14 +2756,18 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
         const futurePeriodIds = periods.slice(currentPeriodIndex + 1).map(p => p.id);
 
-        const batch = writeBatch(db);
+        const phasingUpserts: Parameters<typeof upsertCostPhasingMany>[1] = [];
 
         for (const row of data) {
+          // Typed rather than a bare string: the column is an enum, so a
+          // sheet with an unrecognised Type must skip the row rather than
+          // reach the database with a value it will reject.
           const type = row['Type'];
-          let phasingType = '';
-          if (type === 'Baseline Budget') phasingType = 'baseline';
-          else if (type === 'Approved Budget') phasingType = 'approved';
-          else if (type === 'Estimate At Completion') phasingType = 'eac';
+          const phasingType: CostPhasingType | null =
+            type === 'Baseline Budget' ? 'baseline'
+            : type === 'Approved Budget' ? 'approved'
+            : type === 'Estimate At Completion' ? 'eac'
+            : null;
 
           if (!phasingType) continue;
 
@@ -2907,30 +2790,23 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             }
           });
 
-          const updatePayload: any = {
-            projectId: project.id,
+          phasingUpserts.push({
             costCodeId: selectedTimephasingCode,
             type: phasingType,
             phasingSource: row['Phasing Source'] || (phasingType === 'eac' ? 'ETC Details' : 'Manual'),
-            startDate: row['Start Date'] || '',
-            endDate: row['End Date'] || '',
+            startDate: toDateOnly(row['Start Date']),
+            endDate: toDateOnly(row['End Date']),
             distribution: row['Distribution'] || 'Even',
             periodValues,
-            updatedAt: new Date().toISOString()
-          };
-
-          if (existingDoc) {
-            batch.update(doc(db, 'costPhasing', existingDoc.id), updatePayload);
-          } else {
-            batch.set(doc(collection(db, 'costPhasing')), updatePayload);
-          }
+          });
         }
 
-        await batch.commit();
-        toast.success("Timephasing imported successfully");
-      } catch (error) {
-        console.error("Error importing timephasing:", error);
-        toast.error("Failed to import timephasing");
+        await upsertCostPhasingMany(project.id, phasingUpserts);
+        await reloadCostPhasing();
+        toast.success('Timephasing imported successfully');
+      } catch (error: any) {
+        console.error('Error importing timephasing:', error);
+        toast.error(`Failed to import timephasing: ${error?.message || 'Unknown error'}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -2973,47 +2849,30 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         endDateStr = '';
       }
 
-      const updatePayload = {
-        projectId: project.id,
-        costCodeId: selectedTimephasingCode,
-        type: data.id,
-        phasingSource: data.phasingSource || 'Manual',
-        activityId: data.activityId || null,
-        startDate: startDateStr,
-        endDate: endDateStr,
-        distribution: data.distribution || 'Even',
-        periodValues: data.periodValues || {},
-        updatedAt: new Date().toISOString()
-      };
-
-      if (data.docId) {
-        console.log(`Updating existing doc: ${data.docId}`);
-        await updateDoc(doc(db, 'costPhasing', data.docId), updatePayload);
-      } else {
-        console.log(`Searching for existing doc via query...`);
-        const q = query(
-          collection(db, 'costPhasing'),
-          where('projectId', '==', project.id),
-          where('costCodeId', '==', selectedTimephasingCode),
-          where('type', '==', data.id)
-        );
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-          console.log(`Found doc via query: ${snap.docs[0].id}`);
-          await updateDoc(snap.docs[0].ref, updatePayload);
-        } else {
-          console.log(`No doc found, creating new one.`);
-          await addDoc(collection(db, 'costPhasing'), updatePayload);
+      // One upsert on (cost_code_id, type). The three branches this replaces
+      // -- update by stored id, else search for it, else create -- existed
+      // only because nothing stopped a second curve being created for the
+      // same row. A unique constraint does.
+      await upsertCostPhasing(
+        project.id,
+        selectedTimephasingCode,
+        data.id,
+        data.periodValues || {},
+        {
+          phasingSource: data.phasingSource || 'Manual',
+          activityId: data.activityId || null,
+          startDate: toDateOnly(startDateStr),
+          endDate: toDateOnly(endDateStr),
+          distribution: data.distribution || 'Even',
         }
-      }
-      
+      );
+      await reloadCostPhasing();
       toast.success(`${data.type} updated`);
-    } catch (error) {
-      console.error("Error updating cost phasing:", error);
-      handleFirestoreError(error, OperationType.UPDATE, `costPhasing/${data.docId || 'new'}`);
-      toast.error("Failed to update cost phasing");
+    } catch (error: any) {
+      console.error('Error updating cost phasing:', error);
+      toast.error(`Failed to update cost phasing: ${error?.message || 'Unknown error'}`);
     }
-  }, [project.id, selectedTimephasingCode]);
+  }, [project.id, selectedTimephasingCode, reloadCostPhasing]);
 
   const actualsColumnDefs = useMemo<ColDef[]>(() => [
     { 

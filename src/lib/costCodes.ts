@@ -129,6 +129,15 @@ export interface CostPhasingRow {
   costCodeId: string;
   type: CostPhasingType;
   periodValues: Record<string, number>;
+  /** Where this curve comes from: Manual, Auto, ETC Details or SubContract.
+   *  Not the same set as subcontract_line_items.phasing_source. */
+  phasingSource?: 'Manual' | 'Auto' | 'ETC Details' | 'SubContract';
+  /** The schedule activity this row is tied to, chosen per row. */
+  activityId?: string | null;
+  /** The inputs auto-phasing spreads the total across. */
+  startDate?: string | null;
+  endDate?: string | null;
+  distribution?: string | null;
 }
 
 export async function fetchCostPhasing(
@@ -153,10 +162,17 @@ export async function upsertCostPhasing(
   projectId: string,
   costCodeId: string,
   type: CostPhasingType,
-  periodValues: Record<string, number>
+  periodValues: Record<string, number>,
+  settings?: Pick<CostPhasingRow, 'phasingSource' | 'activityId' | 'startDate' | 'endDate' | 'distribution'>
 ): Promise<void> {
   const { error } = await supabase.from('cost_phasing').upsert(
-    { project_id: projectId, cost_code_id: costCodeId, type, period_values: periodValues },
+    {
+      project_id: projectId,
+      cost_code_id: costCodeId,
+      type,
+      period_values: periodValues,
+      ...(settings ? toRow(settings) : {}),
+    },
     { onConflict: 'cost_code_id,type' }
   );
   raise('save cost phasing', error);
@@ -164,15 +180,19 @@ export async function upsertCostPhasing(
 
 export async function upsertCostPhasingMany(
   projectId: string,
-  rows: Array<{ costCodeId: string; type: CostPhasingType; periodValues: Record<string, number> }>
+  rows: Array<
+    { costCodeId: string; type: CostPhasingType; periodValues: Record<string, number> } &
+    Partial<Pick<CostPhasingRow, 'phasingSource' | 'activityId' | 'startDate' | 'endDate' | 'distribution'>>
+  >
 ): Promise<void> {
   if (rows.length === 0) return;
   const { error } = await supabase.from('cost_phasing').upsert(
-    rows.map((r) => ({
+    rows.map(({ costCodeId, type, periodValues, ...settings }) => ({
       project_id: projectId,
-      cost_code_id: r.costCodeId,
-      type: r.type,
-      period_values: r.periodValues,
+      cost_code_id: costCodeId,
+      type,
+      period_values: periodValues,
+      ...toRow(settings),
     })),
     { onConflict: 'cost_code_id,type' }
   );
@@ -466,5 +486,67 @@ export async function bulkUpdateCostCodes(
     p_project_attributes: patch.projectAttributes ?? null,
   });
   raise('bulk update cost codes', error);
+  return (data as number) ?? 0;
+}
+
+/**
+ * Add ETC detail rows to a cost code, optionally at a position.
+ *
+ * insertIndex shifts the rows at or below that position down to make room;
+ * omit it to append. Both happen in one database function, so a partial
+ * failure cannot leave a gap in the ordering with nothing in it.
+ *
+ * Fields left out of a row fall back to the column default, so a blank row is
+ * `{}` rather than a dozen empty strings and zeros.
+ */
+export async function insertEtcDetailsAt(
+  costCodeId: string,
+  rows: Array<Record<string, unknown>>,
+  insertIndex?: number
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const { data, error } = await supabase.rpc('insert_etc_details_at', {
+    p_cost_code_id: costCodeId,
+    p_rows: rows,
+    p_insert_index: typeof insertIndex === 'number' ? insertIndex : null,
+  });
+  raise('add ETC rows', error);
+  return (data as number) ?? 0;
+}
+
+/**
+ * Apply one patch across many ETC detail rows.
+ *
+ * The three attribute maps merge into the stored value rather than replacing
+ * it. Category is skipped on rows seeded from a resource library, which take
+ * their category from the library entry.
+ */
+export async function bulkUpdateEtcDetails(
+  ids: string[],
+  patch: {
+    category?: string;
+    calendarId?: string;
+    phasingMethod?: string;
+    phasingUnit?: string;
+    enterpriseAttributes?: Record<string, string>;
+    projectAttributes?: Record<string, string>;
+    userDefined?: Record<string, string | number>;
+  }
+): Promise<number> {
+  if (ids.length === 0) return 0;
+  const nonEmpty = (m?: Record<string, unknown>) =>
+    m && Object.keys(m).length > 0 ? m : null;
+  const { data, error } = await supabase.rpc('bulk_update_etc_details', {
+    p_etc_detail_ids: ids,
+    p_category: patch.category || null,
+    p_calendar_id: patch.calendarId || null,
+    p_phasing_method: patch.phasingMethod || null,
+    p_phasing_unit: patch.phasingUnit || null,
+    p_enterprise_attributes: nonEmpty(patch.enterpriseAttributes),
+    p_project_attributes: nonEmpty(patch.projectAttributes),
+    p_user_defined: nonEmpty(patch.userDefined),
+    p_skip_library_resources: true,
+  });
+  raise('bulk update ETC rows', error);
   return (data as number) ?? 0;
 }

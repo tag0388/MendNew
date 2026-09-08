@@ -381,10 +381,9 @@ export interface EtcDetail {
   item: string;
   description: string;
   orderNumber: string;
-  udf1: string;
-  udf2: string;
-  udf3: string;
-  udf4: string;
+  /** Open map of the grid's five numeric and five text UDF columns,
+   *  keyed num1..num5 and text1..text5. */
+  userDefined: Record<string, string | number>;
   qty: number;
   unit: string;
   rate: number;
