@@ -97,3 +97,24 @@ export function raise(context: string, error: { message: string; code?: string }
   console.error(`Supabase ${context}${code}: ${error.message}`);
   throw new Error(`${context}: ${error.message}`);
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Assert that a value really is a row id before sending it as one.
+ *
+ * Cost codes have two identifiers -- a uuid primary key and a user-facing
+ * code like "C2" -- and both are strings, so passing the wrong one type-checks
+ * cleanly and fails at the database as `invalid input syntax for type uuid`.
+ * That happened twice. This turns it into an error naming the argument and the
+ * value, raised at the call site before any request is made.
+ */
+export function assertId(label: string, value: string | null | undefined): string {
+  if (!value || !UUID_RE.test(value)) {
+    throw new Error(
+      `${label} expects a row id but received ${JSON.stringify(value)}. ` +
+      `This is a bug: a user-facing code was passed where an id belongs.`
+    );
+  }
+  return value;
+}

@@ -1,4 +1,4 @@
-import { supabase, fromRow, fromRows, toRow, raise } from './supabase';
+import { supabase, fromRow, fromRows, toRow, raise, assertId } from './supabase';
 import type {
   CostCode, EtcDetail, ScheduleItem, Change, ChangeRecord, Subcontract,
   Calendar as ProjectCalendar,
@@ -81,7 +81,7 @@ export async function fetchEtcDetails(
   costCodeId?: string
 ): Promise<EtcDetail[]> {
   let q = supabase.from('etc_details').select('*').eq('project_id', projectId);
-  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  if (costCodeId) q = q.eq('cost_code_id', assertId('fetchEtcDetails(costCodeId)', costCodeId));
   // sort_order first, created_at to break ties. The old code sorted in memory
   // with `sortOrder ?? -1` because rows written before the column existed had
   // none; the column is NOT NULL with a default here.
@@ -147,7 +147,7 @@ export async function fetchCostPhasing(
 ): Promise<CostPhasingRow[]> {
   let q = supabase.from('cost_phasing').select('*').eq('project_id', projectId);
   if (type) q = q.eq('type', type);
-  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  if (costCodeId) q = q.eq('cost_code_id', assertId('fetchCostPhasing(costCodeId)', costCodeId));
   const { data, error } = await q;
   raise('load cost phasing', error);
   return fromRows<CostPhasingRow>(data);
@@ -168,7 +168,7 @@ export async function upsertCostPhasing(
   const { error } = await supabase.from('cost_phasing').upsert(
     {
       project_id: projectId,
-      cost_code_id: costCodeId,
+      cost_code_id: assertId('upsertCostPhasing(costCodeId)', costCodeId),
       type,
       period_values: periodValues,
       ...(settings ? toRow(settings) : {}),
@@ -222,7 +222,7 @@ export async function fetchActualCosts(
   costCodeId?: string
 ): Promise<ActualCostRow[]> {
   let q = supabase.from('actual_costs').select('*').eq('project_id', projectId);
-  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  if (costCodeId) q = q.eq('cost_code_id', assertId('fetchActualCosts(costCodeId)', costCodeId));
   const { data, error } = await q.order('created_at', { ascending: false });
   raise('load actual costs', error);
   return fromRows<ActualCostRow>(data);
@@ -259,7 +259,7 @@ export async function fetchBaselineBudgets(
   costCodeId?: string
 ): Promise<BaselineBudgetRow[]> {
   let q = supabase.from('baseline_budgets').select('*').eq('project_id', projectId);
-  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  if (costCodeId) q = q.eq('cost_code_id', assertId('fetchBaselineBudgets(costCodeId)', costCodeId));
   const { data, error } = await q;
   raise('load baseline budgets', error);
   return fromRows<BaselineBudgetRow>(data);
@@ -384,7 +384,7 @@ export async function fetchChangeRecords(
   costCodeId?: string
 ): Promise<ChangeRecord[]> {
   let q = supabase.from('change_records').select('*').eq('project_id', projectId);
-  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  if (costCodeId) q = q.eq('cost_code_id', assertId('fetchChangeRecords(costCodeId)', costCodeId));
   const { data, error } = await q;
   raise('load change records', error);
   return fromRows<ChangeRecord>(data);
@@ -506,7 +506,7 @@ export async function insertEtcDetailsAt(
 ): Promise<number> {
   if (rows.length === 0) return 0;
   const { data, error } = await supabase.rpc('insert_etc_details_at', {
-    p_cost_code_id: costCodeId,
+    p_cost_code_id: assertId('insertEtcDetailsAt(costCodeId)', costCodeId),
     p_rows: rows,
     p_insert_index: typeof insertIndex === 'number' ? insertIndex : null,
   });

@@ -1168,7 +1168,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   }, [selectedTimephasingCode, selectedTimephasingCodeId, project.id, costCodes, costPhasing, project.reportingPeriods, subcontracts]);
 
   const handleAddEtcRow = async () => {
-    if (!selectedEtcCode) return;
+    if (!selectedEtcCodeId) return;
     try {
       // The 500 cap came from Firestore's batch limit, not from anything about
       // ETC rows. The insert is one statement now, so the cap is only there to
@@ -1178,7 +1178,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       // A blank row is {}: every column the database can default, it defaults.
       const blankRows = Array.from({ length: count }, () => ({}));
       const added = await insertEtcDetailsAt(
-        selectedEtcCode,
+        selectedEtcCodeId,
         blankRows,
         etcInsertIndex()
       );
