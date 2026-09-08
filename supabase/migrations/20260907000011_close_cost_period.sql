@@ -46,26 +46,15 @@ begin
    order by sort_order limit 1;
 
   -- 1. Carry this period's figures into the "previous" columns, zero the
-  --    movements, and net off any accruals raised in the closing period.
-  --    The accrual is matched per cost code by correlated subquery: an
-  --    earlier draft joined the accrual set with `on true`, which paired
-  --    every cost code with every accrual.
-  update cost_codes c
-     set approved_budget_previous        = c.approved_budget,
+  --    movements. The actual-cost totals are derived by trigger from the
+  --    actual_costs rows, so this does not compute them: two places deriving
+  --    the same figures by different routes is how they drifted before.
+  update cost_codes
+     set approved_budget_previous        = approved_budget,
          approved_budget_movement        = 0,
-         estimate_at_completion_previous = c.estimate_at_completion,
-         estimate_at_completion_movement = 0,
-         actual_cost_to_date = c.actual_cost_to_date + coalesce((
-           select sum(ac.cost) * -1 from actual_costs ac
-            where ac.cost_code_id = c.id
-              and ac.reporting_period_id = closing.id
-              and ac.source = 'ACC'), 0),
-         actual_cost_this_period = case when next_open.id is not null then coalesce((
-           select sum(ac.cost) * -1 from actual_costs ac
-            where ac.cost_code_id = c.id
-              and ac.reporting_period_id = closing.id
-              and ac.source = 'ACC'), 0) else 0 end
-   where c.project_id = p_project_id;
+         estimate_at_completion_previous = estimate_at_completion,
+         estimate_at_completion_movement = 0
+   where project_id = p_project_id;
 
   -- 2. Freeze each ETC detail's total against the periods still ahead.
   update etc_details e
@@ -105,6 +94,19 @@ begin
   if next_open.id is not null then
     update reporting_periods set is_current = true where id = next_open.id;
   end if;
+
+  -- 6. The current period moved, so every "this period" figure is stale.
+  --    Inlined rather than calling a helper: this function is SECURITY
+  --    INVOKER, so it runs as `authenticated`, and granting that role EXECUTE
+  --    on the helper would publish another RPC endpoint for no gain.
+  update cost_codes c
+     set actual_cost_to_date = coalesce((
+           select sum(a.cost) from actual_costs a where a.cost_code_id = c.id), 0),
+         actual_cost_this_period = coalesce((
+           select sum(a.cost) from actual_costs a
+             join reporting_periods rp on rp.id = a.reporting_period_id
+            where a.cost_code_id = c.id and rp.is_current), 0)
+   where c.project_id = p_project_id;
 
   return query select closing.id, closing.name, next_open.id, next_open.name;
 end;

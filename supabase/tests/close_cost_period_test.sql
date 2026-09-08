@@ -35,15 +35,24 @@ insert into reporting_periods (id, project_id, kind, name, start_date, end_date,
  ('99cccccc-0000-0000-0000-000000000003','99bbbbbb-0000-0000-0000-000000000002','cost','Jan','2026-01-01','2026-01-31',0,true),
  ('99dddddd-0000-0000-0000-000000000004','99bbbbbb-0000-0000-0000-000000000002','cost','Feb','2026-02-01','2026-02-28',1,false);
 
-insert into cost_codes (id, project_id, code, name, approved_budget, estimate_at_completion, actual_cost_to_date) values
- ('99eeeeee-0000-0000-0000-000000000005','99bbbbbb-0000-0000-0000-000000000002','CC-1','One', 1000, 900, 500),
- ('99ffffff-0000-0000-0000-000000000006','99bbbbbb-0000-0000-0000-000000000002','CC-2','Two', 2000, 1800, 700);
+-- The actual-cost totals are derived by trigger, so they are never set here:
+-- the rows below are what they are computed from.
+insert into cost_codes (id, project_id, code, name, approved_budget, estimate_at_completion) values
+ ('99eeeeee-0000-0000-0000-000000000005','99bbbbbb-0000-0000-0000-000000000002','CC-1','One', 1000, 900),
+ ('99ffffff-0000-0000-0000-000000000006','99bbbbbb-0000-0000-0000-000000000002','CC-2','Two', 2000, 1800);
 
--- CC-1 carries a 200 accrual in January. CC-2 carries none, and must not be
--- touched by it -- an earlier draft joined accruals to every cost code.
+-- CC-1 carries 300 real plus a 200 accrual in January. CC-2 carries none, and
+-- must not be touched by CC-1's accrual -- an earlier draft of the close
+-- joined the accrual set to every cost code.
 insert into actual_costs (project_id, cost_code_id, reporting_period_id, cost, source) values
+ ('99bbbbbb-0000-0000-0000-000000000002','99eeeeee-0000-0000-0000-000000000005','99cccccc-0000-0000-0000-000000000003', 300, 'MAN'),
  ('99bbbbbb-0000-0000-0000-000000000002','99eeeeee-0000-0000-0000-000000000005','99cccccc-0000-0000-0000-000000000003', 200, 'ACC'),
  ('99bbbbbb-0000-0000-0000-000000000002','99ffffff-0000-0000-0000-000000000006','99cccccc-0000-0000-0000-000000000003', 700, 'MAN');
+
+select 'TRIGGER CC-1 totals derived from its rows before any close' as test,
+       case when actual_cost_to_date = 500 and actual_cost_this_period = 500
+            then 'PASS' else 'FAIL - ' || actual_cost_to_date || '/' || actual_cost_this_period end as result
+  from cost_codes where code = 'CC-1';
 
 insert into cost_phasing (project_id, cost_code_id, type, period_values) values
  ('99bbbbbb-0000-0000-0000-000000000002','99eeeeee-0000-0000-0000-000000000005','eac',
@@ -86,9 +95,17 @@ begin
   perform set_config('role','postgres',true);
 end $$;
 
-select 'CC-1 actuals net off its accrual (500 - 200)' as test,
+select 'CC-1 actuals net off its accrual (300 + 200 - 200)' as test,
        case when actual_cost_to_date = 300 then 'PASS' else 'FAIL - ' || actual_cost_to_date end as result
   from cost_codes where code = 'CC-1'
+union all
+select 'CC-1 this period is the reversal only, in February',
+       case when actual_cost_this_period = -200 then 'PASS' else 'FAIL - ' || actual_cost_this_period end
+  from cost_codes where code = 'CC-1'
+union all
+select 'CC-2 this period is zero (nothing in February)',
+       case when actual_cost_this_period = 0 then 'PASS' else 'FAIL - ' || actual_cost_this_period end
+  from cost_codes where code = 'CC-2'
 union all
 select 'CC-1 approved budget carried to previous',
        case when approved_budget_previous = 1000 then 'PASS' else 'FAIL - ' || approved_budget_previous end

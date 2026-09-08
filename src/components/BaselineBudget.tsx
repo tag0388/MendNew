@@ -34,26 +34,16 @@ import {
   GridApi
 } from 'ag-grid-community';
 import { format, parseISO } from 'date-fns';
-import { db, auth } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  doc, 
-  serverTimestamp,
-  getDocs,
-  getDoc,
-  writeBatch,
-  orderBy
-} from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import { getCurrentUser } from '../lib/currentUser';
+import { fetchMyProjectRole } from '../lib/projects';
+import {
+  fetchBaselineBudgets, upsertBaselineBudget, deleteBaselineBudgets,
+  importBaselineBudgets, fetchCostCodes,
+} from '../lib/costCodes';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { formatCurrency, formatNumber } from '../lib/utils';
-import { OperationType, handleFirestoreError } from '../lib/errorHandlers';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 import { useTheme } from 'next-themes';
@@ -132,88 +122,53 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
   const { theme: currentTheme } = useTheme();
   const theme = currentTheme === 'dark' ? 'dark' : 'light';
 
-  const userId = auth.currentUser?.uid;
-  const isEnterpriseAdmin = userId && enterprise?.users?.[userId]?.role === 'Enterprise System Admin';
-  const isProjectAdmin = userId && (isEnterpriseAdmin || project?.users?.[userId] === 'Project Admin');
+  const userId = getCurrentUser()?.uid;
+  // Whether to offer the control; RLS decides whether the write lands.
+  const [isProjectAdmin, setIsProjectAdmin] = useState(false);
+  useEffect(() => {
+    if (!userId) return;
+    let active = true;
+    void fetchMyProjectRole(project.id, userId).then(role => {
+      if (active) setIsProjectAdmin(role === 'Project Admin' || role === 'Enterprise System Admin');
+    });
+    return () => { active = false; };
+  }, [project.id, userId]);
 
   // Fetch Baseline Budgets
-  useEffect(() => {
-    const q = query(
-      collection(db, 'baselineBudgets'), 
-      where('projectId', '==', project.id),
-      orderBy('createdAt', 'asc')
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as BaselineBudgetRecord[];
-      setRecords(data);
-      setIsLoading(false);
-    }, (error) => {
-      console.error("Error fetching baseline budgets:", error);
-      toast.error("Failed to load baseline budgets");
-      setIsLoading(false);
-    });
-    return () => unsubscribe();
-  }, [project.id]);
-
-  // Fetch Cost Codes for dropdown
-  useEffect(() => {
-    const q = query(collection(db, 'costCodes'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as CostCode[];
-      setCostCodes(data.sort((a, b) => a.sortOrder - b.sortOrder));
-    });
-    return () => unsubscribe();
-  }, [project.id]);
-
-  const syncBaselineBudgetToCostCode = useCallback(async (costCodeId: string) => {
-    if (!costCodeId) return;
+  const reloadRecords = useCallback(async () => {
     try {
-      const ccDoc = await getDoc(doc(db, 'costCodes', costCodeId));
-      if (!ccDoc.exists()) return;
-      const ccData = ccDoc.data() as CostCode;
-
-      // OPTIMIZATION: Query only the records for this specific cost code
-      const qById = query(
-        collection(db, 'baselineBudgets'),
-        where('projectId', '==', project.id),
-        where('costCodeId', '==', costCodeId)
-      );
-
-      const qByCode = query(
-        collection(db, 'baselineBudgets'),
-        where('projectId', '==', project.id),
-        where('costCodeId', '==', ccData.code)
-      );
-
-      const [snapById, snapByCode] = await Promise.all([
-        getDocs(qById),
-        getDocs(qByCode)
-      ]);
-
-      const recordsById = snapById.docs.map(doc => doc.data() as BaselineBudgetRecord);
-      const recordsByCode = snapByCode.docs.map(doc => doc.data() as BaselineBudgetRecord);
-      
-      const uniqueRecordsMap = new Map<string, BaselineBudgetRecord>();
-      snapById.docs.forEach((doc, i) => uniqueRecordsMap.set(doc.id, recordsById[i]));
-      snapByCode.docs.forEach((doc, i) => uniqueRecordsMap.set(doc.id, recordsByCode[i]));
-      
-      const codeBudgets = Array.from(uniqueRecordsMap.values());
-      const totalBaseline = codeBudgets.reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
-      
-      await updateDoc(doc(db, 'costCodes', costCodeId), {
-        baselineBudget: totalBaseline,
-        updatedAt: new Date().toISOString()
-      });
+      setRecords((await fetchBaselineBudgets(project.id)) as unknown as BaselineBudgetRecord[]);
     } catch (error) {
-      console.error("Error syncing baseline budget:", error);
+      console.error('Error fetching baseline budgets:', error);
+      toast.error('Failed to load baseline budgets');
+    } finally {
+      setIsLoading(false);
     }
   }, [project.id]);
+
+  useEffect(() => {
+    void reloadRecords();
+    return subscribeToTable('baseline_budgets', `project_id=eq.${project.id}`, () => void reloadRecords());
+  }, [reloadRecords, project.id]);
+
+  // Fetch Cost Codes for dropdown
+  const reloadCostCodes = useCallback(async () => {
+    try {
+      setCostCodes(await fetchCostCodes(project.id));
+    } catch (error) {
+      console.error('Error fetching cost codes:', error);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    void reloadCostCodes();
+    return subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void reloadCostCodes());
+  }, [reloadCostCodes, project.id]);
+
+  // cost_codes.baseline_budget used to be recomputed here after every write
+  // and written back from the browser, reading costCodeId as both a document
+  // id and a code string because either could have been stored. A database
+  // trigger maintains it now, so it cannot drift from its rows.
 
   const handleAddRecord = async () => {
     if (!isProjectAdmin) {
@@ -222,19 +177,28 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
     }
 
     try {
-      const newRecord = {
-        projectId: project.id,
-        costCodeId: '',
+      // cost_code_id and reporting_period_id are NOT NULL foreign keys, so a
+      // row cannot be created blank as a Firestore document could.
+      const firstCode = costCodes[0];
+      const currentPeriodId = project.reportingPeriods?.currentPeriodId;
+      if (!firstCode || !currentPeriodId) {
+        toast.error(
+          !firstCode
+            ? 'Add a cost code before setting a baseline budget.'
+            : 'Set a current reporting period before setting a baseline budget.'
+        );
+        return;
+      }
+
+      await upsertBaselineBudget(project.id, {
+        costCodeId: firstCode.id,
+        reportingPeriodId: currentPeriodId,
+        amount: 0,
         item: 'New Budget Item',
         description: '',
         source: 'EST',
-        amount: 0,
-        reportingPeriodId: project.reportingPeriods?.currentPeriodId || '',
-        createdAt: new Date().toISOString(),
-        enterpriseAttributes: {},
-        projectAttributes: {}
-      };
-      await addDoc(collection(db, 'baselineBudgets'), newRecord);
+      } as any);
+      await reloadRecords();
       toast.success("Record added");
 
       setTimeout(() => {
@@ -246,7 +210,7 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
         }
       }, 500);
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'baselineBudgets');
+      console.error('Failed to save baseline budget:', error);
       toast.error("Failed to add record");
     }
   };
@@ -258,11 +222,11 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
     }
 
     try {
-      await deleteDoc(doc(db, 'baselineBudgets', id));
+      await deleteBaselineBudgets([id]);
+      await reloadRecords();
       toast.success("Record deleted");
-      if (costCodeId) await syncBaselineBudgetToCostCode(costCodeId);
     } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, `baselineBudgets/${id}`);
+      console.error('Failed to save baseline budget:', error);
       toast.error("Failed to delete record");
     }
   };
@@ -274,20 +238,8 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
 
     setIsLoading(true);
     try {
-      const batch = writeBatch(db);
-      const affectedCostCodeIds = new Set<string>();
-      
-      idsToDelete.forEach(id => {
-        const record = records.find(r => r.id === id);
-        if (record?.costCodeId) affectedCostCodeIds.add(record.costCodeId);
-        batch.delete(doc(db, 'baselineBudgets', id));
-      });
-
-      await batch.commit();
-      
-      for (const ccId of affectedCostCodeIds) {
-        await syncBaselineBudgetToCostCode(ccId);
-      }
+      await deleteBaselineBudgets(idsToDelete);
+      await reloadRecords();
 
       toast.success(`Deleted ${idsToDelete.length} records`);
       setSelectedIds(new Set());
@@ -309,45 +261,26 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
 
     setIsLoading(true);
     try {
-      const batch = writeBatch(db);
-      const affectedCostCodeIds = new Set<string>();
-      
-      idsToUpdate.forEach(id => {
-        const record = records.find(r => r.id === id);
-        if (record?.costCodeId) affectedCostCodeIds.add(record.costCodeId);
-        
-        const updates: any = {
-          updatedAt: new Date().toISOString()
-        };
-        
-        if (bulkData.costCodeId) {
-          updates.costCodeId = bulkData.costCodeId;
-          affectedCostCodeIds.add(bulkData.costCodeId);
-        }
-        if (bulkData.source) updates.source = bulkData.source;
-        
-        if (Object.keys(bulkData.enterpriseAttributes).length > 0) {
-          updates.enterpriseAttributes = {
-            ...(record?.enterpriseAttributes || {}),
-            ...bulkData.enterpriseAttributes
-          };
-        }
-        
-        if (Object.keys(bulkData.projectAttributes).length > 0) {
-          updates.projectAttributes = {
-            ...(record?.projectAttributes || {}),
-            ...bulkData.projectAttributes
-          };
-        }
-
-        batch.update(doc(db, 'baselineBudgets', id), updates);
-      });
-
-      await batch.commit();
-      
-      for (const ccId of affectedCostCodeIds) {
-        await syncBaselineBudgetToCostCode(ccId);
-      }
+      await Promise.all(
+        idsToUpdate.map(id => {
+          const record = records.find(r => r.id === id);
+          if (!record) return Promise.resolve();
+          return upsertBaselineBudget(project.id, {
+            id,
+            costCodeId: bulkData.costCodeId || record.costCodeId,
+            reportingPeriodId: record.reportingPeriodId,
+            amount: record.amount,
+            ...(bulkData.source ? { source: bulkData.source } : {}),
+            ...(Object.keys(bulkData.enterpriseAttributes).length > 0
+              ? { enterpriseAttributes: { ...(record.enterpriseAttributes || {}), ...bulkData.enterpriseAttributes } }
+              : {}),
+            ...(Object.keys(bulkData.projectAttributes).length > 0
+              ? { projectAttributes: { ...(record.projectAttributes || {}), ...bulkData.projectAttributes } }
+              : {}),
+          } as any);
+        })
+      );
+      await reloadRecords();
 
       toast.success(`Updated ${idsToUpdate.length} records`);
       setSelectedIds(new Set());
@@ -467,57 +400,52 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
 
     setImportWizard(prev => ({ ...prev, phase: 'processing', progress: 0 }));
 
-    const chunkSize = 400;
-    const totalChunks = Math.ceil(data.length / chunkSize);
-    
     try {
-      for (let i = 0; i < totalChunks; i++) {
-        const chunk = data.slice(i * chunkSize, (i + 1) * chunkSize);
-        const batch = writeBatch(db);
-        
-        chunk.forEach(row => {
-          const costCode = costCodes.find(cc => cc.code === String(row['Cost Code ID']).trim());
-          if (costCode) affectedCostCodeIds.add(costCode.id);
+      // One insert rather than 400-row batches committed separately, so a
+      // failure part-way cannot leave half the file loaded.
+      const rows = data.map(row => {
+        const costCode = costCodes.find(cc => cc.code === String(row['Cost Code ID']).trim());
 
-          const enterpriseAttributes: Record<string, any> = {};
-          enterpriseAttrs.forEach(attr => {
-            if (row[`E_${attr.title}`] !== undefined) {
-              enterpriseAttributes[attr.id] = String(row[`E_${attr.title}`]);
-            }
-          });
-
-          const projectAttributes: Record<string, any> = {};
-          projectAttrs.forEach(attr => {
-            if (row[`P_${attr.title}`] !== undefined) {
-              projectAttributes[attr.id] = String(row[`P_${attr.title}`]);
-            }
-          });
-
-          const newDocRef = doc(collection(db, 'baselineBudgets'));
-          batch.set(newDocRef, {
-            projectId: project.id,
-            costCodeId: costCode?.id || '',
-            item: row['Item'] || '',
-            description: row['Description'] || '',
-            source: 'EST',
-            amount: Number(row['Amount']) || 0,
-            reportingPeriodId: project.reportingPeriods?.currentPeriodId || '',
-            enterpriseAttributes,
-            projectAttributes,
-            createdAt: new Date().toISOString()
-          });
+        const enterpriseAttributes: Record<string, any> = {};
+        enterpriseAttrs.forEach(attr => {
+          if (row[`E_${attr.title}`] !== undefined) {
+            enterpriseAttributes[attr.id] = String(row[`E_${attr.title}`]);
+          }
         });
 
-        await batch.commit();
-        const processed = Math.min((i + 1) * chunkSize, data.length);
-        setImportWizard(prev => ({ 
-          ...prev, 
-          processed,
-          progress: Math.round((processed / data.length) * 100) 
-        }));
+        const projectAttributes: Record<string, any> = {};
+        projectAttrs.forEach(attr => {
+          if (row[`P_${attr.title}`] !== undefined) {
+            projectAttributes[attr.id] = String(row[`P_${attr.title}`]);
+          }
+        });
+
+        return {
+          costCodeId: costCode?.id,
+          reportingPeriodId: project.reportingPeriods?.currentPeriodId,
+          item: row['Item'] || '',
+          description: row['Description'] || '',
+          source: 'EST',
+          amount: Number(row['Amount']) || 0,
+          enterpriseAttributes,
+          projectAttributes,
+        };
+      });
+
+      const unresolved = rows.filter(r => !r.costCodeId || !r.reportingPeriodId).length;
+      const usable = rows.filter(r => r.costCodeId && r.reportingPeriodId);
+
+      await importBaselineBudgets(project.id, usable as any);
+      await reloadRecords();
+      setImportWizard(prev => ({ ...prev, processed: usable.length, progress: 100 }));
+
+      if (unresolved > 0) {
+        toast.warning(`${unresolved} row(s) skipped: unknown cost code, or no current reporting period.`);
       }
-      
-      toast.success(`Imported ${data.length} records successfully. Click 'Calculate' in the Cost Codes module to update totals.`, { duration: 5000 });
+
+      // Cost code baselines are maintained by the database, so there is no
+      // longer a "Calculate" step to run afterwards.
+      toast.success(`Imported ${usable.length} records successfully.`, { duration: 5000 });
       setImportWizard(prev => ({ ...prev, isOpen: false }));
     } catch (error) {
       console.error("Import execution error:", error);
@@ -531,22 +459,18 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
     if (newValue === oldValue) return;
 
     try {
-      const updates: any = {
-        ...data,
-        updatedAt: new Date().toISOString()
-      };
-      delete updates.id;
-
-      await updateDoc(doc(db, 'baselineBudgets', data.id), updates);
-      
-      if (colDef.field === 'costCodeId' || colDef.field === 'amount') {
-        if (data.costCodeId) await syncBaselineBudgetToCostCode(data.costCodeId);
-        if (colDef.field === 'costCodeId' && oldValue) {
-          await syncBaselineBudgetToCostCode(oldValue);
-        }
-      }
+      await upsertBaselineBudget(project.id, {
+        id: data.id,
+        costCodeId: data.costCodeId,
+        reportingPeriodId: data.reportingPeriodId,
+        amount: data.amount,
+        [colDef.field!]: newValue,
+      } as any);
+      await reloadRecords();
+      // The trigger refreshes the cost code baseline, including the one a row
+      // was moved away from.
     } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `baselineBudgets/${data.id}`);
+      console.error('Failed to update baseline budget:', error);
       toast.error("Failed to update record");
       event.node.setDataValue(colDef.field!, oldValue);
     }

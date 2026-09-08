@@ -254,3 +254,27 @@ export async function fetchCostCodeAssignees(costCodeId: string): Promise<CostCo
     displayName: r.user_profiles?.display_name ?? null,
   }));
 }
+
+/** Bulk import of actual costs, in one insert rather than 400-row batches. */
+export async function importActualCosts(
+  projectId: string,
+  rows: Array<Partial<ActualCostRow> & { costCodeId: string; reportingPeriodId: string }>
+): Promise<void> {
+  if (rows.length === 0) return;
+  const { error } = await supabase
+    .from('actual_costs')
+    .insert(rows.map((r) => ({ ...toRow(r), project_id: projectId })));
+  raise('import actual costs', error);
+}
+
+/** Bulk import of baseline budgets, in one insert. */
+export async function importBaselineBudgets(
+  projectId: string,
+  rows: Array<Partial<BaselineBudgetRow> & { costCodeId: string; reportingPeriodId: string }>
+): Promise<void> {
+  if (rows.length === 0) return;
+  const { error } = await supabase
+    .from('baseline_budgets')
+    .insert(rows.map((r) => ({ ...toRow(r), project_id: projectId })));
+  raise('import baseline budgets', error);
+}
