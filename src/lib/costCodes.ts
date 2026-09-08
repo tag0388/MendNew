@@ -1,5 +1,8 @@
-import { supabase, fromRows, toRow, raise } from './supabase';
-import type { CostCode, EtcDetail } from '../types';
+import { supabase, fromRow, fromRows, toRow, raise } from './supabase';
+import type {
+  CostCode, EtcDetail, ScheduleItem, Change, ChangeRecord, Subcontract,
+  Calendar as ProjectCalendar,
+} from '../types';
 
 /**
  * Cost codes and the records that hang off them.
@@ -73,12 +76,18 @@ export async function upsertCostCodes(
 
 // ----------------------------------------------------------- ETC details ----
 
-export async function fetchEtcDetails(projectId: string): Promise<EtcDetail[]> {
-  const { data, error } = await supabase
-    .from('etc_details')
-    .select('*')
-    .eq('project_id', projectId)
-    .order('sort_order');
+export async function fetchEtcDetails(
+  projectId: string,
+  costCodeId?: string
+): Promise<EtcDetail[]> {
+  let q = supabase.from('etc_details').select('*').eq('project_id', projectId);
+  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  // sort_order first, created_at to break ties. The old code sorted in memory
+  // with `sortOrder ?? -1` because rows written before the column existed had
+  // none; the column is NOT NULL with a default here.
+  const { data, error } = await q
+    .order('sort_order')
+    .order('created_at');
   raise('load ETC details', error);
   return fromRows<EtcDetail>(data);
 }
@@ -124,10 +133,12 @@ export interface CostPhasingRow {
 
 export async function fetchCostPhasing(
   projectId: string,
-  type?: CostPhasingType
+  type?: CostPhasingType,
+  costCodeId?: string
 ): Promise<CostPhasingRow[]> {
   let q = supabase.from('cost_phasing').select('*').eq('project_id', projectId);
   if (type) q = q.eq('type', type);
+  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
   const { data, error } = await q;
   raise('load cost phasing', error);
   return fromRows<CostPhasingRow>(data);
@@ -179,8 +190,20 @@ export interface ActualCostRow {
   description?: string;
 }
 
-export async function fetchActualCosts(projectId: string): Promise<ActualCostRow[]> {
-  const { data, error } = await supabase.from('actual_costs').select('*').eq('project_id', projectId);
+/**
+ * Pass costCodeId to get one cost code's rows. The cost module used to fetch
+ * every actual cost in the project and filter in the browser, which meant
+ * downloading a whole project's ledger to show one code's -- and matching
+ * costCodeId against both the id and the code string, because either could
+ * have been stored.
+ */
+export async function fetchActualCosts(
+  projectId: string,
+  costCodeId?: string
+): Promise<ActualCostRow[]> {
+  let q = supabase.from('actual_costs').select('*').eq('project_id', projectId);
+  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  const { data, error } = await q.order('created_at', { ascending: false });
   raise('load actual costs', error);
   return fromRows<ActualCostRow>(data);
 }
@@ -211,8 +234,13 @@ export interface BaselineBudgetRow {
   description?: string;
 }
 
-export async function fetchBaselineBudgets(projectId: string): Promise<BaselineBudgetRow[]> {
-  const { data, error } = await supabase.from('baseline_budgets').select('*').eq('project_id', projectId);
+export async function fetchBaselineBudgets(
+  projectId: string,
+  costCodeId?: string
+): Promise<BaselineBudgetRow[]> {
+  let q = supabase.from('baseline_budgets').select('*').eq('project_id', projectId);
+  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  const { data, error } = await q;
   raise('load baseline budgets', error);
   return fromRows<BaselineBudgetRow>(data);
 }
@@ -277,4 +305,166 @@ export async function importBaselineBudgets(
     .from('baseline_budgets')
     .insert(rows.map((r) => ({ ...toRow(r), project_id: projectId })));
   raise('import baseline budgets', error);
+}
+
+/**
+ * Recalculate a project's derived cost figures.
+ *
+ * The browser used to do this itself: download every actual cost, baseline
+ * budget, ETC row, change, change record and subcontract in the project,
+ * aggregate them in memory, then write eleven columns back onto every cost
+ * code in batches of 450 -- one transaction per batch, so a large project
+ * could half-succeed. It is one statement now, and returns how many cost
+ * codes it actually wrote.
+ *
+ * Passing costCodeIds limits it to a selection; omit for the whole project.
+ */
+export async function recalculateProjectCosts(
+  projectId: string,
+  costCodeIds?: string[]
+): Promise<number> {
+  const { data, error } = await supabase.rpc('recalculate_project_costs', {
+    p_project_id: projectId,
+    p_cost_code_ids: costCodeIds && costCodeIds.length > 0 ? costCodeIds : null,
+  });
+  raise('recalculate costs', error);
+  return (data as number) ?? 0;
+}
+
+/**
+ * Schedule items for a project.
+ *
+ * Read-only from the cost module's point of view: cost codes carry an
+ * activityId and the grid shows the matching activity's dates alongside.
+ */
+export async function fetchScheduleItems(projectId: string): Promise<ScheduleItem[]> {
+  const { data, error } = await supabase
+    .from('schedule_items')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('activity_id');
+  raise('load schedule items', error);
+  return fromRows<ScheduleItem>(data);
+}
+
+// ------------------------------------------------- project-wide lookups ----
+// The cost module reads these to work out what a cost code's EAC should be.
+// It does not write any of them -- each has its own module that owns it.
+
+export async function fetchChanges(projectId: string): Promise<Change[]> {
+  const { data, error } = await supabase
+    .from('changes').select('*').eq('project_id', projectId);
+  raise('load changes', error);
+  return fromRows<Change>(data);
+}
+
+/** Pass costCodeId for one cost code's records; omit for the project's. */
+export async function fetchChangeRecords(
+  projectId: string,
+  costCodeId?: string
+): Promise<ChangeRecord[]> {
+  let q = supabase.from('change_records').select('*').eq('project_id', projectId);
+  if (costCodeId) q = q.eq('cost_code_id', costCodeId);
+  const { data, error } = await q;
+  raise('load change records', error);
+  return fromRows<ChangeRecord>(data);
+}
+
+/**
+ * Subcontracts with their line items nested, in one round trip.
+ *
+ * The document model stored lineItems inside the subcontract, so readers got
+ * them for free; they are a table here, and this join restores the shape the
+ * grids expect rather than making every caller fetch twice.
+ */
+export async function fetchSubcontractsWithItems(projectId: string): Promise<Subcontract[]> {
+  const { data, error } = await supabase
+    .from('subcontracts')
+    .select('*, subcontract_line_items(*)')
+    .eq('project_id', projectId);
+  raise('load subcontracts', error);
+  return (data ?? []).map((row: any) => {
+    const { subcontract_line_items, ...rest } = row;
+    return {
+      ...fromRow<Subcontract>(rest)!,
+      lineItems: fromRows<any>(subcontract_line_items ?? []),
+    } as Subcontract;
+  });
+}
+
+export async function fetchRiskRecords(projectId: string): Promise<any[]> {
+  const { data, error } = await supabase
+    .from('risk_records').select('*').eq('project_id', projectId);
+  raise('load risk records', error);
+  return fromRows<any>(data);
+}
+
+export async function fetchCalendars(projectId: string): Promise<ProjectCalendar[]> {
+  const { data, error } = await supabase
+    .from('calendars').select('*').eq('project_id', projectId);
+  raise('load calendars', error);
+  return fromRows<ProjectCalendar>(data);
+}
+
+/**
+ * Create a cost code, optionally at a position in the list.
+ *
+ * insertIndex shifts every cost code at or below that position down by one
+ * and drops the new row into the gap; omit it to append. Both happen in one
+ * database function so the list cannot end up with a gap and nothing in it.
+ *
+ * A duplicate code raises rather than returning: (project_id, code) is unique,
+ * so the database refuses it even if two people submit the same code at once,
+ * which a client-side "does this code already exist" check cannot.
+ */
+export async function insertCostCodeAt(
+  projectId: string,
+  input: {
+    code: string;
+    name: string;
+    eacMethod?: CostCode['eacMethod'];
+    enterpriseAttributes?: Record<string, string>;
+    projectAttributes?: Record<string, string>;
+  },
+  insertIndex?: number
+): Promise<CostCode> {
+  const { data, error } = await supabase.rpc('insert_cost_code_at', {
+    p_project_id: projectId,
+    p_code: input.code,
+    p_name: input.name ?? '',
+    p_eac_method: input.eacMethod ?? 'Manual',
+    p_enterprise_attributes: input.enterpriseAttributes ?? {},
+    p_project_attributes: input.projectAttributes ?? {},
+    p_insert_index: typeof insertIndex === 'number' ? insertIndex : null,
+  });
+  raise('create cost code', error);
+  return fromRow<CostCode>(data)!;
+}
+
+/**
+ * Apply one patch across many cost codes.
+ *
+ * The attribute maps merge into whatever is stored, rather than replacing it,
+ * so setting one attribute across a selection does not wipe the others -- and
+ * merges against the current row, not against a copy the browser loaded
+ * earlier. Returns how many rows were actually written, which can be fewer
+ * than asked for if RLS refuses some of them.
+ */
+export async function bulkUpdateCostCodes(
+  ids: string[],
+  patch: {
+    eacMethod?: CostCode['eacMethod'];
+    enterpriseAttributes?: Record<string, string>;
+    projectAttributes?: Record<string, string>;
+  }
+): Promise<number> {
+  if (ids.length === 0) return 0;
+  const { data, error } = await supabase.rpc('bulk_update_cost_codes', {
+    p_cost_code_ids: ids,
+    p_eac_method: patch.eacMethod ?? null,
+    p_enterprise_attributes: patch.enterpriseAttributes ?? null,
+    p_project_attributes: patch.projectAttributes ?? null,
+  });
+  raise('bulk update cost codes', error);
+  return (data as number) ?? 0;
 }

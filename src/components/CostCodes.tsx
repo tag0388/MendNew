@@ -2,6 +2,26 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { createPortal } from 'react-dom';
 import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, Change, ChangeRecord, Subcontract, ScheduleItem } from '../types';
 import { db, auth } from '../firebase';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  fetchCostCodes,
+  updateCostCode,
+  upsertCostCodes,
+  deleteCostCodes,
+  insertCostCodeAt,
+  bulkUpdateCostCodes,
+  fetchScheduleItems,
+  fetchEtcDetails,
+  fetchActualCosts,
+  fetchBaselineBudgets,
+  fetchCostPhasing,
+  fetchChanges,
+  fetchChangeRecords,
+  fetchSubcontractsWithItems,
+  fetchRiskRecords,
+  fetchCalendars,
+  recalculateProjectCosts,
+} from '../lib/costCodes';
 import { 
   doc, 
   updateDoc, 
@@ -393,97 +413,9 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   const [riskRecords, setRiskRecords] = useState<any[]>([]);
   const [changeRecords, setChangeRecords] = useState<ChangeRecord[]>([]);
   const [allChanges, setAllChanges] = useState<Change[]>([]);
-  const [isCalculated, setIsCalculated] = useState(false);
-  const [isCalculating, setIsCalculating] = useState(false);
   const [isChangesLoading, setIsChangesLoading] = useState(false);
   const [importPreview, setImportPreview] = useState<{ data: any[] } | null>(null);
 
-  const handleRecalculateAll = async () => {
-    if (!project.id) return;
-    setIsCalculating(true);
-    const toastId = toast.loading('Recalculating project totals...');
-
-    try {
-      // 1. Bulk fetch all relevant data for the project
-      const [actualsSnap, budgetsSnap, changesSnap, changeRecordsSnap] = await Promise.all([
-        getDocs(query(collection(db, 'actualCosts'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'baselineBudgets'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'changes'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'changeRecords'), where('projectId', '==', project.id)))
-      ]);
-
-      const allActuals = actualsSnap.docs.map(d => d.data());
-      const allBudgets = budgetsSnap.docs.map(d => d.data());
-      const fetchedChanges = changesSnap.docs.map(d => ({ ...d.data(), id: d.id } as Change));
-      const allChangeRecords = changeRecordsSnap.docs.map(d => d.data());
-      
-      // APPROVED CHANGES: Only sum records from approved changes
-      const approvedChangeIds = new Set(fetchedChanges.filter(c => c.status === 'Approved').map(c => c.id));
-
-      const batch = writeBatch(db);
-      let count = 0;
-
-      for (const cc of costCodes) {
-        const ccId = cc.id;
-        const ccCode = cc.code;
-
-        // Sum Actuals
-        const actualCost = allActuals
-          .filter((a: any) => a.costCodeId === ccId || a.costCodeId === ccCode)
-          .reduce((sum, a: any) => sum + (Number(a.cost) || 0), 0);
-
-        // Sum Baseline
-        const baselineBudget = allBudgets
-          .filter((b: any) => b.costCodeId === ccId || b.costCodeId === ccCode)
-          .reduce((sum, b: any) => sum + (Number(b.amount) || 0), 0);
-
-        // Sum Approved Changes
-        const approvedChanges = allChangeRecords
-          .filter((cr: any) => (cr.costCodeId === ccId || cr.costCodeId === ccCode) && approvedChangeIds.has(cr.changeId))
-          .reduce((sum, cr: any) => sum + (Number(cr.budgetAmount) || 0), 0);
-          
-        // Sum Subcontracts
-        let subcontractAmount = 0;
-        subcontracts.forEach(sub => {
-          (sub.lineItems || []).forEach(li => {
-            if (li.status === 'Rejected') return;
-            const assignedId = li.costCodeId || sub.defaultCostCodeId;
-            if (assignedId === ccId || assignedId === ccCode) {
-              subcontractAmount += (Number(li.total) || 0);
-            }
-          });
-        });
-
-        const ccRef = doc(db, 'costCodes', cc.id);
-        batch.update(ccRef, {
-          actualCostToDate: actualCost,
-          baselineBudget: baselineBudget,
-          approvedChanges: approvedChanges,
-          subcontractAmount: subcontractAmount,
-          updatedAt: new Date().toISOString()
-        });
-        count++;
-
-        // Batch limit is 500
-        if (count >= 450) {
-          await batch.commit();
-          // Reset batch for next set
-          // (Actually we would need a new batch object here)
-          // But usually cost codes are < 500. If more, we handle recursively.
-        }
-      }
-
-      if (count > 0) await batch.commit();
-
-      toast.success(`Recalculated totals for ${count} cost codes`, { id: toastId });
-      setIsCalculated(true);
-    } catch (error) {
-      console.error("Recalculation error:", error);
-      toast.error("Failed to recalculate project totals", { id: toastId });
-    } finally {
-      setIsCalculating(false);
-    }
-  };
   const [changesQuickFilterText, setChangesQuickFilterText] = useState('');
   const [etcRows, setEtcRows] = useState<any[]>([]);
   const [actualsRows, setActualsRows] = useState<any[]>([]);
@@ -792,29 +724,20 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }
 
     setIsEtcLoading(true);
-    const q = query(
-      collection(db, 'etcDetails'),
-      where('projectId', '==', project.id),
-      where('costCode', '==', selectedEtcCode)
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const rows = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      // Sort in memory to include rows without sortOrder
-      const sortedRows = rows.sort((a: any, b: any) => {
-        const orderA = a.sortOrder ?? -1;
-        const orderB = b.sortOrder ?? -1;
-        if (orderA !== orderB) return orderA - orderB;
-        return new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime();
-      });
-      setEtcRows(sortedRows);
-      setIsEtcLoading(false);
-    }, (error) => {
-      console.error("Error fetching ETC details:", error);
-      setIsEtcLoading(false);
-    });
-
-    return () => unsubscribe();
+    // Ordering is the database's job now: sort_order then created_at, both
+    // NOT NULL. The old in-memory sort existed to cope with rows written
+    // before sortOrder was introduced, which defaulted to -1.
+    const load = async () => {
+      try {
+        setEtcRows(await fetchEtcDetails(project.id, selectedEtcCode));
+      } catch (error) {
+        console.error('Error fetching ETC details:', error);
+      } finally {
+        setIsEtcLoading(false);
+      }
+    };
+    void load();
+    return subscribeToTable('etc_details', `cost_code_id=eq.${selectedEtcCode}`, () => void load());
   }, [selectedEtcCode, project.id]);
 
   // Fetch Actual Cost Details
@@ -825,32 +748,23 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }
 
     setIsBaselineLoading(true);
-    const costCodeObj = costCodes.find(c => c.code === selectedBaselineCode);
-    
-    const q = query(
-      collection(db, 'baselineBudgets'), 
-      where('projectId', '==', project.id)
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const allBaseline = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      
-      const filtered = allBaseline.filter((a: any) => 
-        a.costCodeId === costCodeObj?.id || a.costCodeId === selectedBaselineCode
-      );
-
-      setBaselineRows(filtered);
-      setIsBaselineLoading(false);
-    }, (error) => {
-      console.error("Error fetching baseline budgets:", error);
-      setIsBaselineLoading(false);
-    });
-
-    return () => unsubscribe();
-  }, [selectedBaselineCode, project.id, costCodes]);
+    // The database filters by cost code. The old version downloaded every
+    // baseline budget in the project and filtered in the browser, matching
+    // costCodeId against both the id and the code string because either could
+    // have been stored -- which is also why costCodes had to be a dependency,
+    // tearing this listener down and rebuilding it on every cost code reload.
+    const load = async () => {
+      try {
+        setBaselineRows(await fetchBaselineBudgets(project.id, selectedBaselineCode));
+      } catch (error) {
+        console.error('Error fetching baseline budgets:', error);
+      } finally {
+        setIsBaselineLoading(false);
+      }
+    };
+    void load();
+    return subscribeToTable('baseline_budgets', `cost_code_id=eq.${selectedBaselineCode}`, () => void load());
+  }, [selectedBaselineCode, project.id]);
 
   useEffect(() => {
     if (!selectedActualsCode) {
@@ -859,34 +773,20 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }
 
     setIsActualsLoading(true);
-    // We match on both ID and Code string for robustness
-    const costCodeObj = costCodes.find(c => c.code === selectedActualsCode);
-    
-    const q = query(
-      collection(db, 'actualCosts'),
-      where('projectId', '==', project.id)
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const allActuals = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const filteredActuals = allActuals.filter((a: any) => 
-        a.costCodeId === costCodeObj?.id || a.costCodeId === selectedActualsCode
-      );
-      
-      // Sort by date/createdAt
-      const sortedRows = filteredActuals.sort((a: any, b: any) => {
-        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
-      });
-      
-      setActualsRows(sortedRows);
-      setIsActualsLoading(false);
-    }, (error) => {
-      console.error("Error fetching Actual Cost details:", error);
-      setIsActualsLoading(false);
-    });
-
-    return () => unsubscribe();
-  }, [selectedActualsCode, project.id, costCodes]);
+    // Filtered and ordered by the database (newest first), rather than
+    // downloading the project's whole ledger to show one cost code's.
+    const load = async () => {
+      try {
+        setActualsRows(await fetchActualCosts(project.id, selectedActualsCode));
+      } catch (error) {
+        console.error('Error fetching Actual Cost details:', error);
+      } finally {
+        setIsActualsLoading(false);
+      }
+    };
+    void load();
+    return subscribeToTable('actual_costs', `cost_code_id=eq.${selectedActualsCode}`, () => void load());
+  }, [selectedActualsCode, project.id]);
 
   // Fetch Cost Phasing (Baseline/Approved)
   useEffect(() => {
@@ -895,37 +795,46 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       return;
     }
 
-    const q = query(
-      collection(db, 'costPhasing'),
-      where('projectId', '==', project.id),
-      where('costCodeId', '==', selectedTimephasingCode)
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setCostPhasing(data);
-    });
-
-    return () => unsubscribe();
+    const load = async () => {
+      try {
+        setCostPhasing(await fetchCostPhasing(project.id, undefined, selectedTimephasingCode));
+      } catch (error) {
+        console.error('Error fetching cost phasing:', error);
+      }
+    };
+    void load();
+    return subscribeToTable('cost_phasing', `cost_code_id=eq.${selectedTimephasingCode}`, () => void load());
   }, [selectedTimephasingCode, project.id]);
 
   // Changes Effects
   useEffect(() => {
     if (!project.id) return;
-    const q = query(collection(db, 'changes'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setAllChanges(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Change)));
-    });
-    return () => unsubscribe();
+    const load = async () => {
+      try {
+        setAllChanges(await fetchChanges(project.id));
+      } catch (error) {
+        console.error('Error fetching changes:', error);
+      }
+    };
+    void load();
+    return subscribeToTable('changes', `project_id=eq.${project.id}`, () => void load());
   }, [project.id]);
 
   useEffect(() => {
     if (!project.id) return;
-    const q = query(collection(db, 'subcontracts'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setSubcontracts(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Subcontract)));
-    });
-    return () => unsubscribe();
+    const load = async () => {
+      try {
+        setSubcontracts(await fetchSubcontractsWithItems(project.id));
+      } catch (error) {
+        console.error('Error fetching subcontracts:', error);
+      }
+    };
+    void load();
+    // Line items live in their own table now, so a change to either the
+    // subcontract or one of its items has to re-read the nested shape.
+    const unsubOrders = subscribeToTable('subcontracts', `project_id=eq.${project.id}`, () => void load());
+    const unsubItems = subscribeToTable('subcontract_line_items', `project_id=eq.${project.id}`, () => void load());
+    return () => { unsubOrders(); unsubItems(); };
   }, [project.id]);
 
   useEffect(() => {
@@ -934,25 +843,30 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       return;
     }
     setIsChangesLoading(true);
-    const q = query(
-      collection(db, 'changeRecords'), 
-      where('projectId', '==', project.id),
-      where('costCodeId', '==', selectedChangesCode)
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setChangeRecords(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ChangeRecord)));
-      setIsChangesLoading(false);
-    });
-    return () => unsubscribe();
+    const load = async () => {
+      try {
+        setChangeRecords(await fetchChangeRecords(project.id, selectedChangesCode));
+      } catch (error) {
+        console.error('Error fetching change records:', error);
+      } finally {
+        setIsChangesLoading(false);
+      }
+    };
+    void load();
+    return subscribeToTable('change_records', `cost_code_id=eq.${selectedChangesCode}`, () => void load());
   }, [selectedChangesCode, project.id]);
 
   useEffect(() => {
     if (!project.id) return;
-    const q = query(collection(db, 'riskRecords'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setRiskRecords(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    });
-    return () => unsubscribe();
+    const load = async () => {
+      try {
+        setRiskRecords(await fetchRiskRecords(project.id));
+      } catch (error) {
+        console.error('Error fetching risk records:', error);
+      }
+    };
+    void load();
+    return subscribeToTable('risk_records', `project_id=eq.${project.id}`, () => void load());
   }, [project.id]);
 
   const riskExposureByCostCode = useMemo(() => {
@@ -3226,237 +3140,90 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   // Visible Columns State
   const [visibleColumns, setVisibleColumns] = useState<string[]>([]);
 
+  // No client-side filtering by assignedUsers any more. The cost_codes SELECT
+  // policy is "project admin, or assigned to this cost code", so the rows that
+  // come back are already the rows this user may see -- filtering again in the
+  // browser could only ever hide rows the database had allowed, never protect
+  // anything. One behaviour does change: a cost code with nobody assigned used
+  // to be visible to everyone, and is now visible only to project admins,
+  // which is what "a project user sees only their assigned cost codes" means.
+  const reloadCostCodes = useCallback(async () => {
+    try {
+      setCostCodes(await fetchCostCodes(project.id));
+    } catch (error) {
+      console.error('Cost codes fetch error:', error);
+      toast.error('Failed to fetch cost codes.');
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  // One statement in the database, not six full-table downloads and a series
+  // of 450-row batches in the browser. recalculate_project_costs() is
+  // SECURITY INVOKER, so RLS still decides which cost codes the caller may
+  // rewrite, and the whole recalculation is one transaction -- the old
+  // chunked version could leave budgets recalculated against stale actuals if
+  // it failed part-way.
   const calculateCosts = useCallback(async () => {
     if (!project.id) return;
+    if (costCodes.length === 0) {
+      toast.error('No cost codes found to calculate.');
+      return;
+    }
+
     setIsSaving(true);
-    const toastId = toast.loading('Starting project cost calculations...');
-    
+    const toastId = toast.loading('Recalculating project costs...');
     try {
-      const codesToUpdate = selectedIds.size > 0 
-        ? costCodes.filter(c => selectedIds.has(c.id)) 
-        : costCodes;
-
-      if (codesToUpdate.length === 0) {
-        toast.error('No cost codes found to calculate.', { id: toastId });
-        setIsSaving(false);
-        return;
-      }
-
-      // 1. Fetch all project data once
-      const [actualsSnap, budgetsSnap, etcSnap, changesSnap, recordsSnap, subSnap] = await Promise.all([
-        getDocs(query(collection(db, 'actualCosts'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'baselineBudgets'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'etcDetails'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'changes'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'changeRecords'), where('projectId', '==', project.id))),
-        getDocs(query(collection(db, 'subcontracts'), where('projectId', '==', project.id)))
-      ]);
-
-      const allActuals = actualsSnap.docs.map(d => d.data());
-      const allBudgets = budgetsSnap.docs.map(d => d.data());
-      const allEtcRows = etcSnap.docs.map(d => d.data());
-      const allChanges = changesSnap.docs.map(d => ({ ...d.data(), id: d.id } as Change));
-      const allChangeRecords = recordsSnap.docs.map(d => d.data());
-      const allSubcontracts = subSnap.docs.map(d => ({ ...d.data(), id: d.id } as Subcontract));
-
-      const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-      const currentPeriod = project.reportingPeriods?.periods.find(p => p.id === currentPeriodId);
-      const currentPeriodNum = currentPeriod ? project.reportingPeriods?.periods.indexOf(currentPeriod) + 1 : -1;
-      
-      const allPeriods = project.reportingPeriods?.periods || [];
-      const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
-      const futurePeriodIds = allPeriods.slice(currentIndex + 1).map(p => p.id);
-
-      // 2. Pre-process Approved Changes
-      const approvedChangeIds = new Set(allChanges.filter(c => c.status === 'Approved' || c.status === 'Pending').map(c => c.id));
-
-      // 3. Optimized Aggregation Lookups (O(N) instead of O(N*M))
-      const actualsToDateMap = new Map<string, number>();
-      const actualsThisPeriodMap = new Map<string, number>();
-      const baselineMap = new Map<string, number>();
-      const budgetChangeMap = new Map<string, number>();
-      const eacChangeMap = new Map<string, number>();
-      const etcMap = new Map<string, number>();
-
-      allActuals.forEach(a => {
-        const cost = Number(a.cost) || 0;
-        const key = a.costCodeId;
-        actualsToDateMap.set(key, (actualsToDateMap.get(key) || 0) + cost);
-        
-        const isCurrent = a.reportingPeriodId === currentPeriodId || 
-                         (currentPeriodNum !== -1 && String(a.reportingPeriodId) === String(currentPeriodNum));
-        if (isCurrent) {
-          actualsThisPeriodMap.set(key, (actualsThisPeriodMap.get(key) || 0) + cost);
-        }
-      });
-
-      allBudgets.forEach(b => {
-        const amount = Number(b.amount) || 0;
-        baselineMap.set(b.costCodeId, (baselineMap.get(b.costCodeId) || 0) + amount);
-      });
-
-      allChangeRecords.forEach(r => {
-        if (approvedChangeIds.has(r.changeId)) {
-          const budgetAmt = Number(r.budgetAmount) || 0;
-          const eacAmt = Number(r.eacAmount) || 0;
-          budgetChangeMap.set(r.costCodeId, (budgetChangeMap.get(r.costCodeId) || 0) + budgetAmt);
-          eacChangeMap.set(r.costCodeId, (eacChangeMap.get(r.costCodeId) || 0) + eacAmt);
-        }
-      });
-
-      allEtcRows.forEach(r => {
-        const periodValues = (r.periodValues || {}) as Record<string, number>;
-        const futureQty = futurePeriodIds.reduce((sum, pId) => sum + (periodValues[pId] || 0), 0);
-        const etcVal = futureQty * (r.rate || 0);
-        etcMap.set(r.costCode, (etcMap.get(r.costCode) || 0) + etcVal);
-      });
-
-      // 4. Calculate everything for each Cost Code
-      const getVal = (map: Map<string, number>, id: string, code: string) => (map.get(id) || 0) + (map.get(code) || 0);
-
-      // Subcontract lookup optimization
-      const subTotalsByCode = new Map<string, number>();
-      allSubcontracts.forEach(sub => {
-        (sub.lineItems || []).forEach(li => {
-          if (li.status === 'Rejected') return;
-          const assignedId = li.costCodeId || sub.defaultCostCodeId;
-          if (assignedId) {
-            subTotalsByCode.set(assignedId, (subTotalsByCode.get(assignedId) || 0) + (Number(li.total) || 0));
-          }
-        });
-      });
-
-      // 5. Bulk updates in chunks of 500
-      const batchSize = 450;
-      for (let i = 0; i < codesToUpdate.length; i += batchSize) {
-        const batch = writeBatch(db);
-        const chunk = codesToUpdate.slice(i, i + batchSize);
-
-        chunk.forEach(code => {
-          const baselineBudget = Number(getVal(baselineMap, code.id, code.code)) || 0;
-          const actualCostToDate = Number(getVal(actualsToDateMap, code.id, code.code)) || 0;
-          const actualCostThisPeriod = Number(getVal(actualsThisPeriodMap, code.id, code.code)) || 0;
-          const budgetChanges = Number(getVal(budgetChangeMap, code.id, code.code)) || 0;
-          const approvedBudget = baselineBudget + budgetChanges;
-          
-          let estimateAtCompletion = 0;
-          let estimateToComplete = 0;
-
-          if (code.eacMethod === 'ETC Details') {
-            estimateToComplete = Number(getVal(etcMap, code.id, code.code)) || 0;
-            estimateAtCompletion = actualCostToDate + estimateToComplete;
-          } else if (code.eacMethod === 'Change Management') {
-            const eacChanges = Number(getVal(eacChangeMap, code.id, code.code)) || 0;
-            estimateAtCompletion = baselineBudget + eacChanges;
-            estimateToComplete = estimateAtCompletion - actualCostToDate;
-          } else if (code.eacMethod === 'Sub-Contract Management') {
-            estimateAtCompletion = Number(getVal(subTotalsByCode, code.id, code.code)) || 0;
-            estimateToComplete = estimateAtCompletion - actualCostToDate;
-          } else {
-            estimateAtCompletion = Number(code.estimateAtCompletion) || 0;
-            estimateToComplete = estimateAtCompletion - actualCostToDate;
-          }
-
-          const approvedBudgetMovement = approvedBudget - (Number(code.approvedBudgetPrevious) || 0);
-          const estimateAtCompletionMovement = estimateAtCompletion - (Number(code.estimateAtCompletionPrevious) || 0);
-          const costVariance = approvedBudget - estimateAtCompletion;
-          const costVarianceMovement = costVariance - (Number(code.costVariancePrevious) || 0);
-
-          // Sanitize values to prevent Firestore rejection of NaN/Infinity
-          const sanitize = (val: number) => isFinite(val) ? val : 0;
-
-          batch.update(doc(db, 'costCodes', code.id), {
-            baselineBudget: sanitize(baselineBudget),
-            budgetChanges: sanitize(budgetChanges),
-            approvedBudget: sanitize(approvedBudget),
-            approvedBudgetMovement: sanitize(approvedBudgetMovement),
-            actualCostToDate: sanitize(actualCostToDate),
-            actualCostThisPeriod: sanitize(actualCostThisPeriod),
-            estimateToComplete: sanitize(estimateToComplete),
-            estimateAtCompletion: sanitize(estimateAtCompletion),
-            estimateAtCompletionMovement: sanitize(estimateAtCompletionMovement),
-            costVariance: sanitize(costVariance),
-            costVarianceMovement: sanitize(costVarianceMovement),
-            updatedAt: new Date().toISOString(),
-            projectId: code.projectId, // Re-affirming to satisfy rules
-            code: code.code // Re-affirming to satisfy rules
-          });
-        });
-
-        await batch.commit();
-      }
-
-      toast.success('Calculations completed successfully.', { id: toastId });
+      const scope = selectedIds.size > 0 ? Array.from(selectedIds) : undefined;
+      const updated = await recalculateProjectCosts(project.id, scope);
+      await reloadCostCodes();
+      toast.success(
+        `Recalculated ${updated} cost code${updated === 1 ? '' : 's'}.`,
+        { id: toastId }
+      );
     } catch (error: any) {
       console.error('Error calculating costs:', error);
-      handleFirestoreError(error, OperationType.UPDATE, 'costCodes/batch_calculate');
-      toast.error(`Failed to complete calculations: ${error.message || 'Unknown error'}`, { id: toastId });
+      toast.error(`Failed to complete calculations: ${error?.message || 'Unknown error'}`, { id: toastId });
     } finally {
       setIsSaving(false);
     }
-  }, [project, costCodes, selectedIds, subcontracts]);
+  }, [project.id, costCodes.length, selectedIds, reloadCostCodes]);
 
   const handleUpdateField = async (id: string, field: string, value: any) => {
     try {
-      await updateDoc(doc(db, 'costCodes', id), {
-        [field]: value,
-        updatedAt: new Date().toISOString()
-      });
+      await updateCostCode(id, { [field]: value } as Partial<CostCode>);
+      await reloadCostCodes();
     } catch (error: any) {
       console.error('Error updating field:', error);
-      handleFirestoreError(error, OperationType.UPDATE, `costCodes/${id}/${field}`);
-      toast.error(`Failed to update field: ${error.message || 'Unknown error'}`);
+      toast.error(`Failed to update field: ${error?.message || 'Unknown error'}`);
     }
   };
 
   useEffect(() => {
-    const q = query(
-      collection(db, 'costCodes'), 
-      where('projectId', '==', project.id),
-      orderBy('sortOrder', 'asc')
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const allCodes = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as CostCode));
-      
-      // Filter codes based on assignedUsers
-      const currentUser = auth.currentUser;
-      const isAdmin = project.users[currentUser?.uid || ''] === 'Project Admin';
-      
-      const filteredCodes = isAdmin 
-        ? allCodes 
-        : allCodes.filter(code => 
-            !code.assignedUsers || 
-            code.assignedUsers.length === 0 || 
-            code.assignedUsers.includes(currentUser?.uid || '')
-          );
-
-      setCostCodes(filteredCodes);
-      setLoading(false);
-    }, (error) => {
-      console.error("Cost codes fetch error:", error);
-      toast.error("Failed to fetch cost codes. Check permissions.");
-      setLoading(false);
-    });
-
-    const qSch = query(collection(db, 'scheduleItems'), where('projectId', '==', project.id));
-    const unsubSch = onSnapshot(qSch, (snapshot) => {
-      setScheduleItems(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ScheduleItem)));
-    });
-
-    return () => {
-      unsubscribe();
-      unsubSch();
-    };
-  }, [project.id, project.users]);
+    void reloadCostCodes();
+    return subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void reloadCostCodes());
+  }, [reloadCostCodes, project.id]);
 
   useEffect(() => {
-    const q = query(collection(db, 'calendars'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setCalendars(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ProjectCalendar)));
-    }, (error) => {
-      console.error("Error fetching calendars:", error);
-    });
-    return () => unsubscribe();
+    let active = true;
+    const load = async () => {
+      try {
+        const rows = await fetchScheduleItems(project.id);
+        if (active) setScheduleItems(rows);
+      } catch (error) {
+        console.error('Schedule items fetch error:', error);
+      }
+    };
+    void load();
+    return () => { active = false; };
+  }, [project.id]);
+
+  useEffect(() => {
+    let active = true;
+    void fetchCalendars(project.id)
+      .then((rows) => { if (active) setCalendars(rows); })
+      .catch((error) => console.error('Error fetching calendars:', error));
+    return () => { active = false; };
   }, [project.id]);
 
   const gridRef = useRef<AgGridReact>(null);
@@ -4015,57 +3782,22 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     if (isSaving) return; // Prevent triggering during bulk calculations or imports
 
     try {
-      const docRef = doc(db, 'costCodes', data.id);
-      const updates: any = {
-        [colDef.field]: newValue,
-        updatedAt: new Date().toISOString()
-      };
-
-      // Reactive calculations for immediate feedback
-      const baseline = Number(colDef.field === 'baselineBudget' ? newValue : data.baselineBudget) || 0;
-      const changes = Number(colDef.field === 'budgetChanges' ? newValue : data.budgetChanges) || 0;
-      const approvedPrev = Number(colDef.field === 'approvedBudgetPrevious' ? newValue : data.approvedBudgetPrevious) || 0;
-      
-      const approved = baseline + changes;
-      const approvedMovement = approved - approvedPrev;
-
-      const actualsToDate = Number(colDef.field === 'actualCostToDate' ? newValue : data.actualCostToDate) || 0;
-      const eacPrev = Number(colDef.field === 'estimateAtCompletionPrevious' ? newValue : data.estimateAtCompletionPrevious) || 0;
-      
-      let eac = Number(colDef.field === 'estimateAtCompletion' ? newValue : data.estimateAtCompletion) || 0;
-      let etc = Number(data.estimateToComplete) || 0;
-
-      if (data.eacMethod === 'ETC Details') {
-        // ETC is fixed from forecast (already in data), EAC = Actuals + ETC
-        eac = actualsToDate + etc;
-      } else {
-        // ETC = EAC - Actuals
-        etc = eac - actualsToDate;
-      }
-      
-      const eacMovement = eac - eacPrev;
-
-      const variance = approved - eac;
-      const variancePrev = Number(colDef.field === 'costVariancePrevious' ? newValue : data.costVariancePrevious) || 0;
-      const varianceMovement = variance - variancePrev;
-
-      // Add calculated fields to updates
-      updates.approvedBudget = approved;
-      updates.approvedBudgetMovement = approvedMovement;
-      updates.estimateAtCompletion = eac;
-      updates.estimateAtCompletionMovement = eacMovement;
-      updates.estimateToComplete = etc;
-      updates.costVariance = variance;
-      updates.costVarianceMovement = varianceMovement;
-
-      // Update grid data immediately for UI responsiveness
-      event.node.setData({ ...data, ...updates });
-
-      await updateDoc(docRef, updates);
+      // Write the edited field, then let the database derive the rest.
+      //
+      // This used to recompute approved budget, EAC, ETC and all three
+      // variance columns here in the browser -- a third copy of formulas that
+      // also lived in the Calculate button and in the recalculate-all pass.
+      // Three copies cannot be kept in agreement, and they were not: they
+      // disagreed about whether a Pending change counts. recalculate_project_
+      // costs() is now the single definition, and this asks it to redo the one
+      // cost code that changed.
+      event.node.setDataValue(colDef.field, newValue);
+      await updateCostCode(data.id, { [colDef.field]: newValue } as Partial<CostCode>);
+      await recalculateProjectCosts(project.id, [data.id]);
+      await reloadCostCodes();
     } catch (error: any) {
       console.error('Update error:', error);
-      handleFirestoreError(error, OperationType.UPDATE, `costCodes/${data.id}`);
-      toast.error(`Failed to update cell: ${error.message || 'Unknown error'}`);
+      toast.error(`Failed to update cell: ${error?.message || 'Unknown error'}`);
       event.node.setDataValue(colDef.field, oldValue);
     }
   };
@@ -4120,44 +3852,27 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     setIsSaving(true);
     try {
       if (isEditing?.id) {
-        // Update existing
-        await updateDoc(doc(db, 'costCodes', isEditing.id), formData);
+        await updateCostCode(isEditing.id, formData);
         toast.success('Cost code updated.');
       } else {
-        // Create new
-        // Check for duplicates within the current project
-        const isDuplicate = costCodes.some(c => c.code.toLowerCase() === formData.code?.toLowerCase());
-        if (isDuplicate) {
-          toast.error(`Cost Code ID "${formData.code}" already exists in this project.`);
-          setIsSaving(false);
-          return;
-        }
-
-        const batch = writeBatch(db);
-        let newSortOrder = 0;
-        
-        if (typeof isEditing?.insertIndex === 'number') {
-          // Insert at index: shift others
-          newSortOrder = isEditing.insertIndex;
-          const toShift = costCodes.filter(c => c.sortOrder >= isEditing.insertIndex!);
-          toShift.forEach(c => {
-            batch.update(doc(db, 'costCodes', c.id), { sortOrder: c.sortOrder + 1 });
-          });
-        } else {
-          // Append at end
-          newSortOrder = costCodes.length > 0 ? Math.max(...costCodes.map(c => c.sortOrder)) + 1 : 0;
-        }
-
-        const newRef = doc(collection(db, 'costCodes'));
-        batch.set(newRef, {
-          ...formData,
-          projectId: project.id,
-          sortOrder: newSortOrder
-        });
-        
-        await batch.commit();
+        // The duplicate check is the database's: (project_id, code) is unique,
+        // so it holds even when two people submit the same code at the same
+        // moment, which the old "does this code already exist in the rows I
+        // happen to have loaded" check could not.
+        await insertCostCodeAt(
+          project.id,
+          {
+            code: formData.code!,
+            name: formData.name ?? '',
+            eacMethod: formData.eacMethod,
+            enterpriseAttributes: formData.enterpriseAttributes,
+            projectAttributes: formData.projectAttributes,
+          },
+          typeof isEditing?.insertIndex === 'number' ? isEditing.insertIndex : undefined
+        );
         toast.success('Cost code created.');
       }
+      await reloadCostCodes();
       setIsEditing(null);
       setFormData({ 
         code: '', 
@@ -4167,9 +3882,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         eacMethod: 'Manual',
         assignedUsers: []
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error saving cost code:', error);
-      toast.error('Failed to save changes.');
+      // 23505 is a unique violation -- here, always (project_id, code).
+      toast.error(
+        error?.code === '23505'
+          ? `Cost Code ID "${formData.code}" already exists in this project.`
+          : `Failed to save changes: ${error?.message || 'Unknown error'}`
+      );
     } finally {
       setIsSaving(false);
     }
@@ -4180,14 +3900,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
     try {
       if (deleteConfirm.type === 'single' && deleteConfirm.id) {
-        await deleteDoc(doc(db, 'costCodes', deleteConfirm.id));
+        await deleteCostCodes([deleteConfirm.id]);
       } else if (deleteConfirm.type === 'bulk') {
-        const batch = writeBatch(db);
-        selectedIds.forEach(id => {
-          batch.delete(doc(db, 'costCodes', id));
-        });
-        await batch.commit();
+        // One statement, not a batch of individual deletes. ETC details, cost
+        // phasing, actuals, baselines and change records all cascade from the
+        // cost code, so none of them are deleted here by hand.
+        await deleteCostCodes(Array.from(selectedIds));
       }
+      await reloadCostCodes();
       setSelectedIds(new Set());
       setDeleteConfirm(null);
       toast.success('Deleted successfully.');
@@ -4201,28 +3921,16 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     if (selectedIds.size === 0) return;
     setIsSaving(true);
     try {
-      const batch = writeBatch(db);
-      selectedIds.forEach(id => {
-        const updateObj: any = {};
-        if (bulkUpdateData.eacMethod) updateObj.eacMethod = bulkUpdateData.eacMethod;
-        
-        // Merge attributes
-        const currentCode = costCodes.find(c => c.id === id);
-        if (currentCode) {
-          updateObj.enterpriseAttributes = { 
-            ...(currentCode.enterpriseAttributes || {}), 
-            ...bulkUpdateData.enterpriseAttributes 
-          };
-          updateObj.projectAttributes = { 
-            ...(currentCode.projectAttributes || {}), 
-            ...bulkUpdateData.projectAttributes 
-          };
-        }
-        
-        batch.update(doc(db, 'costCodes', id), updateObj);
+      // The attributes merge server-side, against each row's current value.
+      // The old version merged against the copy this grid had loaded, so a
+      // bulk update silently reverted anything someone else had changed since.
+      const updated = await bulkUpdateCostCodes(Array.from(selectedIds), {
+        eacMethod: bulkUpdateData.eacMethod,
+        enterpriseAttributes: bulkUpdateData.enterpriseAttributes,
+        projectAttributes: bulkUpdateData.projectAttributes,
       });
-      await batch.commit();
-      toast.success(`Updated ${selectedIds.size} cost codes.`);
+      await reloadCostCodes();
+      toast.success(`Updated ${updated} cost code${updated === 1 ? '' : 's'}.`);
       setIsBulkUpdating(false);
       setSelectedIds(new Set());
       setBulkUpdateData({ enterpriseAttributes: {}, projectAttributes: {} });
@@ -4268,7 +3976,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     
     const toastId = toast.loading('Importing cost codes...');
     try {
-      const batch = writeBatch(db);
+      const upsertRows: Array<Partial<CostCode> & { code: string }> = [];
       let currentMaxOrder = costCodes.length > 0 ? Math.max(...costCodes.map(c => c.sortOrder)) : -1;
       let importCount = 0;
       let updateCount = 0;
@@ -4300,38 +4008,27 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             }
           });
 
+          // Matched on code, which is unique per project -- so this is an
+          // upsert, and the database decides insert vs update rather than the
+          // browser guessing from the rows it happens to have loaded. The old
+          // version also seeded approvedChanges and subcontractAmount on every
+          // new row; nothing ever read either of them.
           const existing = costCodes.find(c => c.code.toLowerCase() === String(code).toLowerCase());
-          const costCodeData: any = {
+          if (existing) { updateCount++; } else { currentMaxOrder++; importCount++; }
+
+          upsertRows.push({
             code: String(code),
             name: String(name),
-            eacMethod: String(eacMethod),
-            projectId: project.id,
+            eacMethod: String(eacMethod) as CostCode['eacMethod'],
             enterpriseAttributes: entAttrs,
             projectAttributes: prjAttrs,
-            updatedAt: new Date().toISOString()
-          };
-          
-          if (existing) {
-            batch.update(doc(db, 'costCodes', existing.id), costCodeData);
-            updateCount++;
-          } else {
-            currentMaxOrder++;
-            const newRef = doc(collection(db, 'costCodes'));
-            batch.set(newRef, { 
-              ...costCodeData, 
-              sortOrder: currentMaxOrder,
-              createdAt: new Date().toISOString(),
-              actualCostToDate: 0,
-              baselineBudget: 0,
-              approvedChanges: 0,
-              subcontractAmount: 0
-            });
-            importCount++;
-          }
+            ...(existing ? {} : { sortOrder: currentMaxOrder }),
+          });
         }
       }
 
-      await batch.commit();
+      await upsertCostCodes(project.id, upsertRows);
+      await reloadCostCodes();
       toast.success(`Import complete: ${importCount} new, ${updateCount} updated.`, { id: toastId });
       setImportPreview(null);
     } catch (error) {
