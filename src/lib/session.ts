@@ -311,8 +311,57 @@ export async function updateOwnProfile(
  * and the statement was rejected. Doing both steps in one function removes
  * the dependence on trigger ordering.
  */
-export async function createEnterprise(name: string): Promise<string> {
-  const { data, error } = await supabase.rpc('create_enterprise', { p_name: name });
+export async function createEnterprise(name: string, code?: string): Promise<string> {
+  const { data, error } = await supabase.rpc('create_enterprise', {
+    p_name: name,
+    p_code: code && code.trim() !== '' ? code : null,
+  });
   raise('create enterprise', error);
   return data as string;
+}
+
+// ------------------------------------------------- system owner (platform) ----
+
+/**
+ * Every enterprise in the system. Only a platform admin can read this: RLS
+ * restricts enterprises to members, and auth_is_enterprise_member() returns
+ * true for a platform admin, so a normal user sees only their own.
+ */
+export async function fetchAllEnterprises(): Promise<Enterprise[]> {
+  const { data, error } = await supabase
+    .from('enterprises')
+    .select('*')
+    .order('name');
+  raise('load enterprises', error);
+  return fromRows<Enterprise>(data);
+}
+
+export async function renameEnterprise(
+  enterpriseId: string,
+  patch: { name?: string; enterpriseCode?: string }
+): Promise<void> {
+  const row: Record<string, any> = {};
+  if (patch.name !== undefined) row.name = patch.name;
+  if (patch.enterpriseCode !== undefined) row.enterprise_code = patch.enterpriseCode;
+  const { error } = await supabase.from('enterprises').update(row).eq('id', enterpriseId);
+  raise('rename enterprise', error);
+}
+
+export async function deleteEnterprises(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  // Projects, cost codes and everything under them cascade. Only a platform
+  // admin may do this.
+  const { error } = await supabase.from('enterprises').delete().in('id', ids);
+  raise('delete enterprises', error);
+}
+
+/** How many people belong to each enterprise, for the system owner's list. */
+export async function fetchEnterpriseMemberCounts(): Promise<Record<string, number>> {
+  const { data, error } = await supabase.from('enterprise_members').select('enterprise_id, role');
+  raise('load member counts', error);
+  const counts: Record<string, number> = {};
+  for (const row of (data ?? []) as any[]) {
+    counts[row.enterprise_id] = (counts[row.enterprise_id] ?? 0) + 1;
+  }
+  return counts;
 }

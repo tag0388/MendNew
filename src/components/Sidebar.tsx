@@ -25,9 +25,9 @@ import {
 } from 'lucide-react';
 import { useNavigate, useLocation, useParams, matchPath } from 'react-router-dom';
 import { Enterprise, Project } from '../types';
-import { auth, db } from '../firebase';
-import { signOut } from 'firebase/auth';
-import { collection, query, where, onSnapshot, doc } from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import { fetchProject, fetchMyProjectRole } from '../lib/projects';
+import { signOut } from '../lib/currentUser';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -37,6 +37,9 @@ interface SidebarProps {
   enterprise: Enterprise | null;
   userEmail?: string | null;
   userId?: string | null;
+  /** From platform_admins and enterprise_members, not a hardcoded email list. */
+  isSystemAdmin?: boolean;
+  enterpriseRole?: 'Enterprise System Admin' | 'Enterprise User';
   theme: 'light' | 'dark';
   setTheme: (theme: 'light' | 'dark') => void;
   isCollapsed: boolean;
@@ -47,6 +50,8 @@ export default function Sidebar({
   enterprise, 
   userEmail,
   userId,
+  isSystemAdmin = false,
+  enterpriseRole,
   theme,
   setTheme,
   isCollapsed,
@@ -63,23 +68,33 @@ export default function Sidebar({
   let moduleId = moduleMatch?.params.moduleId;
 
   const [project, setProject] = useState<Project | null>(null);
+  const [projectRole, setProjectRole] = useState<string | null>(null);
 
   useEffect(() => {
     if (!projectId) {
       setProject(null);
+      setProjectRole(null);
       return;
     }
-    const unsubscribe = onSnapshot(doc(db, 'projects', projectId), (snapshot) => {
-      if (snapshot.exists()) {
-        setProject({ ...snapshot.data() as Project, id: snapshot.id });
-      }
+    let active = true;
+    void fetchProject(projectId).then(p => { if (active) setProject(p); });
+    if (userId) {
+      void fetchMyProjectRole(projectId, userId).then(r => { if (active) setProjectRole(r); });
+    }
+    const unsubscribe = subscribeToTable('projects', `id=eq.${projectId}`, () => {
+      void fetchProject(projectId).then(p => { if (active) setProject(p); });
     });
-    return () => unsubscribe();
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [projectId]);
 
-  const isSystemAdmin = userEmail?.toLowerCase() === 'tarek.guindy@gmail.com' || userEmail?.toLowerCase() === 'tarek_guindy@hotmail.com';
-  const isEnterpriseAdmin = userId && enterprise?.users?.[userId]?.role === 'Enterprise System Admin';
-  const isProjectAdmin = userId && (isEnterpriseAdmin || project?.users?.[userId] === 'Project Admin');
+  // These only decide which links to show. Every screen behind them is
+  // enforced by row level security, so a hidden link is a convenience, not
+  // the protection.
+  const isEnterpriseAdmin = isSystemAdmin || enterpriseRole === 'Enterprise System Admin';
+  const isProjectAdmin = isEnterpriseAdmin || projectRole === 'Project Admin';
 
   const enterpriseItems = [
     { id: 'enterprise', label: 'Enterprise', icon: Layout, disabled: !enterprise },
@@ -263,7 +278,7 @@ export default function Sidebar({
 
           <Button 
             variant="ghost"
-            onClick={() => signOut(auth)}
+            onClick={() => void signOut()}
             className={cn(
               "w-full justify-start gap-3 px-3 py-2 h-auto font-normal text-red-400 hover:text-red-300 hover:bg-red-400/10",
               isCollapsed && "justify-center px-0"

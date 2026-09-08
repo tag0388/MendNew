@@ -1,7 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { db } from '../firebase';
-import { collection, onSnapshot, addDoc, deleteDoc, doc, updateDoc, writeBatch } from 'firebase/firestore';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Enterprise } from '../types';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  fetchAllEnterprises, createEnterprise, renameEnterprise, deleteEnterprises,
+} from '../lib/session';
 import { Plus, Trash2, Edit2, Building2, Shield, Search, AlertTriangle, X, Download, Upload, Filter, Eye, EyeOff, Lock, Unlock, Check, ChevronDown, CheckCircle2 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
@@ -45,14 +47,18 @@ export default function SystemAdmin({ onSwitchEnterprise, currentEnterpriseId }:
     { id: 'admins', label: 'Admins' }
   ];
 
-  useEffect(() => {
-    const unsubscribe = onSnapshot(collection(db, 'enterprises'), (snapshot) => {
-      setEnterprises(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Enterprise)));
-    }, (error) => {
-      console.error("Enterprises fetch error:", error);
-    });
-    return () => unsubscribe();
+  const reload = useCallback(async () => {
+    try {
+      setEnterprises(await fetchAllEnterprises());
+    } catch (error) {
+      console.error('Enterprises fetch error:', error);
+    }
   }, []);
+
+  useEffect(() => {
+    void reload();
+    return subscribeToTable('enterprises', undefined, () => void reload());
+  }, [reload]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -69,52 +75,42 @@ export default function SystemAdmin({ onSwitchEnterprise, currentEnterpriseId }:
       setIsSubmitting(true);
       const finalName = formData.name.trim() || 'Enterprise Name';
       if (editingEnterprise) {
-        await updateDoc(doc(db, 'enterprises', editingEnterprise.id), {
+        await renameEnterprise(editingEnterprise.id, {
           name: finalName,
-          enterpriseId: formData.enterpriseId,
+          enterpriseCode: formData.enterpriseId,
         });
       } else {
-        // Check for uniqueness again on submit
-        if (enterprises.some(e => e.enterpriseId === formData.enterpriseId)) {
-          alert('This ID already Exists!');
-          setIsSubmitting(false);
-          return;
-        }
-
-        // Initialize 10 static attributes for both project and line items
-        const defaultAttributes = Array.from({ length: 10 }, (_, i) => ({
-          id: (i + 1).toString().padStart(2, '0'),
-          title: '',
-          values: []
-        }));
-
-        await addDoc(collection(db, 'enterprises'), {
-          name: finalName,
-          enterpriseId: formData.enterpriseId,
-          adminUsers: [], 
-          users: {},
-          projectAttributes: defaultAttributes,
-          lineItemAttributes: defaultAttributes,
-          createdAt: new Date().toISOString()
-        });
+        // create_enterprise() writes the enterprise and the creator's
+        // membership together, and refuses anyone who is not the system
+        // owner. enterprise_code is unique, so a clash is reported by the
+        // database rather than by a check that could race.
+        await createEnterprise(finalName, formData.enterpriseId);
       }
+      await reload();
       setIsModalOpen(false);
       setEditingEnterprise(null);
       setFormData({ name: '', enterpriseId: '' });
     } catch (error) {
       console.error('Operation failed', error);
+      alert(
+        error instanceof Error ? error.message
+        : typeof error === 'object' && error !== null && 'message' in error
+          ? String((error as any).message)
+          : 'Could not save the enterprise.'
+      );
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleDelete = async (id: string | string[]) => {
-    if (Array.isArray(id)) {
-      await Promise.all(id.map(i => deleteDoc(doc(db, 'enterprises', i))));
-      setSelectedIds([]);
-    } else {
-      await deleteDoc(doc(db, 'enterprises', id));
-      setSelectedIds(prev => prev.filter(i => i !== id));
+    try {
+      await deleteEnterprises(Array.isArray(id) ? id : [id]);
+      if (Array.isArray(id)) setSelectedIds([]);
+      else setSelectedIds(prev => prev.filter(i => i !== id));
+      await reload();
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not delete the enterprise.');
     }
     setDeleteConfirm(null);
   };
@@ -192,40 +188,38 @@ export default function SystemAdmin({ onSwitchEnterprise, currentEnterpriseId }:
   const completeImport = async () => {
     if (!importPreview) return;
 
-    const batch = writeBatch(db);
-    const defaultAttributes = Array.from({ length: 10 }, (_, i) => ({
-      id: (i + 1).toString().padStart(2, '0'),
-      title: '',
-      values: []
-    }));
+    // Enterprises are created one at a time through create_enterprise(),
+    // which enforces that only the system owner may do it and reports a
+    // duplicate code plainly. A spreadsheet import is not a reason to bypass
+    // that, so each row goes through the same path.
+    let created = 0;
+    let renamed = 0;
+    const failures: string[] = [];
 
     for (const row of importPreview) {
       const entId = row['Enterprise ID']?.toString() || '';
       const name = row['Enterprise Name']?.toString() || '';
-      
       if (!name) continue;
 
-      const existing = enterprises.find(e => e.enterpriseId === entId);
-      if (existing) {
-        batch.update(doc(db, 'enterprises', existing.id), {
-          name,
-          enterpriseId: entId
-        });
-      } else {
-        const newDocRef = doc(collection(db, 'enterprises'));
-        batch.set(newDocRef, {
-          name,
-          enterpriseId: entId,
-          adminUsers: [],
-          users: {},
-          projectAttributes: defaultAttributes,
-          lineItemAttributes: defaultAttributes,
-          createdAt: new Date().toISOString()
-        });
+      try {
+        const existing = enterprises.find(e => e.enterpriseId === entId);
+        if (existing) {
+          await renameEnterprise(existing.id, { name, enterpriseCode: entId });
+          renamed++;
+        } else {
+          await createEnterprise(name, entId);
+          created++;
+        }
+      } catch (error) {
+        failures.push(`${name}: ${error instanceof Error ? error.message : 'failed'}`);
       }
     }
 
-    await batch.commit();
+    await reload();
+    if (failures.length > 0) {
+      alert(`${created} created, ${renamed} updated.\n\nSkipped:\n${failures.join('\n')}`);
+    }
+
     setImportPreview(null);
     setShowImportSuccessModal(true);
   };

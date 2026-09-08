@@ -5,7 +5,7 @@ import type { User } from '@supabase/supabase-js';
 import { setCurrentUser, toCurrentUser, signOut } from './lib/currentUser';
 import {
   loadSessionContext, fetchEnterprise, fetchProjects, acceptInvitation,
-  createEnterprise, type SessionContext,
+  type SessionContext,
 } from './lib/session';
 import { fetchProject } from './lib/projects';
 import { Enterprise, Project } from './types';
@@ -530,6 +530,9 @@ function AuthenticatedApp({
     );
   }
 
+  // A user who belongs to no enterprise waits to be invited. Only the system
+  // owner creates enterprises, and they do it from the System Admin screen --
+  // so there is no "create one" offer here.
   if (!currentEnterprise && !loading && !isSystemOwner) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-[#F5F5F4] p-6">
@@ -539,50 +542,29 @@ function AuthenticatedApp({
           </div>
           <h2 className="text-2xl font-bold mb-4">Welcome to Mend</h2>
           <p className="text-sm text-gray-900 mb-8 leading-relaxed">
-            You are not currently associated with an enterprise. Please contact your administrator or create a new enterprise workspace.
+            Your account is set up, but you have not been added to an enterprise yet.
+            Ask your administrator to invite you, then sign in again using the link
+            they send you.
           </p>
-          <div className="space-y-4">
-            <button 
-              onClick={async () => {
-                const name = prompt('Enter your Enterprise Name:');
-                if (!name) return;
-                try {
-                  // create_enterprise() writes the enterprise and the
-                  // creator's admin membership together. A plain insert could
-                  // not read its own row back: the SELECT policy requires a
-                  // membership that an AFTER INSERT trigger had not yet
-                  // written.
-                  const enterpriseId = await createEnterprise(name);
-                  const u = (await supabase.auth.getUser()).data.user;
-                  if (u) setSession(await loadSessionContext(u.id, u.email ?? ''));
-                  setActiveEnterpriseId(enterpriseId);
-                } catch (e) {
-                  // Supabase returns errors as plain objects, not Error
-                  // instances, so an `instanceof Error` check swallowed the
-                  // real reason and showed only "please try again".
-                  const message =
-                    e instanceof Error ? e.message
-                    : typeof e === 'object' && e !== null && 'message' in e ? String((e as any).message)
-                    : 'Failed to create enterprise. Please try again.';
-                  alert(message);
-                }
-              }}
-              className="w-full py-3 bg-black text-white rounded-lg font-medium hover:bg-black/90 transition-colors flex items-center justify-center gap-2"
-            >
-              <Plus className="w-4 h-4" />
-              Create New Enterprise
-            </button>
-            <button 
-              onClick={() => void signOut()}
-              className="w-full py-3 border border-gray-200 hover:bg-gray-50 text-black rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
-            >
-              <LogOut className="w-4 h-4" />
-              Sign Out
-            </button>
-          </div>
+          <p className="text-xs text-gray-500 mb-8">
+            Signed in as <span className="font-medium text-gray-900">{user.email}</span>
+          </p>
+          <button
+            onClick={() => void signOut()}
+            className="w-full py-3 border border-gray-200 hover:bg-gray-50 text-black rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
+          >
+            <LogOut className="w-4 h-4" />
+            Sign Out
+          </button>
         </div>
       </div>
     );
+  }
+
+  // The system owner with no enterprise selected yet goes straight to the
+  // screen where enterprises are created.
+  if (!currentEnterprise && !loading && isSystemOwner && location.pathname !== '/system-admin') {
+    return <Navigate to="/system-admin" replace />;
   }
 
   return (
@@ -591,6 +573,8 @@ function AuthenticatedApp({
         enterprise={currentEnterprise}
         userEmail={user.email}
         userId={user.id}
+        isSystemAdmin={isSystemOwner}
+        enterpriseRole={session?.memberships.find(m => m.enterpriseId === currentEnterprise?.id)?.role}
         theme={theme}
         setTheme={setTheme}
         isCollapsed={isSidebarCollapsed}
