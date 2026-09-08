@@ -922,7 +922,6 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
           enableRangeSelection: true,
           enableFillHandle: true,
           undoRedoCellEditing: true,
-          enableCellTextSelection: true,
           pagination: true,
           paginationPageSize: 100,
           onSelectionChanged: (event: any) => {

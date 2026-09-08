@@ -1250,7 +1250,6 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
           },
           animateRows: true,
           enableRangeSelection: true,
-          enableCellTextSelection: true,
           suppressRowTransform: true,
         }}
       />

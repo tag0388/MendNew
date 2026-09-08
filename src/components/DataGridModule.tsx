@@ -377,6 +377,16 @@ const DataGridModule: React.FC<DataGridModuleProps> = ({
               pinnedBottomRowData={pinnedBottomRowData}
               quickFilterText={quickFilterText}
               animateRows={true}
+              // Do NOT add enableCellTextSelection here or on any grid.
+              // AG Grid's own note: "When this is set to true, the clipboard
+              // service is disabled and only selected text is copied." With it
+              // on, Ctrl+C copied the browser's text selection -- empty when
+              // you have selected CELLS -- so the clipboard kept whatever was
+              // last put there and Ctrl+V pasted stale content. Right-click ->
+              // Copy still worked, because the context menu calls the
+              // clipboard service directly, which is what made it look like a
+              // keyboard problem. The cost of leaving it off is that you
+              // cannot drag-select part of the text inside one cell.
               enableRangeSelection={true}
               enableFillHandle={true}
               undoRedoCellEditing={true}

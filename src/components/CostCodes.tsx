@@ -4619,7 +4619,6 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   enableRangeSelection={true}
                   enableFillHandle={true}
                   undoRedoCellEditing={true}
-                  enableCellTextSelection={true}
                   suppressClipboardPaste={false}
                   processCellFromClipboard={(params) => {
                     const colId = params.column.getColId();
@@ -4949,7 +4948,6 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   }}
                   animateRows={true}
                   enableRangeSelection={true}
-                  enableCellTextSelection={true}
                   grandTotalRow="top"
                   pagination={true}
                   paginationPageSize={100}
@@ -5021,7 +5019,6 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   }}
                   animateRows={true}
                   enableRangeSelection={true}
-                  enableCellTextSelection={true}
                   grandTotalRow="top"
                   pagination={true}
                   paginationPageSize={100}
@@ -5271,7 +5268,6 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   }}
                   animateRows={true}
                   enableRangeSelection={true}
-                  enableCellTextSelection={true}
                 />
               </div>
             </div>
