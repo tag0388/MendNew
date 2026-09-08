@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { subscribeToTable } from '../lib/supabase';
 import {
   createProject, deleteProjects, updateProject, upsertProjects,
@@ -73,26 +73,29 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
   // enterprise's, a normal user only those they are a member of. The old
   // client-side filter is gone -- a user's own browser was deciding what they
   // were allowed to see.
+  // Hoisted out of the effect so the write handlers can call it. Waiting for
+  // a change broadcast to show your OWN action is wrong even when the
+  // broadcast works: it makes every save depend on a live socket, and a
+  // dropped connection looks exactly like a failed save. Realtime is for
+  // picking up what OTHER people change.
+  const reloadProjects = useCallback(async () => {
+    if (!enterprise) return;
+    try {
+      setProjects(await fetchProjects(enterprise.id));
+    } catch (error) {
+      console.error('Projects fetch error:', error);
+    }
+  }, [enterprise]);
+
   useEffect(() => {
     if (!enterprise) return;
-    let active = true;
-
-    const load = async () => {
-      try {
-        const rows = await fetchProjects(enterprise.id);
-        if (active) setProjects(rows);
-      } catch (error) {
-        console.error('Projects fetch error:', error);
-      }
-    };
-
-    void load();
-    const unsubscribe = subscribeToTable('projects', `enterprise_id=eq.${enterprise.id}`, () => void load());
-    return () => {
-      active = false;
-      unsubscribe();
-    };
-  }, [enterprise]);
+    void reloadProjects();
+    return subscribeToTable(
+      'projects',
+      `enterprise_id=eq.${enterprise.id}`,
+      () => void reloadProjects()
+    );
+  }, [enterprise, reloadProjects]);
 
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -112,6 +115,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
         projectName: newProject.name.trim() || 'Project Name',
         projectCode: newProject.code,
       });
+      await reloadProjects();
       setIsModalOpen(false);
       setNewProject({ name: '', code: '' });
     } catch (error) {
@@ -129,6 +133,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
       // Cost codes, subcontracts, changes, risks and progress all cascade from
       // the project, so this is one statement.
       await deleteProjects([projectToDelete.id]);
+      await reloadProjects();
       setProjectToDelete(null);
     } catch (error) {
       console.error('Failed to delete project', error);
@@ -143,6 +148,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
     try {
       if (deleteConfirm.type === 'bulk') {
         await deleteProjects(Array.from(selectedIds));
+        await reloadProjects();
         toast.success(`Deleted ${selectedIds.size} projects.`);
       }
       setSelectedIds(new Set());
@@ -163,6 +169,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
           });
         })
       );
+      await reloadProjects();
       toast.success(`Updated ${selectedIds.size} projects.`);
       setIsBulkUpdating(false);
       setSelectedIds(new Set());
@@ -277,6 +284,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
             // constraint decides insert vs update, so a code cannot be
             // duplicated by two imports racing.
             await upsertProjects(enterprise.id, toUpsert);
+            await reloadProjects();
             if (added > 0) toast.success(`Imported ${added} new projects.`);
             if (updated > 0) toast.success(`Updated ${updated} existing projects.`);
           }
@@ -293,6 +301,7 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
   const handleUpdateField = async (id: string, field: string, value: any) => {
     try {
       await updateProject(id, { [field]: value } as any);
+      await reloadProjects();
     } catch (e) {
       console.error(e);
     }
