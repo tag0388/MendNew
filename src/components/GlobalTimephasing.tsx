@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, Subcontract, ScheduleItem } from '../types';
 import { db, auth } from '../firebase';
 import { 
@@ -183,7 +184,7 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
       try {
         const periods = project.reportingPeriods?.periods || [];
         const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-        const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+        const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
         
         // 1. Get ALL Phasing data for the project
         const phasingQuery = query(
@@ -483,7 +484,7 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
       const currentPeriodId = project.reportingPeriods?.currentPeriodId;
       const currentPeriod = periods.find(p => p.id === currentPeriodId);
       const currentPeriodEnd = currentPeriod ? new Date(currentPeriod.endDate) : null;
-      const currentIndex = periods.findIndex(p => p.id === currentPeriodId);
+      const currentIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
       const nextPeriodStart = (currentIndex !== -1 && currentIndex < periods.length - 1) 
         ? periods[currentIndex + 1].startDate 
         : null;
@@ -670,7 +671,7 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
   const columnDefs = useMemo<(ColDef | ColGroupDef)[]>(() => {
     const periods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+    const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
 
     return [
       {

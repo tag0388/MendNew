@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode } from '../types';
 import { 
   DollarSign, 
@@ -342,7 +343,7 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
 
         const periods = project.reportingPeriods?.periods || [];
         const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-        const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+        const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
         
         const errors: { row: number; msg: string; type: 'error' | 'warning' }[] = [];
 
@@ -491,7 +492,7 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
     if (colDef.field === 'reportingPeriodId') {
       const periods = project.reportingPeriods?.periods || [];
       const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-      const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+      const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
       const newPeriodIndex = periods.findIndex(p => p.id === newValue);
 
       if (newPeriodIndex > currentPeriodIndex) {
@@ -523,7 +524,7 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
   const columnDefs = useMemo<(ColDef | ColGroupDef)[]>(() => {
     const periods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+    const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
     const allowedPeriods = periods.slice(0, currentPeriodIndex + 1);
 
     const enterpriseAttrs = (enterprise.lineItemAttributes || []).filter(a => a.title);

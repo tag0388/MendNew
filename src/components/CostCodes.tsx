@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
+import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, Change, ChangeRecord, Subcontract, ScheduleItem } from '../types';
 import { subscribeToTable } from '../lib/supabase';
 import {
@@ -635,7 +636,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     const initialActualCost = selectedCostCodeObj?.actualCostToDate || 0;
     
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentPeriodIndex = project.reportingPeriods?.periods.findIndex(p => p.id === currentPeriodId) ?? -1;
+    const currentPeriodIndex = resolveCurrentPeriodIndex(project.reportingPeriods?.periods ?? [], currentPeriodId);
     const periods = project.reportingPeriods.periods.slice(currentPeriodIndex + 1);
     let cumulative = initialActualCost;
     
@@ -972,7 +973,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       try {
         const periods = project.reportingPeriods?.periods || [];
         const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-        const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+        const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
         
         // 1. Get Actuals for this cost code, filtered by the database rather
         //    than by downloading the project's whole ledger.
@@ -1229,7 +1230,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     try {
       const allPeriods = project.reportingPeriods?.periods || [];
       const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-      const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+      const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
       const futurePeriodIds = allPeriods.slice(currentIndex + 1).map(p => p.id);
 
       // Create a clean update object with only valid fields
@@ -1312,12 +1313,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
     const allPeriods = project.reportingPeriods.periods;
     const currentPeriodId = project.reportingPeriods.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
 
     // Clearing periods (starting from current period to ensure no old forecast pollution)
-    const periodsToClear = currentIndex !== -1 ? allPeriods.slice(currentIndex) : allPeriods;
+    const periodsToClear = allPeriods.slice(currentIndex);
     // Distribution periods (starting from next period)
-    const distributionPeriods = currentIndex !== -1 ? allPeriods.slice(currentIndex + 1) : allPeriods;
+    const distributionPeriods = allPeriods.slice(currentIndex + 1);
 
     if (distributionPeriods.length === 0) {
       toast.error("No future periods available for phasing");
@@ -1708,7 +1709,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     if (!selectedEtcCode) return;
     const allPeriods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
     
     // Only export future periods for ETC
     const futurePeriods = allPeriods.slice(currentIndex + 1);
@@ -1763,7 +1764,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
         const allPeriods = project.reportingPeriods?.periods || [];
         const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-        const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+        const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
         const futurePeriodIds = allPeriods.slice(currentIndex + 1).map(p => p.id);
 
         const importedRows: Array<Record<string, unknown>> = [];
@@ -1833,7 +1834,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     if (etcRows.length === 0) return [];
     const allPeriods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
     
     // Only consider future periods for ETC subtotal
     const futurePeriods = allPeriods.slice(currentIndex + 1);
@@ -1897,7 +1898,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   const etcColumnDefs = useMemo<(ColDef | ColGroupDef)[]>(() => {
     const allPeriods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
     
     // Only show future periods
     const periods = allPeriods.slice(currentIndex + 1);
@@ -2425,7 +2426,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   const timephasingColumnDefs = useMemo<(ColDef | ColGroupDef)[]>(() => {
     const periods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+    const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
     
     const defs: (ColDef | ColGroupDef)[] = [
       {
@@ -2719,7 +2720,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       const currentPeriodId = project.reportingPeriods?.currentPeriodId;
       const currentPeriod = periods.find(p => p.id === currentPeriodId);
       const currentPeriodEnd = currentPeriod ? new Date(currentPeriod.endDate) : null;
-      const currentIndex = periods.findIndex(p => p.id === currentPeriodId);
+      const currentIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
       const nextPeriodStart = (currentIndex !== -1 && currentIndex < periods.length - 1) 
         ? periods[currentIndex + 1].startDate 
         : null;
@@ -2828,7 +2829,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
         const periods = project.reportingPeriods?.periods || [];
         const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-        const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+        const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
         const futurePeriodIds = periods.slice(currentPeriodIndex + 1).map(p => p.id);
 
         const phasingUpserts: Parameters<typeof upsertCostPhasingMany>[1] = [];

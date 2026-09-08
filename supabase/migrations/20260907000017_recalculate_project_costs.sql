@@ -52,7 +52,17 @@ begin
              (select c.sort_order from reporting_periods c
                where c.project_id = p_project_id and c.kind = 'cost' and c.is_current
                limit 1),
-             -1)
+             -- No current period: treat the earliest as current, so forecast
+             -- starts after it. This was -1, which means `> -1` -- every
+             -- period counted as future, including the one being reported.
+             -- Same shape as the browser bug: findIndex returning -1 and
+             -- slice(-1 + 1) taking the whole list. A trigger now guarantees
+             -- a current period exists; this stays defensive because the two
+             -- failures are not equally bad. Treating the first period as
+             -- current at worst forecasts one period late, while -1 puts
+             -- forecast money into a period already reported as actual.
+             (select min(c.sort_order) from reporting_periods c
+               where c.project_id = p_project_id and c.kind = 'cost'))
   ),
   -- A change counts once it is Approved or Pending. Rejected and Withdrawn
   -- changes never reach the cost codes.

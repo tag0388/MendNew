@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { 
   Plus, 
   Search, 
@@ -1998,7 +1999,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     
     const periods = project.reportingPeriods.periods;
     const currentPeriodId = project.reportingPeriods.currentPeriodId;
-    const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+    const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
     
     const lineItems = selectedSubcontract.lineItems || [];
     
@@ -2479,7 +2480,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
       const currentPeriodId = project.reportingPeriods?.currentPeriodId;
       const currentPeriod = periods.find(p => p.id === currentPeriodId);
       const currentPeriodEnd = currentPeriod ? new Date(currentPeriod.endDate) : null;
-      const currentIndex = periods.findIndex(p => p.id === currentPeriodId);
+      const currentIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
       const nextPeriodStart = (currentIndex !== -1 && currentIndex < periods.length - 1) 
         ? periods[currentIndex + 1].startDate 
         : null;
@@ -2533,7 +2534,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     const sortedCostCodes = [...costCodes].sort((a, b) => a.code.localeCompare(b.code));
     const periods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+    const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
 
     const defs: any[] = [
       {
@@ -3089,7 +3090,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     
     const periods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentPeriodIndex = periods.findIndex(p => p.id === currentPeriodId);
+    const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
 
     const lineItems = selectedSubcontract.lineItems || [];
     const totalContract = lineItems.reduce((sum, li) => sum + (li.total || 0), 0);

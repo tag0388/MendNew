@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
+import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, Calendar as ProjectCalendar, EtcDetail, ResourceRate, ScheduleItem } from '../types';
 import { subscribeToTable } from '../lib/supabase';
 import {
@@ -227,7 +228,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     if (!project.reportingPeriods?.periods || etcRows.length === 0) return [];
     
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentPeriodIndex = project.reportingPeriods?.periods.findIndex(p => p.id === currentPeriodId) ?? -1;
+    const currentPeriodIndex = resolveCurrentPeriodIndex(project.reportingPeriods?.periods ?? [], currentPeriodId);
     const periods = project.reportingPeriods.periods.slice(currentPeriodIndex + 1);
     
     // Calculate initial cumulative from all cost codes' actual cost to date
@@ -273,7 +274,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     try {
       const allPeriods = project.reportingPeriods?.periods || [];
       const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-      const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+      const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
       const futurePeriodIds = allPeriods.slice(currentIndex + 1).map(p => p.id);
 
       const updates: any = {
@@ -446,7 +447,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
   const handleExportEtc = () => {
     const allPeriods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
     const futurePeriods = allPeriods.slice(currentIndex + 1);
 
     const data = etcRows.map(row => {
@@ -513,12 +514,12 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
 
     const allPeriods = project.reportingPeriods.periods;
     const currentPeriodId = project.reportingPeriods.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
     
     // Distribution periods (starting from next period)
-    const distributionPeriods = currentIndex !== -1 ? allPeriods.slice(currentIndex + 1) : allPeriods;
+    const distributionPeriods = allPeriods.slice(currentIndex + 1);
     // Clearing periods (starting from current period to ensure no old forecast pollution)
-    const periodsToClear = currentIndex !== -1 ? allPeriods.slice(currentIndex) : allPeriods;
+    const periodsToClear = allPeriods.slice(currentIndex);
 
     if (distributionPeriods.length === 0) {
       toast.error("No periods available for future phasing");
@@ -887,7 +888,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
 
         const allPeriods = project.reportingPeriods?.periods || [];
         const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-        const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+        const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
         const futurePeriodIds = allPeriods.slice(currentIndex + 1).map(p => p.id);
 
         // Grouped by cost code: each sheet row names its own, and rows are
@@ -1036,7 +1037,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     
     const allPeriods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
     const periods = allPeriods.slice(currentIndex + 1);
 
     let totalQty = 0;
@@ -1075,7 +1076,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
   const etcColumnDefs = useMemo<(ColDef | ColGroupDef)[]>(() => {
     const allPeriods = project.reportingPeriods?.periods || [];
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-    const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
+    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
     const periods = allPeriods.slice(currentIndex + 1);
 
     const defs: (ColDef | ColGroupDef)[] = [

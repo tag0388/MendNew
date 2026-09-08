@@ -232,3 +232,28 @@ export async function deletePeriod(periodId: string): Promise<void> {
   const { error } = await supabase.from('reporting_periods').delete().eq('id', periodId);
   raise('delete period', error);
 }
+
+/**
+ * Index of the current reporting period, or 0 when none is marked.
+ *
+ * Every "which periods are in the future?" calculation is `slice(index + 1)`.
+ * Array.findIndex returns -1 when it finds nothing, and slice(-1 + 1) is
+ * slice(0) -- the WHOLE list, first period included. So a project with no
+ * current period silently treated every period as future, and auto-phasing
+ * put forecast into the period that is actually being reported as actual
+ * cost. That is what happened to a project generated Sep'26..Aug'27: phasing
+ * over dates in Sep'26 landed in Sep'26.
+ *
+ * The database now guarantees a current period exists, so this should not
+ * arise. It falls back to 0 rather than -1 anyway, because the two failures
+ * are not equally bad: treating the first period as current at worst forecasts
+ * one period later than intended, while -1 puts forecast money into a period
+ * that is already being reported.
+ */
+export function resolveCurrentPeriodIndex(
+  periods: Array<{ id: string }>,
+  currentPeriodId: string | undefined | null
+): number {
+  const i = periods.findIndex((p) => p.id === currentPeriodId);
+  return i === -1 ? 0 : i;
+}
