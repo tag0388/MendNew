@@ -44,7 +44,7 @@ export default function Header({ user, enterprise }: HeaderProps) {
         <Button 
           variant="ghost"
           size="sm"
-          onClick={() => window.location.href = '/'}
+          onClick={() => navigate('/')}
           className="flex items-center gap-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors px-2"
         >
           {enterprise?.logoURL && (
@@ -59,7 +59,7 @@ export default function Header({ user, enterprise }: HeaderProps) {
             <Button 
               variant="ghost"
               size="sm"
-              onClick={() => window.location.href = `/project/${projectId}`}
+              onClick={() => navigate(`/project/${projectId}`)}
               className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors px-2"
             >
               {project.projectName}

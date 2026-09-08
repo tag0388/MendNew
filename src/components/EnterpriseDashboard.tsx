@@ -49,7 +49,11 @@ export default function EnterpriseDashboard({ enterprise, userId, isSystemOwner,
   const gridRef = useRef<AgGridReact>(null);
 
   const onSelectProject = (project: Project) => {
-    window.location.href = `/project/${project.id}`;
+    // navigate(), not window.location.href. A hard reload throws away the
+    // signed-in session, the loaded enterprise and every cached grid, then
+    // rebuilds all of it -- and the reloaded app has to re-decide where the
+    // user belongs before the enterprise has finished loading.
+    navigate(`/project/${project.id}`);
   };
 
   const toggleAllCostCodeColumnGroups = (opened: boolean) => {

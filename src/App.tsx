@@ -46,6 +46,16 @@ export default function App() {
     }
   });
 
+  // Which (user, enterprise) pair the loader below has finished with.
+  // Comparing it against the pair we currently want answers "have we finished
+  // trying to resolve an enterprise?" without the render gap a plain isLoading
+  // boolean has -- a boolean can only be flipped on by an effect, which runs
+  // after the render that would already have redirected. A null key means
+  // there is nothing to wait for: signed out, or signed in with no enterprise.
+  const [resolvedFor, setResolvedFor] = useState<string | null>(null);
+  const enterpriseKey = user && activeEnterpriseId ? `${user.id}:${activeEnterpriseId}` : null;
+  const enterpriseSettled = enterpriseKey === null || resolvedFor === enterpriseKey;
+
   // Platform admin is a row in platform_admins, not a hardcoded email list.
   const isSystemOwner = session?.isPlatformAdmin ?? false;
 
@@ -175,6 +185,11 @@ export default function App() {
       } catch (error) {
         console.error('Enterprise fetch error:', error);
         if (active) setCurrentEnterprise(null);
+      } finally {
+        // Marked resolved on failure too. Otherwise a fetch that errors would
+        // leave the app on a spinner forever instead of falling through to
+        // the redirect below.
+        if (active) setResolvedFor(`${user.id}:${activeEnterpriseId}`);
       }
     };
 
@@ -252,6 +267,7 @@ export default function App() {
         setCurrentEnterprise={setCurrentEnterprise}
         isSystemOwner={isSystemOwner}
         activeEnterpriseId={activeEnterpriseId}
+        enterpriseSettled={enterpriseSettled}
         setActiveEnterpriseId={setActiveEnterpriseId}
         session={session}
         setSession={setSession}
@@ -286,6 +302,7 @@ interface AuthenticatedAppProps {
   setCurrentEnterprise: (e: Enterprise | null) => void;
   isSystemOwner: boolean;
   activeEnterpriseId: string | null;
+  enterpriseSettled: boolean;
   setActiveEnterpriseId: (id: string | null) => void;
   session: SessionContext | null;
   setSession: (s: SessionContext | null) => void;
@@ -312,7 +329,7 @@ interface AuthenticatedAppProps {
 
 function AuthenticatedApp({
   user, loading, currentEnterprise, setCurrentEnterprise, isSystemOwner,
-  activeEnterpriseId, setActiveEnterpriseId, session, setSession, theme, setTheme,
+  activeEnterpriseId, enterpriseSettled, setActiveEnterpriseId, session, setSession, theme, setTheme,
   isSidebarCollapsed, setIsSidebarCollapsed, authError, setAuthError,
   email, setEmail, password, setPassword, isRegistering, setIsRegistering,
   showLanding, setShowLanding, 
@@ -322,7 +339,9 @@ function AuthenticatedApp({
   const navigate = useNavigate();
   const location = useLocation();
 
-  if (loading) {
+  // Also hold the spinner while the enterprise is still being fetched, so the
+  // app does not flash a shell with no enterprise in it on every deep link.
+  if (loading || !enterpriseSettled) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-[#F5F5F4]">
         <div className="animate-pulse flex flex-col items-center">
@@ -563,7 +582,12 @@ function AuthenticatedApp({
 
   // The system owner with no enterprise selected yet goes straight to the
   // screen where enterprises are created.
-  if (!currentEnterprise && !loading && isSystemOwner && location.pathname !== '/system-admin') {
+  // enterpriseSettled matters: the session finishes loading before the
+  // enterprise fetch it triggers has even started, so without it a platform
+  // admin opening any deep link -- a project, a bookmark, a hard refresh --
+  // was bounced here on the first render, before the enterprise they are a
+  // member of had a chance to arrive.
+  if (!currentEnterprise && !loading && enterpriseSettled && isSystemOwner && location.pathname !== '/system-admin') {
     return <Navigate to="/system-admin" replace />;
   }
 
@@ -627,26 +651,64 @@ function ProjectView({ enterprise, user, theme, setIsSidebarCollapsed }: { enter
   const { projectId, moduleId, subModuleId } = useParams();
   const navigate = useNavigate();
   const [project, setProject] = useState<Project | null>(null);
+  const [status, setStatus] = useState<'loading' | 'ready' | 'missing'>('loading');
 
   useEffect(() => {
     if (!projectId) return;
     let active = true;
-    void fetchProject(projectId).then((p) => {
-      if (active) setProject(p);
-    });
+
+    const load = async () => {
+      try {
+        const p = await fetchProject(projectId);
+        if (!active) return;
+        setProject(p);
+        // A project the caller may not see comes back as null rather than as
+        // an error -- RLS filters the row out, it does not refuse the query.
+        setStatus(p ? 'ready' : 'missing');
+      } catch (error) {
+        console.error('Project fetch error:', error);
+        if (active) setStatus('missing');
+      }
+    };
+
+    void load();
     // Re-fetch when this project row changes, so RLS still decides visibility.
-    const unsubscribe = subscribeToTable('projects', `id=eq.${projectId}`, () => {
-      void fetchProject(projectId).then((p) => {
-        if (active) setProject(p);
-      });
-    });
+    const unsubscribe = subscribeToTable('projects', `id=eq.${projectId}`, () => void load());
     return () => {
       active = false;
       unsubscribe();
     };
   }, [projectId]);
 
-  if (!project || !enterprise) return null;
+  // Never render nothing. A blank screen is indistinguishable from a crash,
+  // which is exactly how this looked while a redirect was quietly eating the
+  // route.
+  if (status === 'loading' || !enterprise) {
+    return (
+      <div className="flex-1 flex items-center justify-center">
+        <p className="text-xs font-mono uppercase tracking-widest opacity-50">Loading project...</p>
+      </div>
+    );
+  }
+
+  if (status === 'missing' || !project) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="max-w-sm text-center">
+          <h2 className="text-lg font-semibold mb-2">Project not available</h2>
+          <p className="text-sm text-gray-500 mb-6">
+            It may have been deleted, or you may not have been assigned to it.
+          </p>
+          <button
+            onClick={() => navigate('/')}
+            className="px-4 py-2 border border-gray-200 hover:bg-gray-50 rounded-lg text-sm font-medium"
+          >
+            Back to projects
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (moduleId === 'project-admin') {
     return <ProjectAdmin project={project} enterprise={enterprise} />;

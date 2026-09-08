@@ -47,7 +47,7 @@ const CostManagement: React.FC<CostManagementProps> = ({
   };
 
   const handleTabClick = (id: string) => {
-    window.location.href = `/project/${projectId}/cost/${id}`;
+    navigate(`/project/${projectId}/cost/${id}`);
   };
 
   const sections = [
