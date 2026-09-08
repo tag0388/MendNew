@@ -5,7 +5,7 @@ import type { User } from '@supabase/supabase-js';
 import { setCurrentUser, toCurrentUser, signOut } from './lib/currentUser';
 import {
   loadSessionContext, fetchEnterprise, fetchProjects, acceptInvitation,
-  type SessionContext,
+  createEnterprise, type SessionContext,
 } from './lib/session';
 import { fetchProject } from './lib/projects';
 import { Enterprise, Project } from './types';
@@ -547,20 +547,24 @@ function AuthenticatedApp({
                 const name = prompt('Enter your Enterprise Name:');
                 if (!name) return;
                 try {
-                  // enterprises_grant_creator_admin() makes the creator an
-                  // Enterprise System Admin, so the client never asserts its
-                  // own role.
-                  const { data, error } = await supabase
-                    .from('enterprises')
-                    .insert({ name, enterprise_code: name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, '-').slice(0, 40) })
-                    .select('id')
-                    .single();
-                  if (error) throw error;
+                  // create_enterprise() writes the enterprise and the
+                  // creator's admin membership together. A plain insert could
+                  // not read its own row back: the SELECT policy requires a
+                  // membership that an AFTER INSERT trigger had not yet
+                  // written.
+                  const enterpriseId = await createEnterprise(name);
                   const u = (await supabase.auth.getUser()).data.user;
                   if (u) setSession(await loadSessionContext(u.id, u.email ?? ''));
-                  setActiveEnterpriseId(data.id);
+                  setActiveEnterpriseId(enterpriseId);
                 } catch (e) {
-                  alert(e instanceof Error ? e.message : 'Failed to create enterprise. Please try again.');
+                  // Supabase returns errors as plain objects, not Error
+                  // instances, so an `instanceof Error` check swallowed the
+                  // real reason and showed only "please try again".
+                  const message =
+                    e instanceof Error ? e.message
+                    : typeof e === 'object' && e !== null && 'message' in e ? String((e as any).message)
+                    : 'Failed to create enterprise. Please try again.';
+                  alert(message);
                 }
               }}
               className="w-full py-3 bg-black text-white rounded-lg font-medium hover:bg-black/90 transition-colors flex items-center justify-center gap-2"

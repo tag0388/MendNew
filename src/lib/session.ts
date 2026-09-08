@@ -299,3 +299,20 @@ export async function updateOwnProfile(
   const { error } = await supabase.from('user_profiles').update(row).eq('id', userId);
   raise('update profile', error);
 }
+
+/**
+ * Founds a new enterprise and makes the caller its admin.
+ *
+ * Not a plain insert. With RLS, INSERT ... RETURNING also applies the SELECT
+ * policy to the row it returns, and that policy is "you may read an
+ * enterprise you are a member of". The creator's membership is written by an
+ * AFTER INSERT trigger, which has not fired when RETURNING is evaluated -- so
+ * the creator was not yet a member of the enterprise they had just created
+ * and the statement was rejected. Doing both steps in one function removes
+ * the dependence on trigger ordering.
+ */
+export async function createEnterprise(name: string): Promise<string> {
+  const { data, error } = await supabase.rpc('create_enterprise', { p_name: name });
+  raise('create enterprise', error);
+  return data as string;
+}
