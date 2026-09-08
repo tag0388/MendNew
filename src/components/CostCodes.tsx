@@ -14,6 +14,7 @@ import {
   insertEtcDetailsAt,
   upsertEtcDetail,
   upsertEtcDetails,
+  applyEtcPhasing,
   deleteEtcDetails,
   bulkUpdateEtcDetails,
   fetchActualCosts,
@@ -1326,8 +1327,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     // Collected and written in one upsert, rather than accumulated into a
     // Firestore batch. Only the columns being recalculated are sent; the rest
     // of each row is left alone.
-    const phasedRows: Array<{ id: string; costCodeId: string; periodValues: Record<string, number>; qty: number }> = [];
+    const phasedRows: Array<{ id: string; periodValues: Record<string, number>; qty: number }> = [];
     let updatedCount = 0;
+
+    // Rows drop out of this loop for four different reasons and every one of
+    // them used to be a silent `continue`, so a Calculate that phased nothing
+    // looked identical to one that had nothing to do. Collected and reported.
+    const skipped: Record<string, number> = {};
+    const skip = (reason: string) => { skipped[reason] = (skipped[reason] || 0) + 1; };
 
     const parseDateToUTCMidnight = (val: any): Date | null => {
       if (!val) return null;
@@ -1341,7 +1348,8 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
     for (const row of rowsToPhase) {
         const phasingQty = Number(row.phasingQty) || 0;
-        if (!phasingQty || !row.phasingUnit) continue;
+        if (!phasingQty) { skip('no Phasing Qty'); continue; }
+        if (!row.phasingUnit) { skip('no Phasing Unit'); continue; }
 
         const userStartRaw = parseDateToUTCMidnight(row.phasingStartDate);
         const userEndRaw = parseDateToUTCMidnight(row.phasingEndDate);
@@ -1395,7 +1403,6 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
           phasedRows.push({
             id: row.id,
-            costCodeId: selectedEtcCodeId!,
             periodValues: newPeriodValues,
             qty: Object.keys(newPeriodValues)
               .filter(key => distributionPeriods.some(dp => dp.id === key))
@@ -1405,7 +1412,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           continue;
         }
 
-        if (!userStartRaw || !userEndRaw) continue;
+        if (!userStartRaw || !userEndRaw) { skip('no Start/End Date'); continue; }
 
         let userStart = new Date(userStartRaw.getTime());
         let userEnd = new Date(userEndRaw.getTime());
@@ -1419,7 +1426,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           }
         }
 
-        if (userEnd < userStart) continue;
+        if (userEnd < userStart) { skip('the whole date range is in the past'); continue; }
 
         const calendar = calendars.find(c => c.id === row.calendarId);
         const isWorkingDay = (date: Date) => {
@@ -1455,7 +1462,8 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           tempStep.setUTCDate(tempStep.getUTCDate() + 1);
         }
 
-        if (totalWorkingDaysInRange === 0 || distributionPeriodIds.length === 0) continue;
+        if (totalWorkingDaysInRange === 0) { skip('no working days in the date range (check the calendar)'); continue; }
+        if (distributionPeriodIds.length === 0) { skip('the date range does not overlap any future reporting period'); continue; }
 
         if (row.phasingUnit === 'Total') {
           const dailyQty = phasingQty / totalWorkingDaysInRange;
@@ -1561,7 +1569,6 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
         phasedRows.push({
           id: row.id,
-          costCodeId: selectedEtcCodeId!,
           periodValues: newPeriodValues,
           qty: Object.keys(newPeriodValues)
             .filter(key => distributionPeriods.some(dp => dp.id === key))
@@ -1572,15 +1579,30 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
     if (updatedCount > 0) {
       try {
-        await upsertEtcDetails(project.id, phasedRows);
+        const written = await applyEtcPhasing(phasedRows);
         await reloadEtcRows();
-        toast.success(`Calculated phasing for ${updatedCount} rows`);
+        const skippedTotal = Object.values(skipped).reduce((a, b) => a + b, 0);
+        toast.success(
+          skippedTotal > 0
+            ? `Phased ${written} row${written === 1 ? '' : 's'}. Skipped ${skippedTotal}: ` +
+              Object.entries(skipped).map(([r, n]) => `${n} with ${r}`).join(', ') + '.'
+            : `Calculated phasing for ${written} row${written === 1 ? '' : 's'}`
+        );
       } catch (error: any) {
         console.error('Error calculating phasing:', error);
         toast.error(`Failed to calculate phasing: ${error?.message || 'Unknown error'}`);
       }
     } else {
-      toast.warning("No valid rows to calculate. Check highlighted rows.");
+      // Say which setting was missing, rather than "check highlighted rows"
+      // and leaving the user to work out which and why.
+      const reasons = Object.entries(skipped)
+        .map(([reason, n]) => `${n} with ${reason}`)
+        .join(', ');
+      toast.warning(
+        reasons
+          ? `Nothing to phase: ${reasons}.`
+          : 'Nothing to phase. Set Method to Auto-Phase on the rows you want to calculate.'
+      );
     }
   };
 

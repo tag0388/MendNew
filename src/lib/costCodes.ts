@@ -587,3 +587,21 @@ export async function fetchProjectEtcDetails(projectId: string): Promise<EtcDeta
       : (a.sortOrder ?? 0) - (b.sortOrder ?? 0)
   );
 }
+
+/**
+ * Write calculated phasing back onto ETC rows that already exist.
+ *
+ * Deliberately NOT upsertEtcDetails(). An upsert is INSERT ... ON CONFLICT,
+ * and Postgres checks NOT NULL on the proposed insert row before it looks for
+ * a conflict -- so sending only the two recalculated columns failed with
+ * `null value in column "item"` even though the row was only being updated.
+ * This updates period_values and qty and leaves every other column alone.
+ */
+export async function applyEtcPhasing(
+  rows: Array<{ id: string; periodValues: Record<string, number>; qty: number }>
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const { data, error } = await supabase.rpc('apply_etc_phasing', { p_rows: rows });
+  raise('apply phasing', error);
+  return (data as number) ?? 0;
+}

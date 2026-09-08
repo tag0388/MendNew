@@ -10,6 +10,7 @@ import {
   insertEtcDetailsAt,
   upsertEtcDetail,
   upsertEtcDetails,
+  applyEtcPhasing,
   deleteEtcDetails,
   bulkUpdateEtcDetails,
 } from '../lib/costCodes';
@@ -527,7 +528,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     // Collected and written in one upsert. Each row already knows its cost
     // code, so the upsert carries costCodeId straight from the row rather
     // than from a pane-level selection -- this grid spans every cost code.
-    const phasedRows: Array<{ id: string; costCodeId: string; periodValues: Record<string, number>; qty: number }> = [];
+    const phasedRows: Array<{ id: string; periodValues: Record<string, number>; qty: number }> = [];
     let updatedCount = 0;
 
     const parseDateToUTCMidnight = (val: any): Date | null => {
@@ -611,7 +612,6 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           
           phasedRows.push({
             id: row.id,
-            costCodeId: resolveCostCodeId(row.costCode),
             periodValues: newPeriodValues,
             qty: Object.keys(newPeriodValues)
               .filter(key => distributionPeriods.some(dp => dp.id === key))
@@ -802,7 +802,6 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
         
         phasedRows.push({
           id: row.id,
-          costCodeId: resolveCostCodeId(row.costCode),
           periodValues: newPeriodValues,
           qty: Math.round(newFutureQtyTotal * 10000) / 10000,
         });
@@ -810,7 +809,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
       }
 
       if (updatedCount > 0) {
-        await upsertEtcDetails(project.id, phasedRows);
+        await applyEtcPhasing(phasedRows);
         await reloadEtcRows();
         toast.success(`Phasing calculated for ${updatedCount} rows`);
       } else {
