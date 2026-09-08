@@ -292,9 +292,13 @@ export default function Sidebar({
         
         {!isCollapsed && (
           <div className="px-3 pt-2">
+            {/* The commit this bundle was built from. A hardcoded version
+                number cannot tell you whether the browser is running the
+                latest deploy or a cached one, which is exactly the question
+                that matters when a change appears not to have worked. */}
             <div className="flex items-center justify-between text-[10px] font-mono text-gray-900 dark:text-white/20 uppercase tracking-widest">
-              <span>Version</span>
-              <span>1.0.0</span>
+              <span>Build</span>
+              <span title={`Built ${__BUILD_TIME__} UTC`}>{__BUILD_REF__}</span>
             </div>
           </div>
         )}

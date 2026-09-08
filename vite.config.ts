@@ -9,6 +9,14 @@ export default defineConfig(({mode}) => {
     plugins: [react(), tailwindcss()],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+      // Stamped into the bundle at build time so the running app can say
+      // which commit it came from. Without it, "did my change reach the
+      // browser?" can only be answered by guessing -- and a stale cached
+      // bundle looks exactly like a broken feature.
+      __BUILD_REF__: JSON.stringify(
+        (env.VERCEL_GIT_COMMIT_SHA || 'local').slice(0, 7)
+      ),
+      __BUILD_TIME__: JSON.stringify(new Date().toISOString().slice(0, 16).replace('T', ' ')),
     },
     resolve: {
       alias: {
