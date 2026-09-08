@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, Calendar as ProjectCalendar, EtcDetail, ResourceRate, ScheduleItem } from '../types';
 import { subscribeToTable } from '../lib/supabase';
+import { resolvePhasingWindow } from '../lib/phasing';
 import {
   fetchCostCodes,
   fetchCalendars,
@@ -644,24 +645,18 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           continue;
         }
 
-        if (!userStartRaw || !userEndRaw) { skip('no Start/End Date'); continue; }
-
-        let userStart = new Date(userStartRaw.getTime());
-        let userEnd = new Date(userEndRaw.getTime());
-
-        if (distributionPeriods.length > 0) {
-          const futureStartRaw = parseDateToUTCMidnight(distributionPeriods[0].startDate);
-          if (futureStartRaw) {
-            if (userStart < futureStartRaw) {
-              userStart = new Date(futureStartRaw.getTime());
-            }
-            if (userEnd < futureStartRaw) {
-              userEnd = new Date(futureStartRaw.getTime());
-            }
-          }
-        }
-
-        if (userEnd < userStart) { skip('the whole date range is in the past'); continue; }
+        // Same shared rule as the per-cost-code pane, tested in
+        // src/lib/phasing.test.mjs.
+        const phasingWindow = resolvePhasingWindow(
+          userStartRaw,
+          userEndRaw,
+          distributionPeriods.length > 0
+            ? parseDateToUTCMidnight(distributionPeriods[0].startDate)
+            : null
+        );
+        if (phasingWindow.reason) { skip(phasingWindow.reason); continue; }
+        const userStart = phasingWindow.start!;
+        const userEnd = phasingWindow.end!;
 
         const calendar = calendars.find(c => c.id === row.calendarId);
         // No calendar on the row means no weekends and no holidays are known,

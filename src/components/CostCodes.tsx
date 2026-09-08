@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, Change, ChangeRecord, Subcontract, ScheduleItem } from '../types';
 import { subscribeToTable } from '../lib/supabase';
+import { resolvePhasingWindow } from '../lib/phasing';
 import {
   fetchCostCodes,
   updateCostCode,
@@ -1430,21 +1431,19 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           continue;
         }
 
-        if (!userStartRaw || !userEndRaw) { skip('no Start/End Date'); continue; }
-
-        let userStart = new Date(userStartRaw.getTime());
-        let userEnd = new Date(userEndRaw.getTime());
-
-        // Constrain distribution to future periods
-        if (distributionPeriods.length > 0) {
-          const futureStartRaw = parseDateToUTCMidnight(distributionPeriods[0].startDate);
-          if (futureStartRaw) {
-            if (userStart < futureStartRaw) userStart = new Date(futureStartRaw.getTime());
-            if (userEnd < futureStartRaw) userEnd = new Date(futureStartRaw.getTime());
-          }
-        }
-
-        if (userEnd < userStart) { skip('the whole date range is in the past'); continue; }
+        // One shared rule for "which part of this range may carry forecast?",
+        // tested in src/lib/phasing.test.mjs. It used to be written out here
+        // and again in the bulk screen, and the copies drifted.
+        const phasingWindow = resolvePhasingWindow(
+          userStartRaw,
+          userEndRaw,
+          distributionPeriods.length > 0
+            ? parseDateToUTCMidnight(distributionPeriods[0].startDate)
+            : null
+        );
+        if (phasingWindow.reason) { skip(phasingWindow.reason); continue; }
+        const userStart = phasingWindow.start!;
+        const userEnd = phasingWindow.end!;
 
         const calendar = calendars.find(c => c.id === row.calendarId);
         // No calendar on the row means no weekends and no holidays are known,
