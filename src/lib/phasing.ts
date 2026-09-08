@@ -58,3 +58,50 @@ export function resolvePhasingWindow(
 
   return { start, end };
 }
+
+/**
+ * Parse a date the way the grids display it, for clipboard paste.
+ *
+ * The grids show dates as dd/mm/yyyy. JavaScript's Date does not read that
+ * format: `new Date('17/09/2026')` is Invalid Date, and -- far worse --
+ * `new Date('01/08/2026')` silently returns 8 JANUARY, because it falls back
+ * to the American m/d/y reading whenever the day is 12 or less. So a pasted
+ * date either vanished or quietly became a different date.
+ *
+ * Returns null when the text is not a date in a format we recognise, so the
+ * caller can leave the cell alone rather than write a wrong value.
+ */
+export function parsePastedDate(value: unknown): Date | null {
+  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
+  if (typeof value !== 'string') return null;
+
+  const text = value.trim();
+  if (!text) return null;
+
+  // dd/mm/yyyy or dd-mm-yyyy, which is what the grids render.
+  const dmy = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+  if (dmy) {
+    const day = parseInt(dmy[1], 10);
+    const month = parseInt(dmy[2], 10);
+    let year = parseInt(dmy[3], 10);
+    if (year < 100) year += 2000;
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    const d = new Date(year, month - 1, day);
+    // Rejects impossible dates such as 31/02: the Date constructor rolls
+    // those over into the next month rather than failing.
+    if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) return null;
+    return d;
+  }
+
+  // ISO (yyyy-mm-dd) and anything else Date reads unambiguously.
+  const iso = new Date(text);
+  return isNaN(iso.getTime()) ? null : iso;
+}
+
+/** Format a Date as YYYY-MM-DD in local time, which is how rows store dates. */
+export function toStoredDate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}

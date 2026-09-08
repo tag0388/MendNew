@@ -44,5 +44,52 @@ const missingOk = missing.reason === 'no Start/End Date';
 if (!missingOk) ok = false;
 console.log(`${missingOk ? 'PASS' : 'FAIL'}  a missing date is rejected, not defaulted`);
 
-console.log(ok ? '\nALL PASS' : '\nFAILURES');
-process.exit(ok ? 0 : 1);
+console.log(ok ? '\nWINDOW: ALL PASS' : '\nWINDOW: FAILURES');
+if (!ok) process.exitCode = 1;
+
+// ---------------------------------------------------------------- paste ----
+function parsePastedDate(value) {
+  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  const dmy = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+  if (dmy) {
+    const day = parseInt(dmy[1], 10);
+    const month = parseInt(dmy[2], 10);
+    let year = parseInt(dmy[3], 10);
+    if (year < 100) year += 2000;
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    const d = new Date(year, month - 1, day);
+    if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) return null;
+    return d;
+  }
+  const iso = new Date(text);
+  return isNaN(iso.getTime()) ? null : iso;
+}
+
+const fmt = (d) => d === null ? 'null'
+  : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+
+const pasteCases = [
+  ['17/09/2026 is 17 September, not Invalid', '17/09/2026', '2026-09-17'],
+  ['01/08/2026 is 1 August, NOT 8 January',   '01/08/2026', '2026-08-01'],
+  ['dashes work too',                          '17-09-2026', '2026-09-17'],
+  ['two-digit years',                          '17/09/26',   '2026-09-17'],
+  ['ISO passes straight through',              '2026-09-17', '2026-09-17'],
+  ['31/02 is impossible, not 3 March',         '31/02/2026', 'null'],
+  ['month 13 is rejected',                     '01/13/2026', 'null'],
+  ['blank leaves the cell alone',              '',           'null'],
+  ['nonsense leaves the cell alone',           'not a date', 'null'],
+];
+
+let pasteOk = true;
+console.log('');
+for (const [name, input, want] of pasteCases) {
+  const got = fmt(parsePastedDate(input));
+  const pass = got === want;
+  if (!pass) pasteOk = false;
+  console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}: ${got}${pass ? '' : ` (want ${want})`}`);
+}
+console.log(pasteOk ? '\nPASTE: ALL PASS' : '\nPASTE: FAILURES');
+if (!pasteOk) process.exitCode = 1;

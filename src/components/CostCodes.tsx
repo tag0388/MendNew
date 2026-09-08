@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, Change, ChangeRecord, Subcontract, ScheduleItem } from '../types';
 import { subscribeToTable } from '../lib/supabase';
-import { resolvePhasingWindow } from '../lib/phasing';
+import { resolvePhasingWindow, parsePastedDate, toStoredDate } from '../lib/phasing';
 import {
   fetchCostCodes,
   updateCostCode,
@@ -394,6 +394,9 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     calendarId?: string;
     phasingMethod?: 'Manual' | 'Auto-Phase';
     phasingUnit?: 'Daily' | 'Weekly' | 'Monthly' | 'Total' | 'Profile';
+    phasingStartDate?: string;
+    phasingEndDate?: string;
+    phasingQty?: number;
     enterpriseAttributes: Record<string, string>;
     projectAttributes: Record<string, string>;
     userDefined: Record<string, any>;
@@ -759,9 +762,25 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   // Where "Add rows" puts them: below the last selected row, or at the end
   // when nothing is selected. undefined means append.
   const etcInsertIndex = useCallback((): number | undefined => {
-    const selected = etcGridRef.current?.api.getSelectedRows() || [];
-    if (selected.length === 0) return undefined;
-    return selected[selected.length - 1].sortOrder + 1;
+    const api = etcGridRef.current?.api;
+    if (!api) return undefined;
+
+    // A ticked row wins: that is the most explicit "here".
+    const selected = api.getSelectedRows() || [];
+    if (selected.length > 0) return selected[selected.length - 1].sortOrder + 1;
+
+    // Otherwise the focused cell. Clicking a cell focuses it WITHOUT selecting
+    // the row, and getSelectedRows() does not see that -- so pointing at a
+    // cell and pressing Add used to append at the bottom of the table, which
+    // is exactly what people do not want when adding a line into a section.
+    const focused = api.getFocusedCell();
+    if (focused) {
+      const node = api.getDisplayedRowAtIndex(focused.rowIndex);
+      const order = node?.data?.sortOrder;
+      if (typeof order === 'number') return order + 1;
+    }
+
+    return undefined;
   }, []);
 
   useEffect(() => {
@@ -1686,6 +1705,9 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         calendarId: etcBulkUpdateData.calendarId,
         phasingMethod: etcBulkUpdateData.phasingMethod,
         phasingUnit: etcBulkUpdateData.phasingUnit,
+        phasingStartDate: etcBulkUpdateData.phasingStartDate,
+        phasingEndDate: etcBulkUpdateData.phasingEndDate,
+        phasingQty: etcBulkUpdateData.phasingQty,
         enterpriseAttributes: etcBulkUpdateData.enterpriseAttributes,
         projectAttributes: etcBulkUpdateData.projectAttributes,
         userDefined: etcBulkUpdateData.userDefined,
@@ -2279,7 +2301,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           headerName: 'Start Date',
           width: 120,
           columnGroupShow: 'open',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase' && !params.data.activityId,
+          // Editable whenever the row is not tied to a schedule activity.
+          // This used to also require Method = Auto-Phase, and AG Grid skips
+          // non-editable cells on paste WITHOUT saying anything -- so pasting
+          // dates into a row whose Method was still Manual silently did
+          // nothing. The dates are simply unused while Method is Manual, so
+          // letting them be filled in first is harmless; the greyed styling
+          // below still signals when they do not apply.
+          editable: (params) => !params.data.activityId,
           cellEditor: 'agDateCellEditor',
           valueGetter: (params) => {
             const val = params.data.phasingStartDate;
@@ -2300,7 +2329,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           headerName: 'End Date',
           width: 120,
           columnGroupShow: 'open',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase' && !params.data.activityId,
+          // Editable whenever the row is not tied to a schedule activity.
+          // This used to also require Method = Auto-Phase, and AG Grid skips
+          // non-editable cells on paste WITHOUT saying anything -- so pasting
+          // dates into a row whose Method was still Manual silently did
+          // nothing. The dates are simply unused while Method is Manual, so
+          // letting them be filled in first is harmless; the greyed styling
+          // below still signals when they do not apply.
+          editable: (params) => !params.data.activityId,
           cellEditor: 'agDateCellEditor',
           valueGetter: (params) => {
             const val = params.data.phasingEndDate;
@@ -3030,11 +3066,43 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     // No longer re-applying state here to avoid flicker during data updates
   }, []);
 
+  // Pasting Start and End together fired this once per cell, so two saves
+  // raced for the same row -- each sending the whole row as it looked at that
+  // moment. During a paste the changes are collected instead and written once
+  // per row when the paste finishes.
+  const isPastingEtc = useRef(false);
+  const pastedEtcRows = useRef<Map<string, any>>(new Map());
+
   const onEtcCellValueChanged = useCallback((params: CellValueChangedEvent) => {
+    if (isPastingEtc.current) {
+      pastedEtcRows.current.set(params.data.id, params.data);
+      return;
+    }
     handleUpdateEtcRow(params.data.id, params.data);
     // Force refresh of the row to update calculated columns like Total ETC and Qty
     params.api.refreshCells({ rowNodes: [params.node], force: true });
   }, [handleUpdateEtcRow]);
+
+  const onEtcPasteStart = useCallback(() => {
+    isPastingEtc.current = true;
+    pastedEtcRows.current.clear();
+  }, []);
+
+  const onEtcPasteEnd = useCallback(async () => {
+    isPastingEtc.current = false;
+    const rows = Array.from(pastedEtcRows.current.values());
+    pastedEtcRows.current.clear();
+    if (rows.length === 0) return;
+    try {
+      for (const data of rows) {
+        await handleUpdateEtcRow(data.id, data);
+      }
+      await reloadEtcRows();
+    } catch (error: any) {
+      console.error('Error saving pasted rows:', error);
+      toast.error(`Failed to save pasted rows: ${error?.message || 'Unknown error'}`);
+    }
+  }, [handleUpdateEtcRow, reloadEtcRows]);
 
   const getEtcRowId = useCallback((params: any) => params.data.id, []);
 
@@ -4526,6 +4594,8 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   sideBar={sideBar}
                   statusBar={statusBar}
                   onCellValueChanged={onEtcCellValueChanged}
+                  onPasteStart={onEtcPasteStart}
+                  onPasteEnd={onEtcPasteEnd}
                   onRowDataUpdated={onEtcRowDataUpdated}
                   suppressColumnVirtualisation={true}
                   onColumnGroupOpened={(params) => {
@@ -4554,19 +4624,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   processCellFromClipboard={(params) => {
                     const colId = params.column.getColId();
                     if (colId === 'phasingStartDate' || colId === 'phasingEndDate') {
-                      const val = params.value;
-                      if (typeof val === 'string') {
-                        const trimmed = val.trim();
-                        const dmyMatch = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
-                        if (dmyMatch) {
-                          let day = parseInt(dmyMatch[1]);
-                          let month = parseInt(dmyMatch[2]);
-                          let year = parseInt(dmyMatch[3]);
-                          if (year < 100) year += 2000;
-                          const date = new Date(year, month - 1, day);
-                          if (!isNaN(date.getTime())) return date.toISOString();
-                        }
-                      }
+                      // Shared with the bulk screen, and tested: the grids
+                      // render dd/mm/yyyy, which JavaScript's Date either
+                      // refuses or misreads as m/d/y.
+                      const parsed = parsePastedDate(params.value);
+                      if (parsed) return toStoredDate(parsed);
+                      return params.value;
                     }
                     if (colId.startsWith('enterpriseAttributes.') || colId.startsWith('projectAttributes.')) {
                       const val = params.value;
@@ -5410,6 +5473,42 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   </select>
                 </div>
               </div>
+
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-[10px] font-bold uppercase tracking-widest text-gray-400 mb-2">Start Date</label>
+                  <input
+                    type="date"
+                    value={etcBulkUpdateData.phasingStartDate || ''}
+                    onChange={e => setEtcBulkUpdateData({ ...etcBulkUpdateData, phasingStartDate: e.target.value || undefined })}
+                    className="w-full p-4 bg-gray-50 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-black/5 dark:text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold uppercase tracking-widest text-gray-400 mb-2">End Date</label>
+                  <input
+                    type="date"
+                    value={etcBulkUpdateData.phasingEndDate || ''}
+                    onChange={e => setEtcBulkUpdateData({ ...etcBulkUpdateData, phasingEndDate: e.target.value || undefined })}
+                    className="w-full p-4 bg-gray-50 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-black/5 dark:text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold uppercase tracking-widest text-gray-400 mb-2">Phasing Qty</label>
+                  <input
+                    type="number"
+                    placeholder="No Change"
+                    value={etcBulkUpdateData.phasingQty ?? ''}
+                    onChange={e => setEtcBulkUpdateData({
+                      ...etcBulkUpdateData,
+                      phasingQty: e.target.value === '' ? undefined : Number(e.target.value),
+                    })}
+                    className="w-full p-4 bg-gray-50 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-black/5 dark:text-white"
+                  />
+                </div>
+              </div>
+              {/* Dates are left blank to mean "no change". A row driven by a
+                  schedule activity keeps that activity's dates regardless. */}
 
               {enterpriseLineItemAttrs.length > 0 && (
                 <div>

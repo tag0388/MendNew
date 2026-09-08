@@ -531,6 +531,10 @@ export async function bulkUpdateEtcDetails(
     enterpriseAttributes?: Record<string, string>;
     projectAttributes?: Record<string, string>;
     userDefined?: Record<string, string | number>;
+    /** The auto-phasing inputs. Left out means "leave these alone". */
+    phasingStartDate?: string;
+    phasingEndDate?: string;
+    phasingQty?: number;
   }
 ): Promise<number> {
   if (ids.length === 0) return 0;
@@ -546,6 +550,12 @@ export async function bulkUpdateEtcDetails(
     p_project_attributes: nonEmpty(patch.projectAttributes),
     p_user_defined: nonEmpty(patch.userDefined),
     p_skip_library_resources: true,
+    p_phasing_start_date: patch.phasingStartDate || null,
+    p_phasing_end_date: patch.phasingEndDate || null,
+    // 0 is a real quantity, so only an omitted field means "unchanged".
+    p_phasing_qty: patch.phasingQty === undefined || Number.isNaN(patch.phasingQty)
+      ? null
+      : patch.phasingQty,
   });
   raise('bulk update ETC rows', error);
   return (data as number) ?? 0;
