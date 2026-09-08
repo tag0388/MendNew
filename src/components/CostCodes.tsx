@@ -1335,6 +1335,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     // looked identical to one that had nothing to do. Collected and reported.
     const skipped: Record<string, number> = {};
     const skip = (reason: string) => { skipped[reason] = (skipped[reason] || 0) + 1; };
+    let noCalendarCount = 0;
 
     const parseDateToUTCMidnight = (val: any): Date | null => {
       if (!val) return null;
@@ -1346,13 +1347,29 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
     };
 
+    // A row linked to a schedule activity takes its dates from that activity,
+    // read fresh here rather than trusted from the copy stored when the link
+    // was made -- so re-phasing after the programme moves follows the
+    // programme. Picking the activity still copies the dates onto the row so
+    // they are visible in the grid; this keeps them honest.
+    const effectiveDates = (row: any): { start: any; end: any; fromSchedule: boolean } | null => {
+      if (!row.activityId) {
+        return { start: row.phasingStartDate, end: row.phasingEndDate, fromSchedule: false };
+      }
+      const activity = scheduleItems.find(s => s.activityId === row.activityId);
+      if (!activity) return null;
+      return { start: activity.currentStartDate, end: activity.currentEndDate, fromSchedule: true };
+    };
+
     for (const row of rowsToPhase) {
         const phasingQty = Number(row.phasingQty) || 0;
         if (!phasingQty) { skip('no Phasing Qty'); continue; }
         if (!row.phasingUnit) { skip('no Phasing Unit'); continue; }
 
-        const userStartRaw = parseDateToUTCMidnight(row.phasingStartDate);
-        const userEndRaw = parseDateToUTCMidnight(row.phasingEndDate);
+        const dates = effectiveDates(row);
+        if (!dates) { skip(`activity ${row.activityId} is not in the schedule`); continue; }
+        const userStartRaw = parseDateToUTCMidnight(dates.start);
+        const userEndRaw = parseDateToUTCMidnight(dates.end);
 
         const newPeriodValues: Record<string, number> = { ...(row.periodValues as Record<string, number> || {}) };
         
@@ -1429,6 +1446,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         if (userEnd < userStart) { skip('the whole date range is in the past'); continue; }
 
         const calendar = calendars.find(c => c.id === row.calendarId);
+        // No calendar on the row means no weekends and no holidays are known,
+        // so every day counts. That is a 7-day week, which is almost never
+        // what "working days" means -- counted here and reported, rather than
+        // quietly inflating the forecast, and rather than guessing a calendar
+        // on the user's behalf.
+        if (!calendar) noCalendarCount++;
         const isWorkingDay = (date: Date) => {
           if (!calendar) return true;
           const day = date.getUTCDay();
@@ -1573,6 +1596,9 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           qty: Object.keys(newPeriodValues)
             .filter(key => distributionPeriods.some(dp => dp.id === key))
             .reduce((sum, key) => sum + (newPeriodValues[key] || 0), 0),
+          ...(dates.fromSchedule
+            ? { phasingStartDate: toDateOnly(dates.start), phasingEndDate: toDateOnly(dates.end) }
+            : {}),
         });
         updatedCount++;
       }
@@ -1582,6 +1608,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         const written = await applyEtcPhasing(phasedRows);
         await reloadEtcRows();
         const skippedTotal = Object.values(skipped).reduce((a, b) => a + b, 0);
+        if (noCalendarCount > 0) {
+          toast.warning(
+            `${noCalendarCount} row${noCalendarCount === 1 ? ' has' : 's have'} no Calendar set, ` +
+            `so every day counted as a working day (weekends included).`
+          );
+        }
         toast.success(
           skippedTotal > 0
             ? `Phased ${written} row${written === 1 ? '' : 's'}. Skipped ${skippedTotal}: ` +

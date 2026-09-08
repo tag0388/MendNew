@@ -598,7 +598,15 @@ export async function fetchProjectEtcDetails(projectId: string): Promise<EtcDeta
  * This updates period_values and qty and leaves every other column alone.
  */
 export async function applyEtcPhasing(
-  rows: Array<{ id: string; periodValues: Record<string, number>; qty: number }>
+  rows: Array<{
+    id: string;
+    periodValues: Record<string, number>;
+    qty: number;
+    /** Only sent for rows whose dates came from a linked schedule activity.
+     *  Omitting them leaves the stored dates alone. */
+    phasingStartDate?: string | null;
+    phasingEndDate?: string | null;
+  }>
 ): Promise<number> {
   if (rows.length === 0) return 0;
   const { data, error } = await supabase.rpc('apply_etc_phasing', { p_rows: rows });

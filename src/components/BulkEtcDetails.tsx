@@ -528,8 +528,17 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     // Collected and written in one upsert. Each row already knows its cost
     // code, so the upsert carries costCodeId straight from the row rather
     // than from a pane-level selection -- this grid spans every cost code.
-    const phasedRows: Array<{ id: string; periodValues: Record<string, number>; qty: number }> = [];
+    const phasedRows: Array<{
+      id: string; periodValues: Record<string, number>; qty: number;
+      phasingStartDate?: string | null; phasingEndDate?: string | null;
+    }> = [];
     let updatedCount = 0;
+
+    // Every reason a row drops out was a silent `continue`, so a run that
+    // phased nothing looked the same as one with nothing to do.
+    const skipped: Record<string, number> = {};
+    const skip = (reason: string) => { skipped[reason] = (skipped[reason] || 0) + 1; };
+    let noCalendarCount = 0;
 
     const parseDateToUTCMidnight = (val: any): Date | null => {
       if (!val) return null;
@@ -559,10 +568,23 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     try {
       for (const row of rowsToPhase) {
         const phasingQty = Number(row.phasingQty) || 0;
-        if (!phasingQty || !row.phasingUnit) continue;
+        if (!phasingQty) { skip('no Phasing Qty'); continue; }
+        if (!row.phasingUnit) { skip('no Phasing Unit'); continue; }
 
-        const userStartRaw = parseDateToUTCMidnight(row.phasingStartDate);
-        const userEndRaw = parseDateToUTCMidnight(row.phasingEndDate);
+        // A row linked to a schedule activity takes its dates from that
+        // activity, read fresh here rather than trusted from the copy stored
+        // when the link was made, so re-phasing follows the programme.
+        const activity = row.activityId
+          ? scheduleItems.find(sch => sch.activityId === row.activityId)
+          : undefined;
+        if (row.activityId && !activity) {
+          skip(`activity ${row.activityId} is not in the schedule`);
+          continue;
+        }
+        const effStart = activity ? activity.currentStartDate : row.phasingStartDate;
+        const effEnd = activity ? activity.currentEndDate : row.phasingEndDate;
+        const userStartRaw = parseDateToUTCMidnight(effStart);
+        const userEndRaw = parseDateToUTCMidnight(effEnd);
 
         // Retain past periods but clear out all distribution periods before writing new values
         const newPeriodValues: Record<string, number> = { ...(row.periodValues as Record<string, number> || {}) };
@@ -621,7 +643,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           continue;
         }
 
-        if (!userStartRaw || !userEndRaw) continue;
+        if (!userStartRaw || !userEndRaw) { skip('no Start/End Date'); continue; }
 
         let userStart = new Date(userStartRaw.getTime());
         let userEnd = new Date(userEndRaw.getTime());
@@ -638,9 +660,15 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           }
         }
 
-        if (userEnd < userStart) continue;
+        if (userEnd < userStart) { skip('the whole date range is in the past'); continue; }
 
         const calendar = calendars.find(c => c.id === row.calendarId);
+        // No calendar on the row means no weekends and no holidays are known,
+        // so every day counts. That is a 7-day week, which is almost never
+        // what "working days" means -- counted here and reported, rather than
+        // quietly inflating the forecast, and rather than guessing a calendar
+        // on the user's behalf.
+        if (!calendar) noCalendarCount++;
         const isWorkingDay = (date: Date) => {
           if (!calendar) return true;
           const day = date.getUTCDay();
@@ -676,7 +704,8 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           tempStep.setUTCDate(tempStep.getUTCDate() + 1);
         }
 
-        if (totalWorkingDaysInRange === 0 || distributionPeriodIds.length === 0) continue;
+        if (totalWorkingDaysInRange === 0) { skip('no working days in the date range (check the calendar)'); continue; }
+        if (distributionPeriodIds.length === 0) { skip('the date range does not overlap any future reporting period'); continue; }
 
         const phasingQtyVal = Number(row.phasingQty) || 0;
 
@@ -804,16 +833,38 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           id: row.id,
           periodValues: newPeriodValues,
           qty: Math.round(newFutureQtyTotal * 10000) / 10000,
+          ...(activity
+            ? { phasingStartDate: toDateOnly(effStart), phasingEndDate: toDateOnly(effEnd) }
+            : {}),
         });
         updatedCount++;
       }
 
       if (updatedCount > 0) {
-        await applyEtcPhasing(phasedRows);
+        const written = await applyEtcPhasing(phasedRows);
         await reloadEtcRows();
-        toast.success(`Phasing calculated for ${updatedCount} rows`);
+        const skippedTotal = Object.values(skipped).reduce((a, b) => a + b, 0);
+        if (noCalendarCount > 0) {
+          toast.warning(
+            `${noCalendarCount} row${noCalendarCount === 1 ? ' has' : 's have'} no Calendar set, ` +
+            `so every day counted as a working day (weekends included).`
+          );
+        }
+        toast.success(
+          skippedTotal > 0
+            ? `Phased ${written} row${written === 1 ? '' : 's'}. Skipped ${skippedTotal}: ` +
+              Object.entries(skipped).map(([r, n]) => `${n} with ${r}`).join(', ') + '.'
+            : `Phasing calculated for ${written} row${written === 1 ? '' : 's'}`
+        );
       } else {
-        toast.warning('No valid rows to calculate. Check highlighted rows.');
+        const reasons = Object.entries(skipped)
+          .map(([reason, n]) => `${n} with ${reason}`)
+          .join(', ');
+        toast.warning(
+          reasons
+            ? `Nothing to phase: ${reasons}.`
+            : 'Nothing to phase. Set Method to Auto-Phase on the rows you want to calculate.'
+        );
       }
     } catch (error: any) {
       console.error('Error calculating phasing:', error);
