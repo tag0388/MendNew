@@ -550,3 +550,40 @@ export async function bulkUpdateEtcDetails(
   raise('bulk update ETC rows', error);
   return (data as number) ?? 0;
 }
+
+/** An ETC row with its cost code's user-facing code alongside. */
+export type EtcDetailWithCode = EtcDetail & { costCode: string };
+
+/**
+ * Every ETC row in a project, each carrying its cost code's code string.
+ *
+ * The bulk grid shows and edits the code rather than the id, so the join
+ * comes back with the row instead of the grid resolving ids against a
+ * separately loaded list.
+ *
+ * Sorted here rather than in the query: the sort key is a column on the
+ * JOINED table, and ordering a parent by an embedded column is exactly the
+ * case PostgREST handles least predictably. One project's ETC rows is a small
+ * enough set that sorting them locally is not the cost the old whole-project
+ * downloads were.
+ */
+export async function fetchProjectEtcDetails(projectId: string): Promise<EtcDetailWithCode[]> {
+  const { data, error } = await supabase
+    .from('etc_details')
+    .select('*, cost_codes(code)')
+    .eq('project_id', projectId)
+    .order('sort_order')
+    .order('created_at');
+  raise('load ETC details', error);
+
+  const rows = (data ?? []).map((row: any) => {
+    const { cost_codes, ...rest } = row;
+    return { ...fromRow<EtcDetail>(rest)!, costCode: cost_codes?.code ?? '' } as EtcDetailWithCode;
+  });
+
+  return rows.sort((a, b) =>
+    a.costCode !== b.costCode
+      ? a.costCode.localeCompare(b.costCode)
+      : (a.sortOrder ?? 0) - (b.sortOrder ?? 0)
+  );
+}

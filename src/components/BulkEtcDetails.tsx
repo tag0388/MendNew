@@ -1,20 +1,18 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Project, Enterprise, CostCode, Calendar as ProjectCalendar, EtcDetail, ResourceRate, ScheduleItem } from '../types';
-import { db, auth } from '../firebase';
-import { 
-  doc, 
-  updateDoc, 
-  onSnapshot, 
-  collection, 
-  query, 
-  where, 
-  addDoc, 
-  deleteDoc, 
-  writeBatch,
-  getDocs,
-  orderBy
-} from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  fetchCostCodes,
+  fetchCalendars,
+  fetchScheduleItems,
+  fetchProjectEtcDetails,
+  insertEtcDetailsAt,
+  upsertEtcDetail,
+  upsertEtcDetails,
+  deleteEtcDetails,
+  bulkUpdateEtcDetails,
+} from '../lib/costCodes';
 import { 
   Search, 
   Plus, 
@@ -137,29 +135,6 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
   const [resourceLibrarySource, setResourceLibrarySource] = useState<'enterprise' | 'project'>('enterprise');
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
 
-  const handleFirestoreError = (error: any, operationType: OperationType, path: string | null) => {
-    const errInfo = {
-      error: error instanceof Error ? error.message : String(error),
-      authInfo: {
-        userId: auth.currentUser?.uid,
-        email: auth.currentUser?.email,
-        emailVerified: auth.currentUser?.emailVerified,
-        isAnonymous: auth.currentUser?.isAnonymous,
-        tenantId: auth.currentUser?.tenantId,
-        providerInfo: auth.currentUser?.providerData.map(provider => ({
-          providerId: provider.providerId,
-          displayName: provider.displayName,
-          email: provider.email,
-          photoUrl: provider.photoURL
-        })) || []
-      },
-      operationType,
-      path
-    };
-    console.error('Firestore Error: ', JSON.stringify(errInfo));
-    throw new Error(JSON.stringify(errInfo));
-  };
-
   const etcGridRef = useRef<AgGridReact>(null);
   const etcColumnDefsRef = useRef<any[]>([]);
   const etcFileInputRef = useRef<HTMLInputElement>(null);
@@ -173,66 +148,78 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     }).format(value);
   };
 
+  // The Cost Code column is a code string the user picks from a dropdown, but
+  // etc_details references the cost code by id. Resolving it here means an
+  // unrecognised code is refused with a message naming it, rather than
+  // reaching the database as a foreign key violation.
+  const resolveCostCodeId = useCallback((code: string): string => {
+    const match = costCodes.find(c => c.code === code);
+    if (!match) throw new Error(`Unknown cost code "${code}".`);
+    return match.id;
+  }, [costCodes]);
+
+  // Phasing dates are DATE columns; a cleared cell arrives as '' and has to
+  // become null or the save fails on a field the user meant to blank.
+  const toDateOnly = (val: unknown): string | null => {
+    if (!val) return null;
+    const d = val instanceof Date ? val : new Date(String(val));
+    if (isNaN(d.getTime())) return null;
+    return d.toISOString().slice(0, 10);
+  };
+
+  const reloadEtcRows = useCallback(async () => {
+    try {
+      setEtcRows(await fetchProjectEtcDetails(project.id));
+    } catch (error) {
+      console.error('Error fetching ETC details:', error);
+    } finally {
+      setIsEtcLoading(false);
+      setLoading(false);
+    }
+  }, [project.id]);
+
   // Fetch Cost Codes
   useEffect(() => {
     if (!project.id) return;
-    const q = query(collection(db, 'costCodes'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setCostCodes(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as CostCode)));
-    });
-    return () => unsubscribe();
+    let active = true;
+    const load = async () => {
+      try {
+        const rows = await fetchCostCodes(project.id);
+        if (active) setCostCodes(rows);
+      } catch (error) {
+        console.error('Cost codes fetch error:', error);
+      }
+    };
+    void load();
+    const unsubscribe = subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void load());
+    return () => { active = false; unsubscribe(); };
   }, [project.id]);
 
   // Fetch Calendars
   useEffect(() => {
-    const q = query(
-      collection(db, 'calendars'),
-      where('projectId', '==', project.id)
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setCalendars(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as any)));
-    });
-    return () => unsubscribe();
+    let active = true;
+    void fetchCalendars(project.id)
+      .then((rows) => { if (active) setCalendars(rows as any); })
+      .catch((error) => console.error('Error fetching calendars:', error));
+    return () => { active = false; };
   }, [project.id]);
 
   // Fetch ALL ETC Details for the project
   useEffect(() => {
     setIsEtcLoading(true);
-    const q = query(
-      collection(db, 'etcDetails'),
-      where('projectId', '==', project.id)
+    void reloadEtcRows();
+    const unsubscribe = subscribeToTable(
+      'etc_details', `project_id=eq.${project.id}`, () => void reloadEtcRows()
     );
+    return () => unsubscribe();
+  }, [project.id, reloadEtcRows]);
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const rows = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const sortedRows = rows.sort((a: any, b: any) => {
-        // Sort by cost code first, then sortOrder
-        if (a.costCode !== b.costCode) {
-          return (a.costCode || '').localeCompare(b.costCode || '');
-        }
-        const orderA = a.sortOrder ?? -1;
-        const orderB = b.sortOrder ?? -1;
-        if (orderA !== orderB) return orderA - orderB;
-        return new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime();
-      });
-      setEtcRows(sortedRows);
-      setIsEtcLoading(false);
-      setLoading(false);
-    }, (error) => {
-      console.error("Error fetching ETC details:", error);
-      setIsEtcLoading(false);
-      setLoading(false);
-    });
-
-    const qSch = query(collection(db, 'scheduleItems'), where('projectId', '==', project.id));
-    const unsubSch = onSnapshot(qSch, (snapshot) => {
-      setScheduleItems(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ScheduleItem)));
-    });
-
-    return () => {
-      unsubscribe();
-      unsubSch();
-    };
+  useEffect(() => {
+    let active = true;
+    void fetchScheduleItems(project.id)
+      .then((rows) => { if (active) setScheduleItems(rows); })
+      .catch((error) => console.error('Schedule items fetch error:', error));
+    return () => { active = false; };
   }, [project.id]);
 
   const etcChartData = useMemo(() => {
@@ -297,7 +284,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
         'phasingMethod', 'phasingStartDate', 'phasingEndDate', 
         'phasingUnit', 'phasingQty', 'calendarId', 'periodValues',
         'enterpriseAttributes', 'projectAttributes', 'userDefined',
-        'source', 'isEnterpriseResource', 'externalId'
+        'isEnterpriseResource'
       ];
 
       allowedFields.forEach(field => {
@@ -314,6 +301,16 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
             }
           }
           
+          // The grid edits the code; the table stores the id.
+          if (field === 'costCode') {
+            updates.costCodeId = resolveCostCodeId(String(val));
+            return;
+          }
+
+          if (field === 'phasingStartDate' || field === 'phasingEndDate') {
+            val = toDateOnly(val);
+          }
+
           if (field === 'periodValues' && val && typeof val === 'object') {
             const cleanedPeriodValues: Record<string, number> = {};
             Object.entries(val).forEach(([periodId, value]) => {
@@ -330,12 +327,13 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
         }
       });
 
-      await updateDoc(doc(db, 'etcDetails', rowId), updates);
-    } catch (error) {
-      console.error("Error updating ETC row:", error);
-      toast.error("Failed to update row");
+      await upsertEtcDetail(project.id, { id: rowId, ...updates });
+      await reloadEtcRows();
+    } catch (error: any) {
+      console.error('Error updating ETC row:', error);
+      toast.error(`Failed to update row: ${error?.message || 'Unknown error'}`);
     }
-  }, [project.reportingPeriods]);
+  }, [project.id, project.reportingPeriods, resolveCostCodeId, reloadEtcRows]);
 
   const handleDeleteEtcRows = async () => {
     if (!deleteConfirm) return;
@@ -351,11 +349,8 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
 
     setIsSaving(true);
     try {
-      const batch = writeBatch(db);
-      rowsToDelete.forEach(id => {
-        batch.delete(doc(db, 'etcDetails', id));
-      });
-      await batch.commit();
+      await deleteEtcDetails(rowsToDelete);
+      await reloadEtcRows();
       setSelectedEtcIds(new Set());
       setDeleteConfirm(null);
       toast.success(`${rowsToDelete.length} row(s) deleted`);
@@ -367,122 +362,78 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     }
   };
 
+  // Rows added here used to be created with an empty cost code for the user to
+  // fill in afterwards. An ETC row now REFERENCES its cost code, and it cannot
+  // reference nothing: RLS reaches ETC rows through their cost code, so a row
+  // belonging to no cost code would be a row nobody owns and nobody may read.
+  // So new rows take the cost code of the row they are added below -- already
+  // where their position comes from -- and adding with nothing selected asks
+  // for a selection rather than creating orphans.
+  const etcTarget = (): { costCodeId: string; insertIndex: number } | null => {
+    const selected = etcGridRef.current?.api.getSelectedRows() || [];
+    if (selected.length === 0) return null;
+    const last = selected[selected.length - 1];
+    return {
+      costCodeId: resolveCostCodeId(last.costCode),
+      insertIndex: (last.sortOrder ?? 0) + 1,
+    };
+  };
+
   const handleAddEtcRow = async () => {
     try {
-      const batch = writeBatch(db);
+      const target = etcTarget();
+      if (!target) {
+        toast.error('Select the row you want to add below, so the new rows know which cost code they belong to.');
+        return;
+      }
+
       const count = Math.max(1, Math.min(500, addRowsCount));
-      
-      let insertSortOrder: number;
-      const selectedRows = etcGridRef.current?.api.getSelectedRows() || [];
-      if (selectedRows.length > 0) {
-        const lastSelected = selectedRows[selectedRows.length - 1];
-        insertSortOrder = lastSelected.sortOrder + 1;
-        
-        const toShift = etcRows.filter(r => r.sortOrder >= insertSortOrder);
-        toShift.forEach(r => {
-          batch.update(doc(db, 'etcDetails', r.id), { sortOrder: r.sortOrder + count });
-        });
-      } else {
-        const maxSortOrder = etcRows.length > 0 ? Math.max(...etcRows.map(r => r.sortOrder || 0)) : -1;
-        insertSortOrder = maxSortOrder + 1;
-      }
-      
-      for (let i = 0; i < count; i++) {
-        const newRow = {
-          projectId: project.id,
-          costCode: '', // User will fill this in
-          item: '',
-          description: '',
-          qty: 0,
-          unit: '',
-          rate: 0,
-          phasingMethod: 'Manual',
-          phasingStartDate: '',
-          phasingEndDate: '',
-          phasingUnit: '',
-          phasingQty: 0,
-          category: '',
-          periodValues: {},
-          enterpriseAttributes: {},
-          projectAttributes: {},
-          userDefined: {},
-          sortOrder: insertSortOrder + i,
-          createdAt: new Date().toISOString(),
-          source: 'MANUAL',
-          isEnterpriseResource: false
-        };
-        const docRef = doc(collection(db, 'etcDetails'));
-        batch.set(docRef, newRow);
-      }
-      
-      await batch.commit();
-      toast.success(`${count} row(s) added successfully`);
-    } catch (error) {
-      console.error("Error adding row:", error);
-      toast.error("Failed to add row");
+      const added = await insertEtcDetailsAt(
+        target.costCodeId,
+        Array.from({ length: count }, () => ({})),
+        target.insertIndex
+      );
+      await reloadEtcRows();
+      toast.success(`${added} row(s) added successfully`);
+    } catch (error: any) {
+      console.error('Error adding row:', error);
+      toast.error(`Failed to add row: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleDeleteEtcRow = async (rowId: string) => {
     try {
-      await deleteDoc(doc(db, 'etcDetails', rowId));
-      toast.success("Row deleted");
-    } catch (error) {
-      console.error("Error deleting ETC row:", error);
-      toast.error("Failed to delete row");
+      await deleteEtcDetails([rowId]);
+      await reloadEtcRows();
+      toast.success('Row deleted');
+    } catch (error: any) {
+      console.error('Error deleting ETC row:', error);
+      toast.error(`Failed to delete row: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleBulkUpdateEtc = async () => {
     if (selectedEtcIds.size === 0) return;
-    
+
     setIsSaving(true);
     try {
-      const batch = writeBatch(db);
-      selectedEtcIds.forEach(id => {
-        const row = etcRows.find(r => r.id === id);
-        const updateObj: any = {
-          updatedAt: new Date().toISOString()
-        };
-        
-        const isLibraryResource = row?.isEnterpriseResource || row?.source === 'PROJECT';
-        if (etcBulkUpdateData.category && !isLibraryResource) {
-          updateObj.category = etcBulkUpdateData.category;
-        }
-        
-        if (etcBulkUpdateData.calendarId) updateObj.calendarId = etcBulkUpdateData.calendarId;
-        if (etcBulkUpdateData.phasingMethod) updateObj.phasingMethod = etcBulkUpdateData.phasingMethod;
-        if (etcBulkUpdateData.phasingUnit) updateObj.phasingUnit = etcBulkUpdateData.phasingUnit;
-        
-        if (Object.keys(etcBulkUpdateData.enterpriseAttributes).length > 0) {
-          updateObj.enterpriseAttributes = { 
-            ...(row?.enterpriseAttributes || {}), 
-            ...etcBulkUpdateData.enterpriseAttributes 
-          };
-        }
-        
-        if (Object.keys(etcBulkUpdateData.projectAttributes).length > 0) {
-          updateObj.projectAttributes = { 
-            ...(row?.projectAttributes || {}), 
-            ...etcBulkUpdateData.projectAttributes 
-          };
-        }
-
-        if (Object.keys(etcBulkUpdateData.userDefined || {}).length > 0) {
-          updateObj.userDefined = {
-            ...(row?.userDefined || {}),
-            ...etcBulkUpdateData.userDefined
-          };
-        }
-        
-        batch.update(doc(db, 'etcDetails', id), updateObj);
+      // The three maps merge server-side into each row's current value, and
+      // the "a library resource keeps its own category" rule travels with the
+      // statement rather than being decided from the rows this grid loaded.
+      const updated = await bulkUpdateEtcDetails(Array.from(selectedEtcIds), {
+        category: etcBulkUpdateData.category,
+        calendarId: etcBulkUpdateData.calendarId,
+        phasingMethod: etcBulkUpdateData.phasingMethod,
+        phasingUnit: etcBulkUpdateData.phasingUnit,
+        enterpriseAttributes: etcBulkUpdateData.enterpriseAttributes,
+        projectAttributes: etcBulkUpdateData.projectAttributes,
+        userDefined: etcBulkUpdateData.userDefined,
       });
-      
-      await batch.commit();
+      await reloadEtcRows();
       setIsEtcBulkUpdating(false);
       setSelectedEtcIds(new Set());
       setEtcBulkUpdateData({ enterpriseAttributes: {}, projectAttributes: {}, userDefined: {} });
-      toast.success(`Updated ${selectedEtcIds.size} rows`);
+      toast.success(`Updated ${updated} row${updated === 1 ? '' : 's'}`);
     } catch (error) {
       console.error("Error bulk updating ETC:", error);
       toast.error("Failed to update rows");
@@ -573,7 +524,10 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
       return;
     }
 
-    const batch = writeBatch(db);
+    // Collected and written in one upsert. Each row already knows its cost
+    // code, so the upsert carries costCodeId straight from the row rather
+    // than from a pane-level selection -- this grid spans every cost code.
+    const phasedRows: Array<{ id: string; costCodeId: string; periodValues: Record<string, number>; qty: number }> = [];
     let updatedCount = 0;
 
     const parseDateToUTCMidnight = (val: any): Date | null => {
@@ -655,12 +609,13 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
             });
           }
           
-          batch.update(doc(db, 'etcDetails', row.id), {
+          phasedRows.push({
+            id: row.id,
+            costCodeId: resolveCostCodeId(row.costCode),
             periodValues: newPeriodValues,
             qty: Object.keys(newPeriodValues)
-              .filter(key => distributionPeriods.some(dp => dp.id === key)) 
+              .filter(key => distributionPeriods.some(dp => dp.id === key))
               .reduce((sum, key) => sum + (newPeriodValues[key] || 0), 0),
-            updatedAt: new Date().toISOString()
           });
           updatedCount++;
           continue;
@@ -845,23 +800,25 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
 
         const newFutureQtyTotal = distributionPeriods.reduce((acc, p) => acc + (newPeriodValues[p.id] || 0), 0);
         
-        batch.update(doc(db, 'etcDetails', row.id), { 
+        phasedRows.push({
+          id: row.id,
+          costCodeId: resolveCostCodeId(row.costCode),
           periodValues: newPeriodValues,
           qty: Math.round(newFutureQtyTotal * 10000) / 10000,
-          updatedAt: new Date().toISOString()
         });
         updatedCount++;
       }
 
       if (updatedCount > 0) {
-        await batch.commit();
+        await upsertEtcDetails(project.id, phasedRows);
+        await reloadEtcRows();
         toast.success(`Phasing calculated for ${updatedCount} rows`);
       } else {
-        toast.warning("No valid rows to calculate. Check highlighted rows.");
+        toast.warning('No valid rows to calculate. Check highlighted rows.');
       }
-    } catch (error) {
-      console.error("Error calculating phasing:", error);
-      toast.error("Failed to calculate phasing");
+    } catch (error: any) {
+      console.error('Error calculating phasing:', error);
+      toast.error(`Failed to calculate phasing: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -883,7 +840,13 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
         const currentIndex = allPeriods.findIndex(p => p.id === currentPeriodId);
         const futurePeriodIds = allPeriods.slice(currentIndex + 1).map(p => p.id);
 
-        const batch = writeBatch(db);
+        // Grouped by cost code: each sheet row names its own, and rows are
+        // appended to the cost code they name. A row naming a code that does
+        // not exist is collected and reported rather than silently dropped --
+        // the old version wrote it with an empty cost code and left the user
+        // to notice.
+        const byCostCode = new Map<string, Array<Record<string, unknown>>>();
+        const unknownCodes = new Set<string>();
 
         data.forEach(row => {
           const periodValues: Record<string, number> = {};
@@ -917,10 +880,15 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
             if (row[`Text ${i}`] !== undefined) userDefined[`text${i}`] = String(row[`Text ${i}`]);
           }
 
-          const newRowRef = doc(collection(db, 'etcDetails'));
-          batch.set(newRowRef, {
-            projectId: project.id,
-            costCode: row['Cost Code ID'] || '',
+          const code = String(row['Cost Code ID'] || '').trim();
+          const costCodeId = code ? costCodes.find(c => c.code === code)?.id : undefined;
+          if (!costCodeId) {
+            unknownCodes.add(code || '(blank)');
+            return;
+          }
+
+          const bucket = byCostCode.get(costCodeId) ?? [];
+          bucket.push({
             item: row['Item'] || '',
             description: row['Description'] || '',
             qty: 0,
@@ -930,17 +898,26 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
             enterpriseAttributes,
             projectAttributes,
             userDefined,
-            createdAt: new Date().toISOString(),
-            source: 'MANUAL',
-            isEnterpriseResource: false
           });
+          byCostCode.set(costCodeId, bucket);
         });
 
-        await batch.commit();
-        toast.success(`Imported ${data.length} rows successfully`);
-      } catch (error) {
-        console.error("Error importing ETC details:", error);
-        toast.error("Failed to import rows");
+        let imported = 0;
+        for (const [costCodeId, rows] of byCostCode) {
+          imported += await insertEtcDetailsAt(costCodeId, rows);
+        }
+        await reloadEtcRows();
+
+        if (unknownCodes.size > 0) {
+          toast.warning(
+            `Imported ${imported} rows. Skipped rows for unknown cost codes: ${Array.from(unknownCodes).join(', ')}`
+          );
+        } else {
+          toast.success(`Imported ${imported} rows successfully`);
+        }
+      } catch (error: any) {
+        console.error('Error importing ETC details:', error);
+        toast.error(`Failed to import rows: ${error?.message || 'Unknown error'}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -970,64 +947,35 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
   const handleAddResources = async (resources: any[], source: 'enterprise' | 'project' = 'enterprise') => {
     if (resources.length === 0) return;
     try {
-      const batch = writeBatch(db);
-      const count = Math.max(1, Math.min(500, addRowsCount));
-      
-      let insertSortOrder: number;
-      const selectedRows = etcGridRef.current?.api.getSelectedRows() || [];
-      if (selectedRows.length > 0) {
-        const lastSelected = selectedRows[selectedRows.length - 1];
-        insertSortOrder = lastSelected.sortOrder + 1;
-        
-        const totalNewRows = count * resources.length;
-        const toShift = etcRows.filter(r => r.sortOrder >= insertSortOrder);
-        toShift.forEach(r => {
-          batch.update(doc(db, 'etcDetails', r.id), { sortOrder: r.sortOrder + totalNewRows });
-        });
-      } else {
-        const maxSortOrder = etcRows.length > 0 ? Math.max(...etcRows.map(r => r.sortOrder || 0)) : -1;
-        insertSortOrder = maxSortOrder + 1;
+      // Same rule as blank rows: a resource row still has to belong to a cost
+      // code, so it takes the cost code of the row it is added below.
+      const target = etcTarget();
+      if (!target) {
+        toast.error('Select the row you want to add below, so the new rows know which cost code they belong to.');
+        return;
       }
 
-      let currentSortOrder = insertSortOrder;
-      for (const resource of resources) {
-        for (let i = 0; i < count; i++) {
-          const newRow = {
-            projectId: project.id,
-            costCode: '', // User will fill this in
-            item: resource.id,
-            description: resource.name,
-            qty: 0,
-            unit: resource.unit || 'HR',
-            rate: resource.rate || 0,
-            phasingMethod: 'Manual',
-            phasingStartDate: '',
-            phasingEndDate: '',
-            phasingUnit: '',
-            phasingQty: 0,
-            category: resource.category || '',
-            periodValues: {},
-            enterpriseAttributes: {},
-            projectAttributes: {},
-            userDefined: {},
-            sortOrder: currentSortOrder++,
-            createdAt: new Date().toISOString(),
-            isEnterpriseResource: source === 'enterprise',
-            source: source.toUpperCase(),
-            resourceId: resource.id
-          };
-          const docRef = doc(collection(db, 'etcDetails'));
-          batch.set(docRef, newRow);
-        }
-      }
-      
-      await batch.commit();
+      const count = Math.max(1, Math.min(500, addRowsCount));
+      const newRows = resources.flatMap((resource) =>
+        Array.from({ length: count }, () => ({
+          item: resource.id,
+          description: resource.name,
+          unit: resource.unit || 'HR',
+          rate: resource.rate || 0,
+          category: resource.category || '',
+          isEnterpriseResource: source === 'enterprise',
+          resourceId: resource.id,
+        }))
+      );
+
+      const added = await insertEtcDetailsAt(target.costCodeId, newRows, target.insertIndex);
+      await reloadEtcRows();
       setIsResourceModalOpen(false);
       setSelectedResourceIds(new Set());
-      toast.success(`${resources.length * count} row(s) added successfully`);
-    } catch (error) {
-      console.error("Error adding resources:", error);
-      toast.error("Failed to add resources");
+      toast.success(`${added} row(s) added successfully`);
+    } catch (error: any) {
+      console.error('Error adding resources:', error);
+      toast.error(`Failed to add resources: ${error?.message || 'Unknown error'}`);
     }
   };
 

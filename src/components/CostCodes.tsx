@@ -716,19 +716,42 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   // Ordering is the database's job: sort_order then created_at, both NOT NULL.
   // The old in-memory sort existed to cope with rows written before sortOrder
   // was introduced, which defaulted to -1.
+  // The pane selectors hold a cost code's user-facing CODE, because that is
+  // what the row headers show and compare. Every database call needs its id.
+  //
+  // Keeping the two apart in one place, rather than passing whichever was to
+  // hand at each call site, is the whole point: an id and a code are both
+  // strings, so nothing catches the mix-up until Postgres refuses "C2" as a
+  // uuid -- which is exactly how this was found.
+  const codeIdOf = useCallback(
+    (code: string | null): string | null =>
+      code ? (costCodes.find(c => c.code === code)?.id ?? null) : null,
+    [costCodes]
+  );
+
+  const selectedEtcCodeId = useMemo(() => codeIdOf(selectedEtcCode), [codeIdOf, selectedEtcCode]);
+  const selectedActualsCodeId = useMemo(() => codeIdOf(selectedActualsCode), [codeIdOf, selectedActualsCode]);
+  const selectedBaselineCodeId = useMemo(() => codeIdOf(selectedBaselineCode), [codeIdOf, selectedBaselineCode]);
+  const selectedTimephasingCodeId = useMemo(() => codeIdOf(selectedTimephasingCode), [codeIdOf, selectedTimephasingCode]);
+  const selectedChangesCodeId = useMemo(() => codeIdOf(selectedChangesCode), [codeIdOf, selectedChangesCode]);
+
   const reloadEtcRows = useCallback(async () => {
-    if (!selectedEtcCode) {
+    // Guarded on the ID, not the code. These fetchers treat a missing cost
+    // code as "no filter" and return the whole project, so a code whose id
+    // has not resolved yet (cost codes still loading) must show nothing
+    // rather than everything.
+    if (!selectedEtcCodeId) {
       setEtcRows([]);
       return;
     }
     try {
-      setEtcRows(await fetchEtcDetails(project.id, selectedEtcCode));
+      setEtcRows(await fetchEtcDetails(project.id, selectedEtcCodeId));
     } catch (error) {
       console.error('Error fetching ETC details:', error);
     } finally {
       setIsEtcLoading(false);
     }
-  }, [project.id, selectedEtcCode]);
+  }, [project.id, selectedEtcCodeId]);
 
   // Where "Add rows" puts them: below the last selected row, or at the end
   // when nothing is selected. undefined means append.
@@ -739,19 +762,19 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   }, []);
 
   useEffect(() => {
-    if (!selectedEtcCode) {
+    if (!selectedEtcCodeId) {
       setEtcRows([]);
       return;
     }
 
     setIsEtcLoading(true);
     void reloadEtcRows();
-    return subscribeToTable('etc_details', `cost_code_id=eq.${selectedEtcCode}`, () => void reloadEtcRows());
-  }, [selectedEtcCode, project.id, reloadEtcRows]);
+    return subscribeToTable('etc_details', `cost_code_id=eq.${selectedEtcCodeId}`, () => void reloadEtcRows());
+  }, [selectedEtcCodeId, project.id, reloadEtcRows]);
 
   // Fetch Actual Cost Details
   useEffect(() => {
-    if (!selectedBaselineCode) {
+    if (!selectedBaselineCodeId) {
       setBaselineRows([]);
       return;
     }
@@ -764,7 +787,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     // tearing this listener down and rebuilding it on every cost code reload.
     const load = async () => {
       try {
-        setBaselineRows(await fetchBaselineBudgets(project.id, selectedBaselineCode));
+        setBaselineRows(await fetchBaselineBudgets(project.id, selectedBaselineCodeId));
       } catch (error) {
         console.error('Error fetching baseline budgets:', error);
       } finally {
@@ -772,11 +795,11 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       }
     };
     void load();
-    return subscribeToTable('baseline_budgets', `cost_code_id=eq.${selectedBaselineCode}`, () => void load());
-  }, [selectedBaselineCode, project.id]);
+    return subscribeToTable('baseline_budgets', `cost_code_id=eq.${selectedBaselineCodeId}`, () => void load());
+  }, [selectedBaselineCodeId, project.id]);
 
   useEffect(() => {
-    if (!selectedActualsCode) {
+    if (!selectedActualsCodeId) {
       setActualsRows([]);
       return;
     }
@@ -786,7 +809,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     // downloading the project's whole ledger to show one cost code's.
     const load = async () => {
       try {
-        setActualsRows(await fetchActualCosts(project.id, selectedActualsCode));
+        setActualsRows(await fetchActualCosts(project.id, selectedActualsCodeId));
       } catch (error) {
         console.error('Error fetching Actual Cost details:', error);
       } finally {
@@ -794,8 +817,8 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       }
     };
     void load();
-    return subscribeToTable('actual_costs', `cost_code_id=eq.${selectedActualsCode}`, () => void load());
-  }, [selectedActualsCode, project.id]);
+    return subscribeToTable('actual_costs', `cost_code_id=eq.${selectedActualsCodeId}`, () => void load());
+  }, [selectedActualsCodeId, project.id]);
 
   // Fetch Cost Phasing (Baseline/Approved)
   // start_date and end_date are DATE columns, but the grid hands over Date
@@ -810,26 +833,26 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   };
 
   const reloadCostPhasing = useCallback(async () => {
-    if (!selectedTimephasingCode) {
+    if (!selectedTimephasingCodeId) {
       setCostPhasing([]);
       return;
     }
     try {
-      setCostPhasing(await fetchCostPhasing(project.id, undefined, selectedTimephasingCode));
+      setCostPhasing(await fetchCostPhasing(project.id, undefined, selectedTimephasingCodeId));
     } catch (error) {
       console.error('Error fetching cost phasing:', error);
     }
-  }, [project.id, selectedTimephasingCode]);
+  }, [project.id, selectedTimephasingCodeId]);
 
   useEffect(() => {
-    if (!selectedTimephasingCode) {
+    if (!selectedTimephasingCodeId) {
       setCostPhasing([]);
       return;
     }
 
     void reloadCostPhasing();
-    return subscribeToTable('cost_phasing', `cost_code_id=eq.${selectedTimephasingCode}`, () => void reloadCostPhasing());
-  }, [selectedTimephasingCode, project.id, reloadCostPhasing]);
+    return subscribeToTable('cost_phasing', `cost_code_id=eq.${selectedTimephasingCodeId}`, () => void reloadCostPhasing());
+  }, [selectedTimephasingCodeId, project.id, reloadCostPhasing]);
 
   // Changes Effects
   useEffect(() => {
@@ -863,14 +886,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
   }, [project.id]);
 
   useEffect(() => {
-    if (!selectedChangesCode || !project.id) {
+    if (!selectedChangesCodeId || !project.id) {
       setChangeRecords([]);
       return;
     }
     setIsChangesLoading(true);
     const load = async () => {
       try {
-        setChangeRecords(await fetchChangeRecords(project.id, selectedChangesCode));
+        setChangeRecords(await fetchChangeRecords(project.id, selectedChangesCodeId));
       } catch (error) {
         console.error('Error fetching change records:', error);
       } finally {
@@ -878,8 +901,8 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       }
     };
     void load();
-    return subscribeToTable('change_records', `cost_code_id=eq.${selectedChangesCode}`, () => void load());
-  }, [selectedChangesCode, project.id]);
+    return subscribeToTable('change_records', `cost_code_id=eq.${selectedChangesCodeId}`, () => void load());
+  }, [selectedChangesCodeId, project.id]);
 
   useEffect(() => {
     if (!project.id) return;
@@ -933,18 +956,16 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
   // Process Timephasing Rows
   useEffect(() => {
-    if (!selectedTimephasingCode) {
+    if (!selectedTimephasingCodeId) {
       setTimephasingRows([]);
       return;
     }
 
     setIsTimephasingLoading(true);
-    
-    // We need actuals and etc for EAC calculation
-    // Since we might not have them fetched yet (they are fetched in other effects)
-    // We should probably fetch them here too or ensure they are available.
-    // To be safe and consistent with the user's request for "smart" handling,
-    // I'll fetch them specifically for this view if not already there.
+
+    // Actuals and ETC rows are read here rather than shared with the panes
+    // that also load them: this view needs them for the selected cost code
+    // whether or not those panes are open.
     
     const fetchData = async () => {
       try {
@@ -954,7 +975,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         
         // 1. Get Actuals for this cost code, filtered by the database rather
         //    than by downloading the project's whole ledger.
-        const filteredActuals = await fetchActualCosts(project.id, selectedTimephasingCode);
+        const filteredActuals = await fetchActualCosts(project.id, selectedTimephasingCodeId);
 
         const actualsByPeriod: Record<string, number> = {};
         filteredActuals.forEach((a) => {
@@ -962,7 +983,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         });
 
         // 2. Get ETC Details
-        const etcDetails = await fetchEtcDetails(project.id, selectedTimephasingCode);
+        const etcDetails = await fetchEtcDetails(project.id, selectedTimephasingCodeId);
         
         // 3. Get Subcontract Phasing
         const subphasingByPeriod: Record<string, number> = {};
@@ -1014,7 +1035,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         });
 
         // 3. Get Phasing (Baseline/Approved/EAC settings)
-        const codePhasing = costPhasing.filter(p => p.costCodeId === selectedTimephasingCode);
+        const codePhasing = costPhasing.filter(p => p.costCodeId === selectedTimephasingCodeId);
         const baselineDoc = codePhasing.find(p => p.type === 'baseline');
         const approvedDoc = codePhasing.find(p => p.type === 'approved');
         const eacDoc = codePhasing.find(p => p.type === 'eac');
@@ -1144,7 +1165,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     };
 
     fetchData();
-  }, [selectedTimephasingCode, project.id, costCodes, costPhasing, project.reportingPeriods, subcontracts]);
+  }, [selectedTimephasingCode, selectedTimephasingCodeId, project.id, costCodes, costPhasing, project.reportingPeriods, subcontracts]);
 
   const handleAddEtcRow = async () => {
     if (!selectedEtcCode) return;
@@ -1190,7 +1211,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         }))
       );
 
-      const added = await insertEtcDetailsAt(selectedEtcCode, newRows, etcInsertIndex());
+      const added = await insertEtcDetailsAt(selectedEtcCodeId!, newRows, etcInsertIndex());
 
       await reloadEtcRows();
       setIsResourceModalOpen(false);
@@ -1374,7 +1395,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
           phasedRows.push({
             id: row.id,
-            costCodeId: selectedEtcCode,
+            costCodeId: selectedEtcCodeId!,
             periodValues: newPeriodValues,
             qty: Object.keys(newPeriodValues)
               .filter(key => distributionPeriods.some(dp => dp.id === key))
@@ -1540,7 +1561,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
         phasedRows.push({
           id: row.id,
-          costCodeId: selectedEtcCode,
+          costCodeId: selectedEtcCodeId!,
           periodValues: newPeriodValues,
           qty: Object.keys(newPeriodValues)
             .filter(key => distributionPeriods.some(dp => dp.id === key))
@@ -1742,7 +1763,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
         });
 
         // Appended in one call, in the order the sheet listed them.
-        const added = await insertEtcDetailsAt(selectedEtcCode, importedRows);
+        const added = await insertEtcDetailsAt(selectedEtcCodeId!, importedRows);
         await reloadEtcRows();
         toast.success(`Imported ${added} rows successfully`);
       } catch (error: any) {
@@ -2686,7 +2707,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           // people phasing the same row at once cannot create two curves for
           // it -- which the read-then-write version could.
           phasingUpserts.push({
-            costCodeId: selectedTimephasingCode,
+            costCodeId: selectedTimephasingCodeId!,
             type: row.id,
             phasingSource: 'Auto',
             startDate: toDateOnly(row.startDate),
@@ -2711,7 +2732,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     } finally {
       setIsTimephasingLoading(false);
     }
-  }, [selectedTimephasingCode, timephasingRows, project.id, project.reportingPeriods, costCodes, calculatePhasing]);
+  }, [selectedTimephasingCodeId, timephasingRows, project.id, project.reportingPeriods, costCodes, calculatePhasing]);
 
   const handleExportTimephasing = () => {
     if (!selectedTimephasingCode) return;
@@ -2771,7 +2792,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
 
           if (!phasingType) continue;
 
-          const existingDoc = costPhasing.find(p => p.type === phasingType && p.costCodeId === selectedTimephasingCode);
+          const existingDoc = costPhasing.find(p => p.type === phasingType && p.costCodeId === selectedTimephasingCodeId);
           
           const periodValues: Record<string, number> = { ...(existingDoc?.periodValues || {}) };
           periods.forEach(p => {
@@ -2791,7 +2812,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           });
 
           phasingUpserts.push({
-            costCodeId: selectedTimephasingCode,
+            costCodeId: selectedTimephasingCodeId!,
             type: phasingType,
             phasingSource: row['Phasing Source'] || (phasingType === 'eac' ? 'ETC Details' : 'Manual'),
             startDate: toDateOnly(row['Start Date']),
@@ -2855,7 +2876,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       // same row. A unique constraint does.
       await upsertCostPhasing(
         project.id,
-        selectedTimephasingCode,
+        selectedTimephasingCodeId!,
         data.id,
         data.periodValues || {},
         {
@@ -2872,7 +2893,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
       console.error('Error updating cost phasing:', error);
       toast.error(`Failed to update cost phasing: ${error?.message || 'Unknown error'}`);
     }
-  }, [project.id, selectedTimephasingCode, reloadCostPhasing]);
+  }, [project.id, selectedTimephasingCodeId, reloadCostPhasing]);
 
   const actualsColumnDefs = useMemo<ColDef[]>(() => [
     { 
