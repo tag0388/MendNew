@@ -5,6 +5,7 @@ import {
   fetchChanges, createChange, updateChange, deleteChanges, importChanges,
   fetchChangeRecords, upsertChangeRecords, updateChangeRecord,
   deleteChangeRecords, bulkUpdateChangeRecords,
+  applyChangeCellEdit, applyChangeRecordCellEdit,
 } from '../lib/changes';
 import { Project, Enterprise, Change, ChangeRecord, CostCode } from '../types';
 import { 
@@ -552,7 +553,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
     const exportData = changeRecords.map(r => {
       const row: any = {
         'Change ID': changes.find(c => c.id === r.changeId)?.changeId || 'Unknown',
-        'Cost Code': r.costCodeId,
+        'Cost Code': costCodes.find(c => c.id === r.costCodeId)?.code || '',
         'Scope': r.scope,
         'Budget Amount': r.budgetAmount,
         'EAC Amount': r.eacAmount
@@ -734,32 +735,24 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
     const { data, colDef } = params;
     if (!data.id) return;
 
+    const field = colDef.field!;
     try {
-      let updates: any = {
-        [colDef.field!]: params.newValue,
-        updatedAt: new Date().toISOString()
-      };
-      
-      // Handle attribute updates
-      if (colDef.field?.startsWith('enterpriseAttributes.') || colDef.field?.startsWith('projectAttributes.')) {
-        const parts = colDef.field.split('.');
-        const attrField = parts[0];
-        const attrId = parts[1];
-        updates = {
-          [`${attrField}.${attrId}`]: params.newValue,
-          updatedAt: new Date().toISOString()
-        };
-      }
+      let value = params.newValue;
 
       // Enforce character limits
-      if (colDef.field === 'initiator' || colDef.field === 'reference') {
-        updates[colDef.field] = String(params.newValue).slice(0, 50);
+      if (field === 'initiator' || field === 'reference') {
+        value = String(params.newValue ?? '').slice(0, 50);
       }
 
-      await updateChange(data.id, updates);
+      // Attribute columns carry a dotted path, which is a Firestore idiom for
+      // merging into a nested map and not a column name. applyChangeCellEdit
+      // routes those to the merge function.
+      await applyChangeCellEdit(data.id, field, value);
       await reloadChanges();
     } catch (error: any) {
-      toast.error(`Operation failed: ${(error as any)?.message || 'Unknown error'}`);
+      console.error('Change update failed', error);
+      toast.error(`Failed to update change: ${error?.message || 'Unknown error'}`);
+      await reloadChanges();
     }
   };
 
@@ -767,37 +760,31 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
     const { data, colDef } = params;
     if (!data.id) return;
 
+    const field = colDef.field!;
     try {
-      let updates: any = {
-        [colDef.field!]: params.newValue,
-        updatedAt: new Date().toISOString()
-      };
-
-      // Handle attribute updates
-      if (colDef.field?.startsWith('enterpriseAttributes.') || colDef.field?.startsWith('projectAttributes.')) {
-        const parts = colDef.field.split('.');
-        const attrField = parts[0];
-        const attrId = parts[1];
-        updates = {
-          [`${attrField}.${attrId}`]: params.newValue,
-          updatedAt: new Date().toISOString()
-        };
-      }
+      let value = params.newValue;
 
       // Enforce character limits
-      if (colDef.field === 'scope') {
-        updates.scope = String(params.newValue).slice(0, 100);
+      if (field === 'scope') {
+        value = String(params.newValue ?? '').slice(0, 100);
       }
 
-      await updateChangeRecord(data.id, updates);
+      if (field === 'costCodeId') {
+        // The column shows the cost CODE but holds the row id, so the typed
+        // code is resolved before it reaches a uuid column.
+        const resolved = costCodes.find(c => c.code === String(params.newValue ?? '').trim());
+        if (!resolved) {
+          toast.error(`Unknown cost code "${params.newValue}"`);
+          await reloadChangeRecords();
+          return;
+        }
+        value = resolved.id;
+      }
+
+      await applyChangeRecordCellEdit(data.id, field, value);
       await reloadChangeRecords();
       // The change's totals follow by trigger.
       await reloadChanges();
-      
-      // Update parent totals if amounts changed
-      if (colDef.field === 'budgetAmount' || colDef.field === 'eacAmount') {
-        updateParentTotals(data.changeId);
-      }
     } catch (error: any) {
       toast.error(`Operation failed: ${(error as any)?.message || 'Unknown error'}`);
     }
@@ -1013,6 +1000,9 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         allowTyping: true,
         filterList: true
       },
+      // The column holds a foreign key; a user reads and types the code.
+      valueFormatter: (params: ValueFormatterParams) =>
+        costCodes.find(c => c.id === params.value)?.code || '',
       enableRowGroup: true
     },
     {
@@ -1714,7 +1704,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
                 </SelectTrigger>
                 <SelectContent>
                   {costCodes.map(c => (
-                    <SelectItem key={c.id} value={c.code}>{c.code} - {c.name}</SelectItem>
+                    <SelectItem key={c.id} value={c.id}>{c.code} - {c.name}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>

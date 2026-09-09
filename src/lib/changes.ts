@@ -160,3 +160,58 @@ export async function bulkUpdateChangeRecords(
   raise('bulk update change records', error);
   return (data as number) ?? 0;
 }
+
+/**
+ * Merge attribute maps into changes without replacing the keys this edit did
+ * not touch. See migration 20260907000032.
+ */
+export async function mergeChangeAttributes(
+  ids: string[],
+  patch: { enterpriseAttributes?: Record<string, string>; projectAttributes?: Record<string, string> }
+): Promise<number> {
+  if (ids.length === 0) return 0;
+  const nonEmpty = (m?: Record<string, unknown>) =>
+    m && Object.keys(m).length > 0 ? m : null;
+  const { data, error } = await supabase.rpc('merge_change_attributes', {
+    p_change_ids: ids,
+    p_enterprise_attributes: nonEmpty(patch.enterpriseAttributes),
+    p_project_attributes: nonEmpty(patch.projectAttributes),
+  });
+  raise('update change attributes', error);
+  return (data as number) ?? 0;
+}
+
+/**
+ * Split an AG Grid field name into a column patch or an attribute merge.
+ *
+ * The grids name their attribute columns with Firestore's dotted path --
+ * "enterpriseAttributes.<attributeId>". A jsonb column has no such path, so an
+ * edit to one of those is routed to a merge function instead of being sent as
+ * a column called `enterprise_attributes.<id>`, which does not exist.
+ */
+export function splitCellEdit(
+  field: string,
+  value: any
+): { column?: Record<string, any>; attributes?: { enterpriseAttributes?: Record<string, any>; projectAttributes?: Record<string, any> } } {
+  const dot = field.indexOf('.');
+  if (dot === -1) return { column: { [field]: value } };
+  const map = field.slice(0, dot);
+  const key = field.slice(dot + 1);
+  if (map === 'enterpriseAttributes') return { attributes: { enterpriseAttributes: { [key]: value ?? '' } } };
+  if (map === 'projectAttributes') return { attributes: { projectAttributes: { [key]: value ?? '' } } };
+  return { column: { [field]: value } };
+}
+
+/** One cell edit on the changes grid. */
+export async function applyChangeCellEdit(id: string, field: string, value: any): Promise<void> {
+  const { column, attributes } = splitCellEdit(field, value);
+  if (attributes) await mergeChangeAttributes([id], attributes);
+  if (column) await updateChange(id, column as Partial<Change>);
+}
+
+/** One cell edit on either change-records grid. */
+export async function applyChangeRecordCellEdit(id: string, field: string, value: any): Promise<void> {
+  const { column, attributes } = splitCellEdit(field, value);
+  if (attributes) await bulkUpdateChangeRecords([id], attributes);
+  if (column) await updateChangeRecord(id, column as Partial<ChangeRecord>);
+}
