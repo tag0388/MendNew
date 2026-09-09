@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { 
   Plus, 
@@ -34,19 +34,17 @@ import {
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { toast } from 'sonner';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  doc,
-  writeBatch,
-  serverTimestamp 
-} from 'firebase/firestore';
-import { db } from '../firebase';
+import { subscribeToTable } from '../lib/supabase';
+import { fetchCostCodes } from '../lib/costCodes';
+import {
+  fetchSubcontractSummaries, createSubcontract, updateSubcontract,
+  deleteSubcontracts, importSubcontracts, bulkUpdateSubcontracts,
+  fetchLineItems, upsertLineItems, deleteLineItems,
+  bulkUpdateLineItems, applyLineItemCellEdit,
+  fetchInvoices, createInvoiceFromSubcontract, updateInvoice, deleteInvoices,
+  fetchInvoiceItemDetail, updateInvoiceItem, setInvoiceItemClaim,
+  fetchClaimPositions, resolveVendorByName, applyLineItemPhasing,
+} from '../lib/subcontracts';
 import { Enterprise, Project, Subcontract, SubcontractLineItem, Vendor, Invoice, CostCode } from '../types';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -307,6 +305,10 @@ export default function SubcontractManagement({ enterprise, project, user, theme
   const [subcontracts, setSubcontracts] = useState<Subcontract[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [costCodes, setCostCodes] = useState<CostCode[]>([]);
+  // Children of whatever is open, not of everything in the project.
+  const [lineItems, setLineItems] = useState<SubcontractLineItem[]>([]);
+  const [invoiceItems, setInvoiceItems] = useState<any[]>([]);
+  const [claimPositions, setClaimPositions] = useState<Record<string, { claimed: number; certified: number }>>({});
   const [loading, setLoading] = useState(true);
   const [selectedSubcontractId, setSelectedSubcontractId] = useState<string | null>(null);
   const [selectedInvoiceId, setSelectedInvoiceId] = useState<string | null>(null);
@@ -400,34 +402,103 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     }
   }, [projectPeriodDates]);
 
+  // The grid reads subcontract_summary: one row per subcontract with the
+  // roll-ups already computed in SQL. It used to load every line item of every
+  // subcontract so the browser could sum them, which is the whole commitment
+  // ledger crossing the network to draw a handful of rows.
+  const reloadSubcontracts = useCallback(async () => {
+    try {
+      setSubcontracts(await fetchSubcontractSummaries(project.id));
+    } catch (error: any) {
+      console.error('Subcontracts fetch error:', error);
+      toast.error(`Failed to load subcontracts: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  const reloadInvoices = useCallback(async () => {
+    try {
+      setInvoices(await fetchInvoices(project.id));
+    } catch (error: any) {
+      console.error('Invoices fetch error:', error);
+    }
+  }, [project.id]);
+
   useEffect(() => {
     if (!project.id) return;
+    void reloadSubcontracts();
+    void reloadInvoices();
 
-    const qSub = query(collection(db, 'subcontracts'), where('projectId', '==', project.id));
-    const unsubscribeSub = onSnapshot(qSub, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Subcontract));
-      setSubcontracts(data);
-      setLoading(false);
-    });
-
-    const qInv = query(collection(db, 'invoices'), where('projectId', '==', project.id));
-    const unsubscribeInv = onSnapshot(qInv, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Invoice));
-      setInvoices(data);
-    });
-
-    const qCost = query(collection(db, 'costCodes'), where('projectId', '==', project.id));
-    const unsubscribeCost = onSnapshot(qCost, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as CostCode));
-      setCostCodes(data);
-    });
-
-    return () => {
-      unsubscribeSub();
-      unsubscribeInv();
-      unsubscribeCost();
+    const load = async () => {
+      try {
+        setCostCodes(await fetchCostCodes(project.id));
+      } catch (error) {
+        console.error('Subcontracts: cost codes fetch error:', error);
+      }
     };
-  }, [project.id]);
+    void load();
+
+    const unsubSub = subscribeToTable('subcontracts', `project_id=eq.${project.id}`, () => void reloadSubcontracts());
+    // A line item changes the subcontract's roll-ups, so the grid follows it.
+    const unsubItems = subscribeToTable('subcontract_line_items', `project_id=eq.${project.id}`, () => void reloadSubcontracts());
+    const unsubInv = subscribeToTable('invoices', `project_id=eq.${project.id}`, () => {
+      void reloadInvoices();
+      void reloadSubcontracts();
+    });
+    const unsubCost = subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void load());
+
+    return () => { unsubSub(); unsubItems(); unsubInv(); unsubCost(); };
+  }, [project.id, reloadSubcontracts, reloadInvoices]);
+
+  // Line items are fetched for the subcontract that is open, never for all of
+  // them at once.
+  const reloadLineItems = useCallback(async () => {
+    if (!selectedSubcontractId) { setLineItems([]); setClaimPositions({}); return; }
+    try {
+      const [items, positions] = await Promise.all([
+        fetchLineItems(selectedSubcontractId),
+        fetchClaimPositions(project.id, selectedSubcontractId),
+      ]);
+      setLineItems(items);
+      setClaimPositions(positions);
+    } catch (error: any) {
+      console.error('Line items fetch error:', error);
+      toast.error(`Failed to load line items: ${error?.message || 'Unknown error'}`);
+    }
+  }, [selectedSubcontractId, project.id]);
+
+  useEffect(() => {
+    void reloadLineItems();
+    if (!selectedSubcontractId) return;
+    return subscribeToTable(
+      'subcontract_line_items',
+      `subcontract_id=eq.${selectedSubcontractId}`,
+      () => void reloadLineItems()
+    );
+  }, [reloadLineItems, selectedSubcontractId]);
+
+  // Likewise the open invoice's items.
+  const reloadInvoiceItems = useCallback(async () => {
+    if (!selectedInvoiceId) { setInvoiceItems([]); return; }
+    try {
+      // The view carries the parent line item's reference fields and the
+      // position on the previous invoice, so the grid does not derive them.
+      setInvoiceItems(await fetchInvoiceItemDetail(selectedInvoiceId));
+    } catch (error: any) {
+      console.error('Invoice items fetch error:', error);
+    }
+  }, [selectedInvoiceId]);
+
+  useEffect(() => {
+    void reloadInvoiceItems();
+    if (!selectedInvoiceId) return;
+    return subscribeToTable(
+      'invoice_items',
+      `invoice_id=eq.${selectedInvoiceId}`,
+      () => void reloadInvoiceItems()
+    );
+  }, [reloadInvoiceItems, selectedInvoiceId]);
 
   // Clear selected invoice when subcontract changes
   useEffect(() => {
@@ -458,71 +529,10 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     return invoices.find(i => i.id === selectedInvoiceId);
   }, [invoices, selectedInvoiceId]);
 
-  const selectedInvoiceItems = useMemo(() => {
-    if (!selectedInvoiceId || !selectedInvoice || selectedInvoice.subcontractId !== selectedSubcontractId) return [];
-
-    // All invoices for this subcontract, sorted by ID (standard sequence)
-    const subInvoices = [...invoices]
-      .filter(i => i.subcontractId === selectedInvoice.subcontractId)
-      .sort((a, b) => a.invoiceId.localeCompare(b.invoiceId));
-
-    const currentIndex = subInvoices.findIndex(i => i.id === selectedInvoiceId);
-    const previousInvoices = subInvoices.slice(0, currentIndex);
-    
-    // Get last invoice's values as our "Previous Cumulative"
-    const lastInvoice = previousInvoices[previousInvoices.length - 1];
-    const prevItems: Record<string, any> = {};
-    if (lastInvoice) {
-      (lastInvoice.items || []).forEach(item => {
-        prevItems[item.subcontractLineItemId] = item;
-      });
-    }
-
-    // Map current items with parent line item data to ensure reference columns are up-to-date
-    const lineItemsArray = selectedSubcontract?.lineItems || [];
-    const lineItemsMap: Record<string, any> = {};
-    lineItemsArray.forEach(li => {
-      lineItemsMap[li.id] = li;
-    });
-
-    return (selectedInvoice?.items || []).map(item => {
-      const parentLI = lineItemsMap[item.subcontractLineItemId] || {};
-      const prev = prevItems[item.subcontractLineItemId] || { 
-        claimQty: 0, claimValue: 0, claimPercent: 0, 
-        certifiedQty: 0, certifiedValue: 0, certifiedPercent: 0 
-      };
-
-      return {
-        ...item,
-        // Override reference fields from parent line item for accurate display
-        qty: parentLI.qty ?? item.qty,
-        rate: parentLI.rate ?? item.rate,
-        description: parentLI.description ?? item.description,
-        itemNo: parentLI.itemNo ?? item.itemNo,
-        unit: parentLI.unit ?? item.unit,
-        type: parentLI.type ?? item.type,
-        
-        previousClaimQty: prev.claimQty || 0,
-        previousClaimValue: prev.claimValue || 0,
-        previousClaimPercent: prev.claimPercent || 0,
-        previousCertifiedQty: prev.certifiedQty || 0,
-        previousCertifiedValue: prev.certifiedValue || 0,
-        previousCertifiedPercent: prev.certifiedPercent || 0,
-        // Computed periodic if not explicitly stored (Relative to PREVIOUS CERTIFIED)
-        periodicClaimQty: item.periodicClaimQty ?? ((item.claimQty || 0) - (prev.certifiedQty || 0)),
-        periodicClaimPercent: item.periodicClaimPercent ?? ((item.claimPercent || 0) - (prev.certifiedPercent || 0)),
-        periodicClaimValue: item.periodicClaimValue ?? ((item.claimValue || 0) - (prev.certifiedValue || 0)),
-        periodicCertifiedQty: item.periodicCertifiedQty ?? ((item.certifiedQty || 0) - (prev.certifiedQty || 0)),
-        periodicCertifiedPercent: item.periodicCertifiedPercent ?? ((item.certifiedPercent || 0) - (prev.certifiedPercent || 0)),
-        periodicCertifiedValue: item.periodicCertifiedValue ?? ((item.certifiedValue || 0) - (prev.certifiedValue || 0))
-      };
-    }).sort((a, b) => {
-      // Sort by Item No.
-      const aNo = parseInt(a.itemNo?.replace(/\D/g, '') || '0');
-      const bNo = parseInt(b.itemNo?.replace(/\D/g, '') || '0');
-      return aNo - bNo;
-    });
-  }, [selectedInvoiceId, selectedInvoice, invoices, selectedSubcontract]);
+  // Read from invoice_item_detail: the parent line item's reference fields and
+  // the position on the PREVIOUS invoice come from the view. This used to be
+  // derived here by loading every invoice on the order with all of its items.
+  const selectedInvoiceItems = invoiceItems;
 
   const invoiceItemsPinnedTopRowData = useMemo(() => {
     if (selectedInvoiceItems.length === 0) return [];
@@ -553,66 +563,40 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     }];
   }, [selectedInvoiceItems]);
 
-  const getSubcontractCalculations = (subcontract: Subcontract | undefined) => {
-    if (!subcontract) return {
-      originalAmount: 0,
-      approvedChanges: 0,
-      pendingChanges: 0,
-      totalAmount: 0,
-      claimedAmountToDate: 0,
-      certifiedAmountToDate: 0,
-      varianceAmount: 0
+  /**
+   * The subcontracts grid's figures, read from subcontract_summary.
+   *
+   * Every one of these used to be computed here: original, approved, pending
+   * and forecast change values by filtering and summing the subcontract's line
+   * item array, and the claimed and certified positions by sorting the
+   * project's invoices on the digits in their reference. That meant loading
+   * every line item of every subcontract in the project to draw the grid. The
+   * view does the same arithmetic in SQL, on one row per subcontract.
+   */
+  const getSubcontractCalculations = (subcontract: any | undefined) => {
+    const zero = {
+      originalAmount: 0, approvedChanges: 0, pendingChanges: 0, forecastChanges: 0,
+      totalAmount: 0, claimedAmountToDate: 0, claimedLastInvoice: 0,
+      certifiedAmountToDate: 0, certifiedLastInvoice: 0, varianceAmount: 0,
     };
-    const lineItems = subcontract.lineItems || [];
-    const subInvoices = invoices.filter(i => i.subcontractId === subcontract.id);
-    
-    const originalAmount = lineItems
-      .filter(li => li.type === 'Original')
-      .reduce((sum, li) => sum + (li.total || 0), 0);
-      
-    const approvedChanges = lineItems
-      .filter(li => li.type === 'ChangeOrder' && li.status === 'Approved')
-      .reduce((sum, li) => sum + (li.total || 0), 0);
-      
-    const pendingChanges = lineItems
-      .filter(li => li.type === 'ChangeOrder' && li.status === 'Pending')
-      .reduce((sum, li) => sum + (li.total || 0), 0);
+    if (!subcontract) return zero;
 
-    const forecastChanges = lineItems
-      .filter(li => li.type === 'ChangeOrder' && li.status === 'Forecast')
-      .reduce((sum, li) => sum + (li.total || 0), 0);
-      
-    const totalAmount = lineItems
-      .filter(li => li.status !== 'Rejected')
-      .reduce((sum, li) => sum + (li.total || 0), 0);
-    
-    // Sort invoices by ID numerically descending to find the latest
-    // Cumulative values should be taken from the latest invoice
-    const sortedInvoices = [...subInvoices].sort((a, b) => {
-      const aNo = parseInt(a.invoiceId?.replace(/\D/g, '') || '0');
-      const bNo = parseInt(b.invoiceId?.replace(/\D/g, '') || '0');
-      return bNo - aNo;
-    });
+    const claimedAmountToDate = Number(subcontract.claimedAmountToDate) || 0;
+    const certifiedAmountToDate = Number(subcontract.certifiedAmountToDate) || 0;
 
-    const lastInvoice = sortedInvoices[0];
-    const claimedAmountToDate = lastInvoice?.totalAmount || 0;
-    const certifiedAmountToDate = lastInvoice?.certifiedAmount || 0;
-    const claimedLastInvoice = claimedAmountToDate;
-    const certifiedLastInvoice = certifiedAmountToDate;
-
-    const varianceAmount = certifiedAmountToDate - claimedAmountToDate;
-      
     return {
-      originalAmount,
-      approvedChanges,
-      pendingChanges,
-      forecastChanges,
-      totalAmount,
+      originalAmount: Number(subcontract.originalAmount) || 0,
+      approvedChanges: Number(subcontract.approvedChanges) || 0,
+      pendingChanges: Number(subcontract.pendingChanges) || 0,
+      forecastChanges: Number(subcontract.forecastChanges) || 0,
+      totalAmount: Number(subcontract.totalAmount) || 0,
       claimedAmountToDate,
-      claimedLastInvoice,
+      // The cumulative position IS the latest invoice's position, so these are
+      // the same number under two headings, as they were before.
+      claimedLastInvoice: claimedAmountToDate,
       certifiedAmountToDate,
-      certifiedLastInvoice,
-      varianceAmount
+      certifiedLastInvoice: certifiedAmountToDate,
+      varianceAmount: Number(subcontract.varianceAmount) || (certifiedAmountToDate - claimedAmountToDate),
     };
   };
 
@@ -643,13 +627,17 @@ export default function SubcontractManagement({ enterprise, project, user, theme
       }
     }
 
+    // vendorName is the vendor's name, not a column on subcontracts.
+    delete updateData.vendorName;
+
     try {
-      const docRef = doc(db, 'subcontracts', data.id);
-      await updateDoc(docRef, updateData);
+      await updateSubcontract(data.id, updateData);
+      await reloadSubcontracts();
       toast.success('Updated successfully.');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error updating subcontract:', error);
-      toast.error('Failed to update.');
+      toast.error(`Failed to update: ${error?.message || 'Unknown error'}`);
+      await reloadSubcontracts();
     }
   };
 
@@ -1095,11 +1083,9 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     if (editingSubcontractId) {
       // Update existing
       try {
-        const docRef = doc(db, 'subcontracts', editingSubcontractId);
-        await updateDoc(docRef, {
-          ...subcontractFormData,
-          updatedAt: new Date().toISOString()
-        });
+        const { vendorName, ...fields } = subcontractFormData as any;
+        await updateSubcontract(editingSubcontractId, fields);
+        await reloadSubcontracts();
         setIsAddingSubcontract(false);
         setEditingSubcontractId(null);
         setSubcontractFormData({
@@ -1118,9 +1104,9 @@ export default function SubcontractManagement({ enterprise, project, user, theme
           vendorName: ''
         });
         toast.success('Subcontract updated successfully.');
-      } catch (error) {
+      } catch (error: any) {
         console.error('Error updating subcontract:', error);
-        toast.error('Failed to update subcontract.');
+        toast.error(`Failed to update subcontract: ${error?.message || 'Unknown error'}`);
       }
       return;
     }
@@ -1132,18 +1118,11 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     }
 
     try {
-      const newSubcontract = {
-        ...subcontractFormData,
-        enterpriseId: enterprise.id,
-        projectId: project.id,
-        totalAmount: 0,
-        lineItems: [],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        createdBy: user.uid
-      };
-
-      await addDoc(collection(db, 'subcontracts'), newSubcontract);
+      const { vendorName, ...fields } = subcontractFormData as any;
+      // totalAmount is derived from the line items by trigger, so a new
+      // subcontract does not carry one in.
+      await createSubcontract(project.id, { ...fields, createdBy: user.uid });
+      await reloadSubcontracts();
       setIsAddingSubcontract(false);
       setSubcontractFormData({
         orderId: '',
@@ -1161,38 +1140,32 @@ export default function SubcontractManagement({ enterprise, project, user, theme
         vendorName: ''
       });
       toast.success('Subcontract added successfully.');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error adding subcontract:', error);
-      toast.error('Failed to add subcontract.');
+      toast.error(`Failed to add subcontract: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleBulkUpdate = async () => {
     if (selectedIds.size === 0) return;
     try {
-      const batch = writeBatch(db);
-      selectedIds.forEach(id => {
-        const updateObj: any = {
-          updatedAt: new Date().toISOString()
-        };
-        if (bulkUpdateData.status) updateObj.status = bulkUpdateData.status;
-        if (bulkUpdateData.paymentType) updateObj.paymentType = bulkUpdateData.paymentType;
-        if (bulkUpdateData.awardDate) updateObj.awardDate = bulkUpdateData.awardDate;
-        if (bulkUpdateData.vendorId) {
-          updateObj.vendorId = bulkUpdateData.vendorId;
-          updateObj.vendorName = bulkUpdateData.vendorName;
-        }
+      const patch: any = {};
+      if (bulkUpdateData.status) patch.status = bulkUpdateData.status;
+      if (bulkUpdateData.paymentType) patch.paymentType = bulkUpdateData.paymentType;
+      if (bulkUpdateData.awardDate) patch.awardDate = bulkUpdateData.awardDate;
+      // The vendor is a foreign key; its name lives on the vendor row.
+      if (bulkUpdateData.vendorId) patch.vendorId = bulkUpdateData.vendorId;
 
-        batch.update(doc(db, 'subcontracts', id), updateObj);
-      });
-      await batch.commit();
-      toast.success(`Updated ${selectedIds.size} subcontracts successfully.`);
+      // One statement for every selected subcontract.
+      const updated = await bulkUpdateSubcontracts(Array.from(selectedIds), patch);
+      await reloadSubcontracts();
+      toast.success(`Updated ${updated} subcontracts successfully.`);
       setIsBulkUpdating(false);
       setSelectedIds(new Set());
       setBulkUpdateData({});
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error bulk updating:', error);
-      toast.error('Failed to bulk update subcontracts.');
+      toast.error(`Failed to bulk update subcontracts: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1230,49 +1203,52 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     
     if (type === 'subcontracts') {
       try {
-        const batch = writeBatch(db);
-        data.forEach(row => {
-          const orderId = row['Order ID'] || row.orderId || row.ID || row.id;
-          const orderName = row['Order Name'] || row.orderName || row.Name || row.name || '';
-          const vendorName = row['Vendor'] || row.vendorName || '';
-          const status = row['Status'] || row.status || 'Active';
-          const paymentType = row['Payment Type'] || row.paymentType || 'LumpSum';
-          const awardDate = row['Award Date'] || row.awardDate || new Date().toISOString().split('T')[0];
+        const parsed = data
+          .map(row => ({
+            orderId: String(row['Order ID'] || row.orderId || row.ID || row.id || '').trim(),
+            orderName: String(row['Order Name'] || row.orderName || row.Name || row.name || ''),
+            vendorName: String(row['Vendor'] || row.vendorName || '').trim(),
+            status: String(row['Status'] || row.status || 'Active'),
+            paymentType: String(row['Payment Type'] || row.paymentType || 'LumpSum'),
+            awardDate: String(row['Award Date'] || row.awardDate || new Date().toISOString().split('T')[0]),
+          }))
+          .filter(r => r.orderId);
 
-          if (orderId) {
-            const existing = subcontracts.find(s => s.orderId.toLowerCase() === String(orderId).toLowerCase());
-            const subcontractData = {
-              orderId: String(orderId),
-              orderName: String(orderName),
-              vendorName: String(vendorName),
-              status: String(status) as any,
-              paymentType: String(paymentType) as any,
-              awardDate: String(awardDate),
-              projectId: project.id,
-              enterpriseId: enterprise.id,
-              updatedAt: new Date().toISOString()
-            };
-            
-            if (existing) {
-              batch.update(doc(db, 'subcontracts', existing.id), subcontractData);
-            } else {
-              const newRef = doc(collection(db, 'subcontracts'));
-              batch.set(newRef, { 
-                ...subcontractData, 
-                vendorId: '',
-                totalAmount: 0,
-                lineItems: [],
-                createdAt: new Date().toISOString(),
-                createdBy: user.uid
-              });
-            }
-          }
-        });
-        await batch.commit();
-        toast.success('Import successful.');
-      } catch (error) {
+        if (parsed.length === 0) {
+          toast.error('No rows in the sheet carried an Order ID.');
+          setImportPreview(null);
+          return;
+        }
+
+        // The sheet names the vendor; the column is a foreign key. Each
+        // distinct name is resolved once -- not once per row -- and an unknown
+        // vendor is created on the enterprise.
+        const vendorIdByName = new Map<string, string | null>();
+        for (const name of new Set(parsed.map(r => r.vendorName).filter(Boolean))) {
+          vendorIdByName.set(
+            name.toLowerCase(),
+            (enterprise.vendors || []).find(v => v.name.toLowerCase() === name.toLowerCase())?.id
+              ?? await resolveVendorByName(enterprise.id, name)
+          );
+        }
+
+        // Upsert on (project_id, order_id): a sheet row whose order number is
+        // already in the project updates that subcontract instead of creating
+        // a second one with the same reference.
+        const imported = await importSubcontracts(project.id, parsed.map(r => ({
+          orderId: r.orderId,
+          orderName: r.orderName,
+          status: r.status as any,
+          paymentType: r.paymentType as any,
+          awardDate: r.awardDate,
+          vendorId: (r.vendorName ? vendorIdByName.get(r.vendorName.toLowerCase()) : null) || undefined,
+          createdBy: user.uid,
+        })));
+        await reloadSubcontracts();
+        toast.success(`Imported ${imported} subcontracts.`);
+      } catch (error: any) {
         console.error('Error committing import:', error);
-        toast.error('Failed to commit import.');
+        toast.error(`Failed to commit import: ${error?.message || 'Unknown error'}`);
       }
     }
     setImportPreview(null);
@@ -1289,29 +1265,30 @@ export default function SubcontractManagement({ enterprise, project, user, theme
   const handleBulkDelete = async () => {
     if (selectedIds.size === 0) return;
     try {
-      const batch = writeBatch(db);
-      selectedIds.forEach(id => {
-        batch.delete(doc(db, 'subcontracts', id));
-      });
-      await batch.commit();
+      const ids = Array.from(selectedIds);
+      // Line items and invoices cascade with the subcontract.
+      await deleteSubcontracts(ids);
+      await reloadSubcontracts();
+      if (selectedSubcontractId && selectedIds.has(selectedSubcontractId)) setSelectedSubcontractId(null);
       setSelectedIds(new Set());
       setDeleteConfirm(null);
-      toast.success(`Deleted ${selectedIds.size} subcontracts.`);
-    } catch (error) {
+      toast.success(`Deleted ${ids.length} subcontracts.`);
+    } catch (error: any) {
       console.error('Error bulk deleting:', error);
-      toast.error('Failed to delete subcontracts.');
+      toast.error(`Failed to delete subcontracts: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleDeleteSubcontract = async (id: string) => {
     try {
-      await deleteDoc(doc(db, 'subcontracts', id));
+      await deleteSubcontracts([id]);
+      await reloadSubcontracts();
       if (selectedSubcontractId === id) setSelectedSubcontractId(null);
       setDeleteConfirm(null);
       toast.success('Subcontract deleted.');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error deleting subcontract:', error);
-      toast.error('Failed to delete subcontract.');
+      toast.error(`Failed to delete subcontract: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1319,58 +1296,38 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     if (!selectedSubcontractId || !selectedSubcontract) return;
 
     try {
-      const currentLineItems = selectedSubcontract?.lineItems || [];
-      
       // Calculate next sequential item number
       let nextNum = 1;
-      if (currentLineItems.length > 0) {
-        const lastItem = currentLineItems[currentLineItems.length - 1];
+      if (lineItems.length > 0) {
+        const lastItem = lineItems[lineItems.length - 1];
         const lastNum = parseInt(lastItem.itemNo);
-        if (!isNaN(lastNum)) {
-          nextNum = lastNum + 1;
-        } else {
-          nextNum = currentLineItems.length + 1;
-        }
+        nextNum = isNaN(lastNum) ? lineItems.length + 1 : lastNum + 1;
       }
       const itemNo = String(nextNum).padStart(3, '0');
 
-      const newLineItem: SubcontractLineItem = {
-        id: Math.random().toString(36).substring(2, 9),
-        subcontractId: selectedSubcontractId,
-        projectId: project.id,
+      // One row. `total` is generated from qty x rate by the database, so it
+      // is not sent, and the subcontract's total follows by trigger.
+      await upsertLineItems(project.id, selectedSubcontractId, [{
         itemNo,
         description: 'New Line Item',
         qty: 0,
         unit: 'ea',
         rate: 0,
-        total: 0,
         type: 'Original',
         status: 'Approved',
         date: new Date().toISOString().split('T')[0],
         phasingSource: selectedSubcontract.defaultPhasingSource || 'Manual',
-        startDate: selectedSubcontract.defaultStartDate || '',
-        endDate: selectedSubcontract.defaultEndDate || '',
+        startDate: selectedSubcontract.defaultStartDate || undefined,
+        endDate: selectedSubcontract.defaultEndDate || undefined,
         distribution: selectedSubcontract.defaultDistribution || 'Even',
-        enterpriseAttributes: {},
-        projectAttributes: {},
-        userDefined: {},
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
+        sortOrder: lineItems.length,
+      } as any]);
 
-      const updatedLineItems = [...currentLineItems, newLineItem];
-      const totalAmount = updatedLineItems.reduce((sum, li) => sum + li.total, 0);
-
-      await updateDoc(doc(db, 'subcontracts', selectedSubcontractId), {
-        lineItems: updatedLineItems,
-        totalAmount,
-        updatedAt: new Date().toISOString()
-      });
-
+      await reloadLineItems();
       toast.success('Line item added.');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error adding line item:', error);
-      toast.error('Failed to add line item.');
+      toast.error(`Failed to add line item: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1379,20 +1336,15 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     if (!window.confirm(`Are you sure you want to delete ${selectedLineItemIds.size} selected line items?`)) return;
 
     try {
-      const updatedItems = (selectedSubcontract?.lineItems || []).filter(li => !selectedLineItemIds.has(li.id));
-      const newTotal = updatedItems.reduce((sum, li) => sum + (li.total || 0), 0);
-      
-      await updateDoc(doc(db, 'subcontracts', selectedSubcontractId), {
-        lineItems: updatedItems,
-        totalAmount: newTotal,
-        updatedAt: new Date().toISOString()
-      });
-      
+      const count = selectedLineItemIds.size;
+      // One statement. The subcontract's total follows by trigger.
+      await deleteLineItems(Array.from(selectedLineItemIds));
+      await reloadLineItems();
       setSelectedLineItemIds(new Set());
-      toast.success(`Deleted ${selectedLineItemIds.size} line items.`);
-    } catch (error) {
+      toast.success(`Deleted ${count} line items.`);
+    } catch (error: any) {
       console.error('Error bulk deleting line items:', error);
-      toast.error('Failed to delete line items.');
+      toast.error(`Failed to delete line items: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1400,78 +1352,53 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     if (!selectedSubcontractId || !selectedSubcontract || selectedLineItemIds.size === 0) return;
 
     try {
-      const updatedItems = (selectedSubcontract?.lineItems || []).map(li => {
-        if (selectedLineItemIds.has(li.id)) {
-          const updatedLi = { ...li };
-          if (lineItemBulkUpdateData.costCodeId) updatedLi.costCodeId = lineItemBulkUpdateData.costCodeId;
-          if (lineItemBulkUpdateData.date) updatedLi.date = lineItemBulkUpdateData.date;
-          if (lineItemBulkUpdateData.startDate) updatedLi.startDate = lineItemBulkUpdateData.startDate;
-          if (lineItemBulkUpdateData.endDate) updatedLi.endDate = lineItemBulkUpdateData.endDate;
-          if (lineItemBulkUpdateData.phasingSource) updatedLi.phasingSource = lineItemBulkUpdateData.phasingSource;
-          if (lineItemBulkUpdateData.distribution) updatedLi.distribution = lineItemBulkUpdateData.distribution;
-          if (lineItemBulkUpdateData.type) updatedLi.type = lineItemBulkUpdateData.type;
-          if (lineItemBulkUpdateData.status) updatedLi.status = lineItemBulkUpdateData.status;
-          
-          if (lineItemBulkUpdateData.enterpriseAttributes) {
-            const updatedEntAttrs = { ...updatedLi.enterpriseAttributes };
-            Object.entries(lineItemBulkUpdateData.enterpriseAttributes).forEach(([key, val]) => {
-              if (val === 'CLEAR') {
-                delete updatedEntAttrs[key];
-              } else if (val) {
-                updatedEntAttrs[key] = val as string;
-              }
-            });
-            updatedLi.enterpriseAttributes = updatedEntAttrs;
-          }
-          if (lineItemBulkUpdateData.projectAttributes) {
-            const updatedProjAttrs = { ...updatedLi.projectAttributes };
-            Object.entries(lineItemBulkUpdateData.projectAttributes).forEach(([key, val]) => {
-              if (val === 'CLEAR') {
-                delete updatedProjAttrs[key];
-              } else if (val) {
-                updatedProjAttrs[key] = val as string;
-              }
-            });
-            updatedLi.projectAttributes = updatedProjAttrs;
-          }
-          if (lineItemBulkUpdateData.userDefined) {
-            const updatedUserAttrs = { ...updatedLi.userDefined };
-            Object.entries(lineItemBulkUpdateData.userDefined).forEach(([key, val]) => {
-              if (val === 'CLEAR') {
-                delete updatedUserAttrs[key];
-              } else if (val) {
-                updatedUserAttrs[key] = val as string;
-              }
-            });
-            updatedLi.userDefined = updatedUserAttrs;
-          }
-          
-          updatedLi.updatedAt = new Date().toISOString();
-          return updatedLi;
-        }
-        return li;
+      // The dialog offers "set this value" and "clear it" (the CLEAR
+      // sentinel). Setting merges into the stored map; clearing removes the
+      // key. Both happen in one statement, against what is stored now rather
+      // than against the copy this browser is holding.
+      const split = (m?: Record<string, any>) => {
+        const set: Record<string, string> = {};
+        const clear: string[] = [];
+        Object.entries(m || {}).forEach(([key, val]) => {
+          if (val === 'CLEAR') clear.push(key);
+          else if (val) set[key] = String(val);
+        });
+        return { set, clear };
+      };
+      const ent = split(lineItemBulkUpdateData.enterpriseAttributes);
+      const prj = split(lineItemBulkUpdateData.projectAttributes);
+      const usr = split(lineItemBulkUpdateData.userDefined);
+
+      const updated = await bulkUpdateLineItems(Array.from(selectedLineItemIds), {
+        costCodeId: lineItemBulkUpdateData.costCodeId || undefined,
+        date: lineItemBulkUpdateData.date || undefined,
+        startDate: lineItemBulkUpdateData.startDate || undefined,
+        endDate: lineItemBulkUpdateData.endDate || undefined,
+        phasingSource: lineItemBulkUpdateData.phasingSource || undefined,
+        distribution: lineItemBulkUpdateData.distribution || undefined,
+        type: lineItemBulkUpdateData.type || undefined,
+        status: lineItemBulkUpdateData.status || undefined,
+        enterpriseAttributes: ent.set,
+        projectAttributes: prj.set,
+        userDefined: usr.set,
+        clearEnterpriseAttributes: ent.clear,
+        clearProjectAttributes: prj.clear,
+        clearUserDefined: usr.clear,
       });
 
-      const newTotal = updatedItems.reduce((sum, li) => sum + (li.total || 0), 0);
-      
-      await updateDoc(doc(db, 'subcontracts', selectedSubcontractId), {
-        lineItems: updatedItems,
-        totalAmount: newTotal,
-        updatedAt: new Date().toISOString()
-      });
-
+      await reloadLineItems();
       setIsLineItemBulkUpdating(false);
       setSelectedLineItemIds(new Set());
-      toast.success('Bulk update successful.');
-    } catch (error) {
+      toast.success(`Updated ${updated} line items.`);
+    } catch (error: any) {
       console.error('Error bulk updating line items:', error);
-      toast.error('Failed to update line items.');
+      toast.error(`Failed to update line items: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleLineItemExport = () => {
     if (!selectedSubcontract) return;
-    const exportData = (selectedSubcontract?.lineItems || []).map(li => ({
+    const exportData = lineItems.map(li => ({
       'No.': li.itemNo,
       'Description': li.description,
       'Cost Code ID': li.costCodeId || '',
@@ -1520,64 +1447,62 @@ export default function SubcontractManagement({ enterprise, project, user, theme
         const ws = wb.Sheets[wsname];
         const data = XLSX.utils.sheet_to_json(ws);
 
-        const currentItems = [...(selectedSubcontract?.lineItems || [])];
-        
+        const unknownCodes = new Set<string>();
+        const rows: any[] = [];
+
         data.forEach((row: any) => {
           const itemNo = row['No.'] || row.itemNo || '';
           const description = row['Description'] || row.description || '';
           if (!description) return;
 
-          const newLineItem: SubcontractLineItem = {
-            id: Math.random().toString(36).substring(2, 9),
-            subcontractId: selectedSubcontractId,
-            projectId: project.id,
+          // The sheet names a cost code; the column is a foreign key. A code
+          // the project does not have is reported rather than written as-is.
+          const codeText = String(row['Cost Code'] || row['Cost Code ID'] || row.costCodeId || '').trim();
+          let costCodeId: string | undefined;
+          if (codeText) {
+            const resolved = costCodes.find(c => c.code === codeText || c.id === codeText);
+            if (resolved) costCodeId = resolved.id;
+            else unknownCodes.add(codeText);
+          }
+
+          rows.push({
             itemNo: String(itemNo),
             description: String(description),
-            costCodeId: row['Cost Code ID'] || row.costCodeId || '',
+            costCodeId,
             date: row['Date'] || row.date || dateToISO(new Date()),
+            // qty and rate are the inputs; the database generates the total.
             qty: Number(row['Qty'] || row.qty) || 0,
             unit: String(row['Unit'] || row.unit || 'ea'),
             rate: Number(row['Rate'] || row.rate) || 0,
-            total: 0,
-            type: (row['Type'] || row.type || 'Original') as any,
-            status: (row['Status'] || row.status || 'Approved') as any,
+            type: (row['Type'] || row.type || 'Original'),
+            status: (row['Status'] || row.status || 'Approved'),
             phasingSource: selectedSubcontract.defaultPhasingSource || 'Manual',
-            startDate: selectedSubcontract.defaultStartDate || '',
-            endDate: selectedSubcontract.defaultEndDate || '',
+            startDate: selectedSubcontract.defaultStartDate || undefined,
+            endDate: selectedSubcontract.defaultEndDate || undefined,
             distribution: selectedSubcontract.defaultDistribution || 'Even',
-            enterpriseAttributes: {},
-            projectAttributes: {},
-            userDefined: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-          };
-          newLineItem.total = newLineItem.qty * newLineItem.rate;
-          currentItems.push(newLineItem);
+            sortOrder: rows.length,
+          });
         });
 
-        const totals = currentItems.reduce((acc, li) => {
-          const isOriginal = li.type === 'Original';
-          const isApproved = li.type === 'ChangeOrder' && li.status === 'Approved';
-          const isForecast = li.type === 'ChangeOrder' && li.status === 'Forecast';
-          if (isOriginal || isApproved || isForecast) {
-            acc.total += (li.total || 0);
-          }
-          if (isForecast) {
-            acc.forecast += (li.total || 0);
-          }
-          return acc;
-        }, { total: 0, forecast: 0 });
+        if (rows.length === 0) {
+          toast.error('No rows in the sheet carried a description.');
+          return;
+        }
 
-        await updateDoc(doc(db, 'subcontracts', selectedSubcontractId), {
-          lineItems: currentItems,
-          totalAmount: totals.total,
-          forecastChanges: totals.forecast,
-          updatedAt: new Date().toISOString()
-        });
-        toast.success('Import successful.');
-      } catch (error) {
+        // One statement, whatever the size of the sheet. Upsert on
+        // (subcontract_id, item_no), so re-importing a corrected sheet updates
+        // the items rather than duplicating them, and the subcontract's totals
+        // follow by trigger.
+        const imported = await upsertLineItems(project.id, selectedSubcontractId, rows);
+        await reloadLineItems();
+        toast.success(
+          unknownCodes.size > 0
+            ? `Imported ${imported} line items. Unknown cost codes left blank: ${Array.from(unknownCodes).join(', ')}`
+            : `Imported ${imported} line items.`
+        );
+      } catch (error: any) {
         console.error('Error importing line items:', error);
-        toast.error('Failed to import line items.');
+        toast.error(`Failed to import line items: ${error?.message || 'Unknown error'}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -1585,65 +1510,35 @@ export default function SubcontractManagement({ enterprise, project, user, theme
 
   const onLineItemCellValueChanged = async (event: CellValueChangedEvent) => {
     const { data, colDef, newValue, oldValue } = event;
-    
+
     // Don't skip if oldValue is undefined, as it might be the first time setting it
     if (newValue === oldValue && oldValue !== undefined) return;
     if (!colDef.field || !selectedSubcontractId || !selectedSubcontract) return;
 
+    const field = colDef.field;
     try {
-      const field = colDef.field;
-      const updatedItems = (selectedSubcontract?.lineItems || []).map(li => {
-        if (li.id === data.id) {
-          // Create a deep-ish copy of the line item
-          const updatedLi = { ...li, updatedAt: new Date().toISOString() };
-          
-          if (field.includes('.')) {
-            const parts = field.split('.');
-            let current: any = updatedLi;
-            
-            // Navigate through the nested structure, cloning as we go
-            for (let i = 0; i < parts.length - 1; i++) {
-              const part = parts[i];
-              // Ensure the nested object exists and is a new object reference
-              current[part] = current[part] ? { ...current[part] } : {};
-              current = current[part];
-            }
-            
-            // Set the final value
-            current[parts[parts.length - 1]] = (newValue instanceof Date) ? dateToISO(newValue) : newValue;
-          } else {
-            (updatedLi as any)[field] = (newValue instanceof Date) ? dateToISO(newValue) : newValue;
-          }
+      let value = (newValue instanceof Date) ? dateToISO(newValue) : newValue;
 
-          // Recalculate total if qty or rate changed (or always, to be safe)
-          updatedLi.total = (updatedLi.qty || 0) * (updatedLi.rate || 0);
-          return updatedLi;
+      if (field === 'costCodeId' && value) {
+        // The column shows the cost CODE but holds the row id.
+        const resolved = costCodes.find(c => c.code === String(value).trim() || c.id === value);
+        if (!resolved) {
+          toast.error(`Unknown cost code "${value}"`);
+          await reloadLineItems();
+          return;
         }
-        return li;
-      });
+        value = resolved.id;
+      }
 
-      const totals = updatedItems.reduce((acc, li) => {
-        const isOriginal = li.type === 'Original';
-        const isApproved = li.type === 'ChangeOrder' && li.status === 'Approved';
-        const isForecast = li.type === 'ChangeOrder' && li.status === 'Forecast';
-        if (isOriginal || isApproved || isForecast) {
-          acc.total += (li.total || 0);
-        }
-        if (isForecast) {
-          acc.forecast += (li.total || 0);
-        }
-        return acc;
-      }, { total: 0, forecast: 0 });
-
-      await updateDoc(doc(db, 'subcontracts', selectedSubcontractId), {
-        lineItems: updatedItems,
-        totalAmount: totals.total,
-        forecastChanges: totals.forecast,
-        updatedAt: new Date().toISOString()
-      });
-    } catch (error) {
+      // The total is generated from qty x rate by the database, so there is
+      // nothing to recompute here, and the subcontract's roll-ups follow by
+      // trigger rather than being summed in the browser and written back.
+      await applyLineItemCellEdit(data.id, field, value);
+      await reloadLineItems();
+    } catch (error: any) {
       console.error('Error updating line item:', error);
-      toast.error('Failed to update line item.');
+      toast.error(`Failed to update line item: ${error?.message || 'Unknown error'}`);
+      await reloadLineItems();
     }
   };
 
@@ -1654,78 +1549,28 @@ export default function SubcontractManagement({ enterprise, project, user, theme
       const subInvoices = invoices.filter(i => i.subcontractId === selectedSubcontractId);
       let nextNum = 1;
       if (subInvoices.length > 0) {
-        const ids = subInvoices
-          .map(i => parseInt(i.invoiceId))
-          .filter(n => !isNaN(n));
-        if (ids.length > 0) {
-          nextNum = Math.max(...ids) + 1;
-        }
+        const ids = subInvoices.map(i => parseInt(i.invoiceId)).filter(n => !isNaN(n));
+        if (ids.length > 0) nextNum = Math.max(...ids) + 1;
       }
-      const invoiceId = String(nextNum).padStart(3, '0');
+      const invoiceRef = String(nextNum).padStart(3, '0');
 
-      // Get previous aggregates for auto-population
-      const aggregates: Record<string, { certifiedQty: number, certifiedValue: number, certifiedPercent: number }> = {};
-      subInvoices.forEach(inv => {
-        (inv.items || []).forEach(item => {
-          if (!aggregates[item.subcontractLineItemId]) {
-            aggregates[item.subcontractLineItemId] = { certifiedQty: 0, certifiedValue: 0, certifiedPercent: 0 };
-          }
-          aggregates[item.subcontractLineItemId].certifiedQty += (item.certifiedQty || 0);
-          aggregates[item.subcontractLineItemId].certifiedValue += (item.certifiedValue || 0);
-          aggregates[item.subcontractLineItemId].certifiedPercent += (item.certifiedPercent || 0);
-        });
-      });
-
-      const newInvoice: any = {
-        projectId: project.id,
-        enterpriseId: enterprise.id,
-        subcontractId: selectedSubcontractId,
-        invoiceId,
-        description: `Invoice ${invoiceId}`,
-        status: 'Draft',
-        initiator: user.displayName || user.email,
-        vendorId: selectedSubcontract.vendorId,
-        vendorName: selectedSubcontract.vendorName,
-        totalAmount: 0,
-        certifiedAmount: 0,
-        items: (selectedSubcontract?.lineItems || []).map((li: any) => {
-          const prev = aggregates[li.id] || { certifiedQty: 0, certifiedValue: 0, certifiedPercent: 0 };
-          return {
-            id: Math.random().toString(36).substring(2, 9),
-            subcontractLineItemId: li.id,
-            itemNo: li.itemNo,
-            description: li.description,
-            qty: li.qty,
-            unit: li.unit,
-            rate: li.rate,
-            total: li.total,
-            // Pre-populate Cumulative Claimed with Previous Cumulative Certified
-            claimQty: prev.certifiedQty,
-            claimValue: prev.certifiedValue,
-            claimPercent: prev.certifiedPercent,
-            // Also sync Certified for the new invoice
-            certifiedQty: prev.certifiedQty,
-            certifiedValue: prev.certifiedValue,
-            certifiedPercent: prev.certifiedPercent,
-            // Initial Periodic values are 0 for a fresh invoice (no new progress yet)
-            periodicClaimQty: 0,
-            periodicClaimValue: 0,
-            periodicClaimPercent: 0,
-            periodicCertifiedQty: 0,
-            periodicCertifiedValue: 0,
-            periodicCertifiedPercent: 0
-          };
-        }),
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        createdBy: user.uid
-      };
-
-      await addDoc(collection(db, 'invoices'), newInvoice);
+      // The invoice and its items are created in the database, opening at what
+      // has already been certified. This used to load every invoice on the
+      // order with all of its items just to work out the opening position --
+      // and it summed the cumulative certified figures across them, so each
+      // new invoice opened higher than the work actually certified.
+      const newId = await createInvoiceFromSubcontract(
+        selectedSubcontractId,
+        invoiceRef,
+        `Invoice ${invoiceRef}`,
+        user.displayName || user.email
+      );
+      await reloadInvoices();
+      setSelectedInvoiceId(newId);
       toast.success('Invoice created.');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error adding invoice:', error);
-      toast.error('Failed to add invoice.');
+      toast.error(`Failed to add invoice: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1733,31 +1578,31 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     e.preventDefault();
     if (!editingInvoiceId) return;
     try {
-      await updateDoc(doc(db, 'invoices', editingInvoiceId), {
-        ...invoiceFormData,
-        updatedAt: new Date().toISOString()
-      });
+      const { vendorName, ...fields } = invoiceFormData as any;
+      await updateInvoice(editingInvoiceId, fields);
+      await reloadInvoices();
       toast.success('Invoice updated.');
       setIsAddingInvoice(false);
       setEditingInvoiceId(null);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error updating invoice:', error);
-      toast.error('Failed to update invoice.');
+      toast.error(`Failed to update invoice: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleDeleteInvoice = async () => {
     if (!invoiceDeleteConfirm) return;
     try {
-      await deleteDoc(doc(db, 'invoices', invoiceDeleteConfirm));
+      // The invoice's items cascade.
+      await deleteInvoices([invoiceDeleteConfirm]);
+      await reloadInvoices();
+      await reloadSubcontracts();
       toast.success('Invoice deleted.');
+      if (selectedInvoiceId === invoiceDeleteConfirm) setSelectedInvoiceId(null);
       setInvoiceDeleteConfirm(null);
-      if (selectedInvoiceId === invoiceDeleteConfirm) {
-        setSelectedInvoiceId(null);
-      }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error deleting invoice:', error);
-      toast.error('Failed to delete invoice.');
+      toast.error(`Failed to delete invoice: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -1767,190 +1612,40 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     if (!colDef.field) return;
 
     try {
-      let valueToSave = newValue;
-      if (newValue instanceof Date) {
-        valueToSave = dateToISO(newValue);
-      }
-
-      await updateDoc(doc(db, 'invoices', data.id), {
-        [colDef.field]: valueToSave,
-        updatedAt: new Date().toISOString()
-      });
-    } catch (error) {
+      const valueToSave = (newValue instanceof Date) ? dateToISO(newValue) : newValue;
+      await updateInvoice(data.id, { [colDef.field]: valueToSave } as any);
+      await reloadInvoices();
+    } catch (error: any) {
       console.error('Error updating invoice:', error);
-      toast.error('Failed to update invoice.');
+      toast.error(`Failed to update invoice: ${error?.message || 'Unknown error'}`);
+      await reloadInvoices();
     }
   };
 
   const onInvoiceLineItemCellValueChanged = async (event: CellValueChangedEvent) => {
     const { data, colDef, newValue, oldValue } = event;
     if (newValue === oldValue) return;
-    if (!selectedInvoiceId) return;
+    if (!selectedInvoiceId || !colDef.field) return;
 
-    const invoice = invoices.find(i => i.id === selectedInvoiceId);
-    if (!invoice) return;
-
-    // Helper for rounding
-    const round2 = (val: number) => Math.round((val + Number.EPSILON) * 100) / 100;
-
-    // To handle periodic/cumulative sync, we need the "Previous Cumulative" values
-    const prevClaimQty = (data.previousClaimQty || 0);
-    const prevClaimPercent = (data.previousClaimPercent || 0);
-    const prevClaimValue = (data.previousClaimValue || 0);
-    const prevCertQty = (data.previousCertifiedQty || 0);
-    const prevCertPercent = (data.previousCertifiedPercent || 0);
-    const prevCertValue = (data.previousCertifiedValue || 0);
-    
-    const qty = data.qty || 0;
-    const rate = data.rate || 0;
-
-    const updatedItems = (invoice.items || []).map(item => {
-      if (item.id === data.id) {
-        let updated = { ...item, [colDef.field!]: newValue };
-        const field = colDef.field;
-
-        if (field === 'commentary') {
-          return updated;
-        }
-
-        let isClaimEdit = false;
-
-        // --- CLAIMED LOGIC ---
-        if (field === 'claimQty') {
-          isClaimEdit = true;
-          updated.claimQty = round2(newValue);
-          updated.periodicClaimQty = round2(updated.claimQty - prevCertQty);
-          updated.claimValue = round2(updated.claimQty * rate);
-          updated.claimPercent = round2((qty > 0) ? (updated.claimQty / qty) * 100 : 0);
-          updated.periodicClaimValue = round2(updated.claimValue - prevCertValue);
-          updated.periodicClaimPercent = round2(updated.claimPercent - prevCertPercent);
-        } else if (field === 'periodicClaimQty') {
-          isClaimEdit = true;
-          updated.periodicClaimQty = round2(newValue);
-          updated.claimQty = round2(prevCertQty + updated.periodicClaimQty);
-          updated.claimValue = round2(updated.claimQty * rate);
-          updated.claimPercent = round2((qty > 0) ? (updated.claimQty / qty) * 100 : 0);
-          updated.periodicClaimValue = round2(updated.periodicClaimQty * rate);
-          updated.periodicClaimPercent = round2((qty > 0) ? (updated.periodicClaimQty / qty) * 100 : 0);
-        } else if (field === 'claimPercent') {
-          isClaimEdit = true;
-          const p = round2(newValue);
-          updated.claimPercent = p;
-          updated.claimQty = round2((p / 100) * qty);
-          updated.periodicClaimQty = round2(updated.claimQty - prevCertQty);
-          updated.claimValue = round2(updated.claimQty * rate);
-          updated.periodicClaimValue = round2(updated.claimValue - prevCertValue);
-          updated.periodicClaimPercent = round2(p - prevCertPercent);
-        } else if (field === 'periodicClaimPercent') {
-          isClaimEdit = true;
-          const p = round2(newValue);
-          updated.periodicClaimPercent = p;
-          updated.periodicClaimQty = round2((p / 100) * qty);
-          updated.claimQty = round2(prevCertQty + updated.periodicClaimQty);
-          updated.claimPercent = round2(prevCertPercent + p);
-          updated.periodicClaimValue = round2(updated.periodicClaimQty * rate);
-          updated.claimValue = round2(updated.claimQty * rate);
-        } else if (field === 'claimValue') {
-           isClaimEdit = true;
-           const v = round2(newValue);
-           updated.claimValue = v;
-           updated.periodicClaimValue = round2(v - prevCertValue);
-           updated.claimQty = rate > 0 ? round2(v / rate) : 0;
-           updated.periodicClaimQty = round2(updated.claimQty - prevCertQty);
-           updated.claimPercent = round2((qty > 0) ? (updated.claimQty / qty) * 100 : 0);
-           updated.periodicClaimPercent = round2(updated.claimPercent - prevCertPercent);
-        } else if (field === 'periodicClaimValue') {
-           isClaimEdit = true;
-           const v = round2(newValue);
-           updated.periodicClaimValue = v;
-           updated.claimValue = round2(prevCertValue + v);
-           updated.periodicClaimQty = rate > 0 ? round2(v / rate) : 0;
-           updated.claimQty = round2(prevCertQty + updated.periodicClaimQty);
-           updated.periodicClaimPercent = round2((qty > 0) ? (updated.periodicClaimQty / qty) * 100 : 0);
-           updated.claimPercent = round2(prevCertPercent + updated.periodicClaimPercent);
-        }
-
-        // --- Sync Certified to Claimed if Claimed was edited ---
-        if (isClaimEdit) {
-          updated.certifiedQty = updated.claimQty;
-          updated.periodicCertifiedQty = updated.periodicClaimQty;
-          updated.certifiedPercent = updated.claimPercent;
-          updated.periodicCertifiedPercent = updated.periodicClaimPercent;
-          updated.certifiedValue = updated.claimValue;
-          updated.periodicCertifiedValue = updated.periodicClaimValue;
-        }
-
-        // --- CERTIFIED LOGIC (Independent Edit) ---
-        else if (field === 'certifiedQty') {
-          const v = round2(newValue);
-          updated.certifiedQty = v;
-          updated.periodicCertifiedQty = round2(v - prevCertQty);
-          updated.certifiedValue = round2(v * rate);
-          updated.certifiedPercent = round2((qty > 0) ? (v / qty) * 100 : 0);
-          updated.periodicCertifiedValue = round2(updated.certifiedValue - prevCertValue);
-          updated.periodicCertifiedPercent = round2(updated.certifiedPercent - prevCertPercent);
-        } else if (field === 'periodicCertifiedQty') {
-          const v = round2(newValue);
-          updated.periodicCertifiedQty = v;
-          updated.certifiedQty = round2(prevCertQty + v);
-          updated.certifiedValue = round2(updated.certifiedQty * rate);
-          updated.certifiedPercent = round2((qty > 0) ? (updated.certifiedQty / qty) * 100 : 0);
-          updated.periodicCertifiedValue = round2(v * rate);
-          updated.periodicCertifiedPercent = round2((qty > 0) ? (v / qty) * 100 : 0);
-        } else if (field === 'certifiedPercent') {
-          const p = round2(newValue);
-          updated.certifiedPercent = p;
-          updated.certifiedQty = round2((p / 100) * qty);
-          updated.periodicCertifiedQty = round2(updated.certifiedQty - prevCertQty);
-          updated.certifiedValue = round2(updated.certifiedQty * rate);
-          updated.periodicCertifiedValue = round2(updated.certifiedValue - prevCertValue);
-          updated.periodicCertifiedPercent = round2(p - prevCertPercent);
-        } else if (field === 'periodicCertifiedPercent') {
-          const p = round2(newValue);
-          updated.periodicCertifiedPercent = p;
-          updated.periodicCertifiedQty = round2((p / 100) * qty);
-          updated.certifiedQty = round2(prevCertQty + updated.periodicCertifiedQty);
-          updated.certifiedPercent = round2(prevCertPercent + p);
-          updated.periodicCertifiedValue = round2(updated.periodicCertifiedQty * rate);
-          updated.certifiedValue = round2(updated.certifiedQty * rate);
-        } else if (field === 'certifiedValue') {
-          const v = round2(newValue);
-          updated.certifiedValue = v;
-          updated.periodicCertifiedValue = round2(v - prevCertValue);
-          updated.certifiedQty = rate > 0 ? round2(v / rate) : 0;
-          updated.periodicCertifiedQty = round2(updated.certifiedQty - prevCertQty);
-          updated.certifiedPercent = round2((qty > 0) ? (updated.certifiedQty / qty) * 100 : 0);
-          updated.periodicCertifiedPercent = round2(updated.certifiedPercent - prevCertPercent);
-        } else if (field === 'periodicCertifiedValue') {
-          const v = round2(newValue);
-          updated.periodicCertifiedValue = v;
-          updated.certifiedValue = round2(prevCertValue + v);
-          updated.periodicCertifiedQty = rate > 0 ? round2(v / rate) : 0;
-          updated.certifiedQty = round2(prevCertQty + updated.periodicCertifiedQty);
-          updated.periodicCertifiedPercent = round2((qty > 0) ? (updated.periodicCertifiedQty / qty) * 100 : 0);
-          updated.certifiedPercent = round2(prevCertPercent + updated.periodicCertifiedPercent);
-        }
-        
-        return updated;
-      }
-      return item;
-    });
-
-    const newTotal = updatedItems.reduce((sum, item) => sum + (item.claimValue || 0), 0);
-    const newCertifiedTotal = updatedItems.reduce((sum, item) => sum + (item.certifiedValue || 0), 0);
-
+    const field = colDef.field;
     try {
-      await updateDoc(doc(db, 'invoices', selectedInvoiceId), {
-        items: updatedItems,
-        totalAmount: newTotal,
-        certifiedAmount: newCertifiedTotal,
-        updatedAt: new Date().toISOString()
-      });
-      // Force grid refresh to update styles of non-edited cells
+      if (field === 'commentary') {
+        await updateInvoiceItem(data.id, { commentary: newValue ?? '' } as any);
+      } else {
+        // Editing any one of the twelve claim / certification figures
+        // determines the other eleven. That derivation lives in the database
+        // now: it used to run in the browser, on a copy of the invoice this
+        // tab happened to be holding, and rewrite the whole item array.
+        await setInvoiceItemClaim(data.id, field, Number(newValue) || 0);
+      }
+      await reloadInvoiceItems();
+      // The invoice's and the subcontract's totals follow by trigger.
+      await reloadInvoices();
       event.api.refreshCells({ rowNodes: [event.node] });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error updating invoice item:', error);
-      toast.error('Failed to update invoice item.');
+      toast.error(`Failed to update invoice item: ${error?.message || 'Unknown error'}`);
+      await reloadInvoiceItems();
     }
   };
 
@@ -1965,34 +1660,11 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     api.setColumnGroupState(newState);
   };
 
-  const lineItemInvoiceAggregates = useMemo(() => {
-    const aggregates: Record<string, { claimed: number, certified: number }> = {};
-    
-    // Group invoices by subcontract and sort by invoiceId numerically
-    const sortedInvoices = [...invoices].sort((a, b) => {
-      const aNo = parseInt(a.invoiceId?.replace(/\D/g, '') || '0');
-      const bNo = parseInt(b.invoiceId?.replace(/\D/g, '') || '0');
-      // Sort descending so the first invoice we see for a line item is the latest one
-      return bNo - aNo;
-    });
-
-    const processedLineItems = new Set<string>();
-
-    sortedInvoices.forEach(inv => {
-      (inv.items || []).forEach(item => {
-        const lineId = item.subcontractLineItemId;
-        // If we already processed the latest invoice for this line item, skip
-        if (processedLineItems.has(lineId)) return;
-        
-        aggregates[lineId] = { 
-          claimed: item.claimValue || 0, 
-          certified: item.certifiedValue || 0 
-        };
-        processedLineItems.add(lineId);
-      });
-    });
-    return aggregates;
-  }, [invoices]);
+  // Claimed and certified per line item, from subcontract_line_item_claim_position.
+  // Each invoice states the cumulative position, so the answer is the value on
+  // the latest invoice that mentions the item; the view works that out. This
+  // used to load every invoice in the project and walk them in date order.
+  const lineItemInvoiceAggregates = claimPositions;
 
   const phasingHistogramData = useMemo(() => {
     if (!selectedSubcontract || !project.reportingPeriods?.periods) return [];
@@ -2001,7 +1673,6 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     const currentPeriodId = project.reportingPeriods.currentPeriodId;
     const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
     
-    const lineItems = selectedSubcontract.lineItems || [];
     
     // Starting cumulative value is the sum of total claimed across all line items
     const initialClaimed = lineItems.reduce((sum, li) => {
@@ -2457,76 +2128,33 @@ export default function SubcontractManagement({ enterprise, project, user, theme
   const handleCalculateLineItemAutoPhasing = async () => {
     if (!selectedSubcontractId || !selectedSubcontract) return;
 
-    const selectedNodes = lineItemsGridRef.current?.api.getSelectedNodes();
-    const selectedRows = selectedNodes?.map(node => node.data) || [];
-    
-    let itemsToProcess = [];
-    if (selectedRows.length > 0) {
-      itemsToProcess = selectedRows.filter(r => r.phasingSource === 'Auto');
-      if (itemsToProcess.length === 0) {
-        toast.info("Selected items are not set to 'Auto' phasing source.");
-        return;
-      }
-    } else {
-      itemsToProcess = (selectedSubcontract.lineItems || []).filter(r => r.phasingSource === 'Auto');
-      if (itemsToProcess.length === 0) {
-        toast.info("No line items set to 'Auto' phasing source.");
-        return;
-      }
+    const selectedRows = (lineItemsGridRef.current?.api.getSelectedNodes() || []).map(n => n.data);
+    const scoped = selectedRows.length > 0;
+    const autoRows = (scoped ? selectedRows : lineItems).filter(r => r?.phasingSource === 'Auto');
+
+    if (autoRows.length === 0) {
+      toast.info(scoped
+        ? "Selected items are not set to 'Auto' phasing source."
+        : "No line items set to 'Auto' phasing source.");
+      return;
     }
 
+    const toastId = toast.loading('Calculating phasing...');
     try {
-      const periods = project.reportingPeriods?.periods || [];
-      const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-      const currentPeriod = periods.find(p => p.id === currentPeriodId);
-      const currentPeriodEnd = currentPeriod ? new Date(currentPeriod.endDate) : null;
-      const currentIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
-      const nextPeriodStart = (currentIndex !== -1 && currentIndex < periods.length - 1) 
-        ? periods[currentIndex + 1].startDate 
-        : null;
-
-      const updatedLineItems = (selectedSubcontract.lineItems || []).map(li => {
-        const targetItem = itemsToProcess.find(item => item.id === li.id);
-        if (targetItem && li.startDate && li.endDate && li.distribution) {
-          const total = (li.qty || 0) * (li.rate || 0);
-          const claimedValue = lineItemInvoiceAggregates[li.id]?.claimed || 0;
-          const remainingToClaim = Math.max(0, total - claimedValue);
-          
-          let effectiveStartDate = li.startDate;
-          if (currentPeriodEnd && nextPeriodStart) {
-            const userStart = new Date(li.startDate);
-            if (userStart <= currentPeriodEnd) {
-              effectiveStartDate = nextPeriodStart;
-            }
-          }
-
-          const newPhasing = calculatePhasing(
-            remainingToClaim,
-            effectiveStartDate,
-            li.endDate,
-            li.distribution,
-            periods,
-            li.periodValues
-          );
-
-          return {
-            ...li,
-            periodValues: newPhasing,
-            updatedAt: new Date().toISOString()
-          };
-        }
-        return li;
-      });
-
-      await updateDoc(doc(db, 'subcontracts', selectedSubcontractId), {
-        lineItems: updatedLineItems,
-        updatedAt: new Date().toISOString()
-      });
-
-      toast.success(`Recalculated phasing for ${itemsToProcess.length} line item(s).`);
-    } catch (error) {
+      // The whole calculation is one statement in the database: which periods
+      // each item's dates touch, the weight per period for its distribution
+      // curve, and the value still to claim. It used to run in the browser and
+      // rewrite every line item on the order for one button press.
+      const phased = await applyLineItemPhasing(
+        selectedSubcontractId,
+        scoped ? autoRows.map(r => r.id) : undefined
+      );
+      await reloadLineItems();
+      toast.success(`Recalculated phasing for ${phased} line item(s).`, { id: toastId });
+    } catch (error: any) {
+      toast.dismiss(toastId);
       console.error('Error calculating auto phasing:', error);
-      toast.error('Failed to calculate auto phasing.');
+      toast.error(`Failed to calculate auto phasing: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -3029,7 +2657,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
             valueGetter: (params: any) => {
               if (periodIndex <= currentPeriodIndex && params.node?.rowPinned !== 'top') return 0;
               if (params.node?.rowPinned === 'top') {
-                return (selectedSubcontract?.lineItems || []).reduce((sum, li) => sum + (li.periodValues?.[p.id] || 0), 0);
+                return lineItems.reduce((sum, li) => sum + (li.periodValues?.[p.id] || 0), 0);
               }
               return params.data.periodValues?.[p.id] || 0;
             },
@@ -3065,14 +2693,15 @@ export default function SubcontractManagement({ enterprise, project, user, theme
           <button 
             onClick={async () => {
               if (!window.confirm('Delete this line item?')) return;
-              const updatedItems = (selectedSubcontract?.lineItems || []).filter(i => i.id !== params.data.id);
-              const newTotal = updatedItems.reduce((sum, i) => sum + (i.total || 0), 0);
-              await updateDoc(doc(db, 'subcontracts', selectedSubcontractId!), {
-                lineItems: updatedItems,
-                totalAmount: newTotal,
-                updatedAt: new Date().toISOString()
-              });
-              toast.success('Line item deleted.');
+              try {
+                // One row. The subcontract's total follows by trigger.
+                await deleteLineItems([params.data.id]);
+                await reloadLineItems();
+                toast.success('Line item deleted.');
+              } catch (error: any) {
+                console.error('Error deleting line item:', error);
+                toast.error(`Failed to delete line item: ${error?.message || 'Unknown error'}`);
+              }
             }}
             className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
           >
@@ -3092,7 +2721,6 @@ export default function SubcontractManagement({ enterprise, project, user, theme
     const currentPeriodId = project.reportingPeriods?.currentPeriodId;
     const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
 
-    const lineItems = selectedSubcontract.lineItems || [];
     const totalContract = lineItems.reduce((sum, li) => sum + (li.total || 0), 0);
     const totalClaimed = lineItems.reduce((sum, li) => sum + (lineItemInvoiceAggregates[li.id]?.claimed || 0), 0);
     const totalCertified = lineItems.reduce((sum, li) => sum + (lineItemInvoiceAggregates[li.id]?.certified || 0), 0);
@@ -3621,7 +3249,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
                     <AgGridReact
                       key="lineItemsGrid"
                       ref={lineItemsGridRef}
-                      rowData={selectedSubcontract?.lineItems || []}
+                      rowData={lineItems}
                       columnDefs={lineItemColumnDefs}
                       pinnedTopRowData={lineItemPinnedTopRowData}
                       getRowClass={(params) => {
