@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Project, ProjectAttribute, ProjectAttributeValue } from '../types';
-import { db } from '../firebase';
-import { doc, updateDoc } from 'firebase/firestore';
+import { updateProjectAttributeSet } from '../lib/projectSettings';
 import { 
   Plus, 
   Trash2, 
@@ -73,7 +72,7 @@ const ProjectCostCodeAttributes: React.FC<ProjectCostCodeAttributesProps> = ({ p
 
   const handleGlobalSave = async (updatedAttrs: ProjectAttribute[]) => {
     try {
-      await updateDoc(doc(db, 'projects', project.id), { costCodeAttributes: updatedAttrs });
+      await updateProjectAttributeSet(project.id, 'costCodeAttributes', updatedAttrs);
     } catch (error) {
       console.error('Error saving cost code attributes:', error);
       toast.error('Failed to save changes.');
