@@ -1006,14 +1006,24 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     return () => { active = false; };
   }, [isResourceModalOpen, project.id]);
 
+  // ONE definition of "which library is showing". The picker, its select-all
+  // check and the Add to Forecast button each resolved this for themselves,
+  // and when the project library moved out of project.resourceRates only the
+  // picker was updated -- so the list showed resources the button could not
+  // see, and Add to Forecast silently did nothing.
+  const currentResourceLibrary = useMemo(
+    () => resourceLibrarySource === 'enterprise'
+      ? (enterprise.resourceRates ?? [])
+      : projectResources,
+    [resourceLibrarySource, enterprise.resourceRates, projectResources]
+  );
+
   const groupedLibraryResources = useMemo(() => {
     // The project library is loaded from project_resource_rates rather than
     // read off the project object: it used to be an array stored on the
     // project row, and nothing hydrates it any more, so the project tab of
     // this picker was always empty.
-    const library = resourceLibrarySource === 'enterprise'
-      ? (enterprise.resourceRates ?? [])
-      : projectResources;
+    const library = currentResourceLibrary;
     const term = resourceSearch.toLowerCase();
     const filtered = library.filter(r =>
       r.name.toLowerCase().includes(term) ||
@@ -1031,7 +1041,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
     }, {} as Record<string, typeof filtered>);
 
     return Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b));
-  }, [resourceLibrarySource, enterprise.resourceRates, projectResources, resourceSearch]);
+  }, [currentResourceLibrary, resourceSearch]);
 
   const handleAddResources = async (resources: any[], source: 'enterprise' | 'project' = 'enterprise') => {
     if (resources.length === 0) return;
@@ -1444,7 +1454,12 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           headerName: 'Calendar',
           width: 150,
           columnGroupShow: 'open',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase',
+          // Not gated on Method. AG Grid skips non-editable cells on BOTH paste
+          // and the fill handle, silently -- so copying a value into a row
+          // still set to Manual appeared to do nothing. These fields are
+          // simply unused while Method is Manual; the cellClass below still
+          // greys them so it is clear when they do not apply.
+          editable: true,
           cellEditor: 'agSelectCellEditor',
           cellEditorParams: {
             values: [null, ...calendars.map(c => c.id)],
@@ -1592,7 +1607,12 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           headerName: 'Phasing Unit',
           width: 120,
           columnGroupShow: 'open',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase',
+          // Not gated on Method. AG Grid skips non-editable cells on BOTH paste
+          // and the fill handle, silently -- so copying a value into a row
+          // still set to Manual appeared to do nothing. These fields are
+          // simply unused while Method is Manual; the cellClass below still
+          // greys them so it is clear when they do not apply.
+          editable: true,
           cellEditor: 'agSelectCellEditor',
           cellEditorParams: {
             values: ['Daily', 'Weekly', 'Monthly', 'Total', 'Profile']
@@ -1605,7 +1625,12 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           width: 110,
           columnGroupShow: 'open',
           type: 'numericColumn',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase',
+          // Not gated on Method. AG Grid skips non-editable cells on BOTH paste
+          // and the fill handle, silently -- so copying a value into a row
+          // still set to Manual appeared to do nothing. These fields are
+          // simply unused while Method is Manual; the cellClass below still
+          // greys them so it is clear when they do not apply.
+          editable: true,
           valueFormatter: (params) => formatNumber(params.value, 2),
           cellClass: (params) => params.data.phasingMethod === 'Auto-Phase' ? 'bg-white dark:bg-transparent' : 'bg-gray-100 dark:bg-white/5 text-gray-400'
         }
@@ -1867,6 +1892,19 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           },
           processCellFromClipboard: (params: any) => {
             const colId = params.column.getColId();
+            if (colId === 'calendarId') {
+              // The cell stores a calendar id but displays its name, and AG
+              // Grid copies what is displayed. Map the name back rather than
+              // writing it into a uuid column.
+              const text = String(params.value ?? '').trim();
+              if (!text || text === 'None') return null;
+              const byId = calendars.find((c: any) => c.id === text);
+              if (byId) return byId.id;
+              const byName = calendars.find(
+                (c: any) => c.name.toLowerCase() === text.toLowerCase()
+              );
+              return byName ? byName.id : params.value;
+            }
             if (colId === 'phasingStartDate' || colId === 'phasingEndDate') {
               // This grid had no clipboard handling at all, so pasting the
               // dd/mm/yyyy dates it renders was either refused ('17/09/2026'
@@ -2166,7 +2204,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
             <Button 
               disabled={selectedResourceIds.size === 0}
               onClick={() => {
-                const library = resourceLibrarySource === 'enterprise' ? enterprise.resourceRates : project.resourceRates;
+                const library = currentResourceLibrary;
                 const selected = library?.filter(r => selectedResourceIds.has(r.id)) || [];
                 handleAddResources(selected, resourceLibrarySource);
               }}

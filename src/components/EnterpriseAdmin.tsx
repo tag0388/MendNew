@@ -5,7 +5,7 @@ import { fetchSavedViews, createSavedView, deleteSavedView } from '../lib/savedV
 import {
   updateAttributeSet, updateEnterpriseProfile,
   upsertVendor, deleteVendors as deleteVendorRows,
-  upsertResourceRate, deleteResourceRates, importResourceRates,
+  upsertResourceRate, deleteResourceRates, importResourceRates, fetchResourceRates,
   type AttributeSet,
 } from '../lib/enterpriseSettings';
 import {
@@ -18,7 +18,7 @@ import {
   type ProjectMember,
 } from '../lib/projects';
 import { fetchProjects } from '../lib/session';
-import { Enterprise, Project, ProjectAttribute, ProjectAttributeValue, SavedView } from '../types';
+import { Enterprise, Project, ProjectAttribute, ProjectAttributeValue, SavedView, ResourceRate} from '../types';
 import { Users, Briefcase, Settings, Plus, Trash2, Tag, Search, X, ChevronRight, ChevronDown, UserPlus, ExternalLink, AlertTriangle, Edit2, Download, Upload, Eye, Lock, Unlock, MoreVertical, Bookmark, Filter, Layout, CheckCircle2, PieChart, DollarSign, RefreshCw, Receipt, Calendar, Hash, Menu, ChevronLeft, Building2, ShieldAlert, ShoppingCart, Activity } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
@@ -208,8 +208,10 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const [valueFormData, setValueFormData] = useState({ id: '', description: '', sortOrder: '' as any });
   const [costElementFormData, setCostElementFormData] = useState({ id: '', description: '', sortCode: '' });
   const [vendorFormData, setVendorFormData] = useState({ id: '', name: '', code: '', contactEmail: '', contactName: '' });
-  const [resourceFormData, setResourceFormData] = useState({ 
-    id: '', 
+  const [resourceFormData, setResourceFormData] = useState({
+    // The code people type ("LAB-01"). The row's uuid is the database's and
+    // never appears in this form.
+    code: '',
     name: '', 
     unit: '', 
     rate: 0, 
@@ -296,6 +298,24 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   };
 
   const currentUserId = getCurrentUser()?.uid ?? null;
+
+  // The enterprise prop is hydrated once when the enterprise is loaded, so a
+  // resource added here had nothing to refresh from and the grid stayed stale.
+  // Held locally and re-read after each write, the same way the project-level
+  // library works.
+  const [resourceRates, setResourceRates] = useState<ResourceRate[]>(enterprise.resourceRates ?? []);
+
+  const reloadEnterprise = useCallback(async () => {
+    try {
+      setResourceRates(await fetchResourceRates(enterprise.id));
+    } catch (error) {
+      console.error('Failed to reload resource rates', error);
+    }
+  }, [enterprise.id]);
+
+  useEffect(() => {
+    void reloadEnterprise();
+  }, [reloadEnterprise]);
 
   const reloadSavedViews = useCallback(async () => {
     if (!currentUserId) return;
@@ -399,7 +419,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     return result as ProjectAttribute[];
   };
 
-  const resourceIdExists = !isSubmitting && !isEditingResource?.id && (enterprise.resourceRates || []).some(r => r.id === resourceFormData.id);
+  const resourceIdExists = !isSubmitting && !isEditingResource?.id && resourceRates.some(r => r.code === resourceFormData.code);
   const valueIdExists = !isSubmitting && !isEditingValue?.valueId && isEditingValue && (getAttributes(isEditingValue.type).find(a => a.id === isEditingValue.attrId)?.values || []).some(v => v.id === valueFormData.id);
 
   const reloadProjects = useCallback(async () => {
@@ -1294,9 +1314,10 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   ], [activeTab, selectedAttrId, enterprise]);
 
   const resourceRateColumnDefs = useMemo(() => [
-    { 
-      headerName: 'Resource ID', 
-      field: 'id', 
+    {
+      headerName: 'Resource ID',
+      // The code, not the row's uuid.
+      field: 'code',
       width: 150, 
       pinned: 'left',
       lockPosition: 'left',
@@ -1702,27 +1723,41 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const addResourceRate = async (resource: any, index?: number) => {
     try {
       setIsSubmitting(true);
-      const currentResources = [...(enterprise.resourceRates || [])];
-      if (currentResources.some(r => r.id === resource.id)) {
-        alert(`Resource ID "${resource.id}" already exists.`);
-        setIsSubmitting(false);
-        return;
-      }
+      const currentResources = [...resourceRates];
+      // The typed value is the CODE. It used to be sent as the row's id,
+      // which Postgres rejected as an invalid uuid -- and the failure was only
+      // logged to the console, so adding an enterprise resource appeared to do
+      // nothing at all. The uuid is the database's to assign.
       await upsertResourceRate(enterprise.id, {
         ...resource,
+        id: undefined,
         name: resource.name.trim() || 'Resource Name',
         sortOrder: typeof index === 'number' ? index : currentResources.length,
       });
-    } catch (error) {
+      await reloadEnterprise();
+      toast.success('Resource added');
+    } catch (error: any) {
       console.error('Failed to add resource rate', error);
+      toast.error(
+        error?.code === '23505'
+          ? `Resource ID "${resource.code}" already exists in this enterprise.`
+          : `Failed to add resource: ${error?.message || 'Unknown error'}`
+      );
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const updateResourceRate = async (id: string, updates: any) => {
-    const existing = (enterprise.resourceRates || []).find(r => r.id === id);
-    await upsertResourceRate(enterprise.id, { ...existing, ...updates, id } as any);
+    try {
+      const existing = resourceRates.find(r => r.id === id);
+      await upsertResourceRate(enterprise.id, { ...existing, ...updates, id } as any);
+      await reloadEnterprise();
+      toast.success('Resource updated');
+    } catch (error: any) {
+      console.error('Failed to update resource rate', error);
+      toast.error(`Failed to update resource: ${error?.message || 'Unknown error'}`);
+    }
   };
 
   const updateVendor = async (id: string, updates: any) => {
@@ -2260,14 +2295,14 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                 title="Resource Rates"
                 description="Manage global resource rates and unit costs."
                 onAdd={() => {
-                  setResourceFormData({ id: '', name: '', unit: '', rate: 0, category: '', udf1: '', udf2: '', udf3: '' });
+                  setResourceFormData({ code: '', name: '', unit: '', rate: 0, category: '', udf1: '', udf2: '', udf3: '' });
                   setIsEditingResource({ id: null });
                 }}
                 gridRef={resourceRatesGridRef}
                 searchPlaceholder="Search resources..."
                 quickFilterText={resourceSearch}
                 onQuickFilterChange={setResourceSearch}
-                rowData={enterprise.resourceRates || []}
+                rowData={resourceRates}
                 columnDefs={resourceRateColumnDefs}
                 theme={document.documentElement.classList.contains('dark') ? 'dark' : 'light'}
                 onCellValueChanged={(event) => {
@@ -2885,8 +2920,8 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                     disabled={!!isEditingResource.id}
                     type="text"
                     maxLength={20}
-                    value={resourceFormData.id}
-                    onChange={e => setResourceFormData({ ...resourceFormData, id: e.target.value })}
+                    value={resourceFormData.code}
+                    onChange={e => setResourceFormData({ ...resourceFormData, code: e.target.value })}
                     className={cn(
                       "w-full p-4 bg-gray-50 dark:bg-white/5 border rounded-2xl text-sm focus:outline-none focus:ring-2 dark:text-white disabled:opacity-50 transition-all",
                       resourceIdExists 
@@ -2983,7 +3018,7 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                 </button>
                 <button 
                   type="submit"
-                  disabled={!resourceFormData.id || resourceIdExists}
+                  disabled={!resourceFormData.code.trim() || resourceIdExists}
                   className="flex-1 py-4 bg-black dark:bg-white text-white dark:text-black rounded-2xl text-sm font-bold uppercase tracking-widest hover:bg-black/90 dark:hover:bg-white/90 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   {isEditingResource.id ? 'Update' : 'Add'}

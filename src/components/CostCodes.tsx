@@ -708,14 +708,24 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     return () => { active = false; };
   }, [isResourceModalOpen, project.id]);
 
+  // ONE definition of "which library is showing". The picker, its select-all
+  // check and the Add to Forecast button each resolved this for themselves,
+  // and when the project library moved out of project.resourceRates only the
+  // picker was updated -- so the list showed resources the button could not
+  // see, and Add to Forecast silently did nothing.
+  const currentResourceLibrary = useMemo(
+    () => resourceLibrarySource === 'enterprise'
+      ? (enterprise.resourceRates ?? [])
+      : projectResources,
+    [resourceLibrarySource, enterprise.resourceRates, projectResources]
+  );
+
   const groupedLibraryResources = useMemo(() => {
     // The project library is loaded from project_resource_rates rather than
     // read off the project object: it used to be an array stored on the
     // project row, and nothing hydrates it any more, so the project tab of
     // this picker was always empty.
-    const library = resourceLibrarySource === 'enterprise'
-      ? (enterprise.resourceRates ?? [])
-      : projectResources;
+    const library = currentResourceLibrary;
     const term = resourceSearch.toLowerCase();
     const filtered = library.filter(r =>
       r.name.toLowerCase().includes(term) ||
@@ -733,7 +743,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }, {} as Record<string, typeof filtered>);
 
     return Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b));
-  }, [resourceLibrarySource, enterprise.resourceRates, projectResources, resourceSearch]);
+  }, [currentResourceLibrary, resourceSearch]);
 
   // Fetch ETC Details
   // Hoisted so the write handlers can refresh after their own writes rather
@@ -2266,7 +2276,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           headerName: 'Calendar',
           width: 150,
           columnGroupShow: 'open',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase',
+          // Not gated on Method. AG Grid skips non-editable cells on BOTH paste
+          // and the fill handle, silently -- so copying a value into a row
+          // still set to Manual appeared to do nothing. These fields are
+          // simply unused while Method is Manual; the cellClass below still
+          // greys them so it is clear when they do not apply.
+          editable: true,
           cellEditor: 'agSelectCellEditor',
           cellEditorParams: {
             values: [null, ...calendars.map(c => c.id)],
@@ -2382,7 +2397,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           headerName: 'Phasing Unit',
           width: 120,
           columnGroupShow: 'open',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase',
+          // Not gated on Method. AG Grid skips non-editable cells on BOTH paste
+          // and the fill handle, silently -- so copying a value into a row
+          // still set to Manual appeared to do nothing. These fields are
+          // simply unused while Method is Manual; the cellClass below still
+          // greys them so it is clear when they do not apply.
+          editable: true,
           cellEditor: 'agSelectCellEditor',
           cellEditorParams: {
             values: ['Daily', 'Weekly', 'Monthly', 'Total', 'Profile']
@@ -2395,7 +2415,12 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           width: 110,
           columnGroupShow: 'open',
           type: 'numericColumn',
-          editable: (params) => params.data.phasingMethod === 'Auto-Phase',
+          // Not gated on Method. AG Grid skips non-editable cells on BOTH paste
+          // and the fill handle, silently -- so copying a value into a row
+          // still set to Manual appeared to do nothing. These fields are
+          // simply unused while Method is Manual; the cellClass below still
+          // greys them so it is clear when they do not apply.
+          editable: true,
           valueFormatter: (params) => formatNumber(params.value, 2),
           cellClass: (params) => params.data.phasingMethod === 'Auto-Phase' ? 'bg-white dark:bg-transparent' : 'bg-gray-100 dark:bg-white/5 text-gray-400'
         }
@@ -4647,6 +4672,23 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                   suppressClipboardPaste={false}
                   processCellFromClipboard={(params) => {
                     const colId = params.column.getColId();
+                    if (colId === 'calendarId') {
+                      // The cell stores a calendar id but DISPLAYS its name,
+                      // and AG Grid copies what is displayed. Pasting the name
+                      // straight back would put "Site 5-day" into a uuid
+                      // column. Map it back; accept an id unchanged so a
+                      // paste between two grids still works.
+                      const text = String(params.value ?? '').trim();
+                      if (!text || text === 'None') return null;
+                      const byId = calendars.find(c => c.id === text);
+                      if (byId) return byId.id;
+                      const byName = calendars.find(
+                        c => c.name.toLowerCase() === text.toLowerCase()
+                      );
+                      // An unknown name leaves the cell alone rather than
+                      // writing something the column cannot hold.
+                      return byName ? byName.id : params.value;
+                    }
                     if (colId === 'phasingStartDate' || colId === 'phasingEndDate') {
                       // Shared with the bulk screen, and tested: the grids
                       // render dd/mm/yyyy, which JavaScript's Date either
@@ -5787,7 +5829,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                       size="sm"
                       className="h-10 px-4 font-bold rounded-xl border hover:bg-gray-50 dark:hover:bg-white/5 transition-all text-xs"
                       onClick={() => {
-                        const library = resourceLibrarySource === 'enterprise' ? enterprise.resourceRates : project.resourceRates;
+                        const library = currentResourceLibrary;
                         const filtered = library?.filter(r => 
                           r.name.toLowerCase().includes(resourceSearch.toLowerCase()) ||
                           r.id.toLowerCase().includes(resourceSearch.toLowerCase()) ||
@@ -5800,9 +5842,9 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                         }
                       }}
                     >
-                      {selectedResourceIds.size > 0 && selectedResourceIds.size === ((resourceLibrarySource === 'enterprise' ? enterprise.resourceRates : project.resourceRates)?.filter(r => 
+                      {selectedResourceIds.size > 0 && selectedResourceIds.size === (currentResourceLibrary.filter(r =>
                         r.name.toLowerCase().includes(resourceSearch.toLowerCase()) ||
-                        r.id.toLowerCase().includes(resourceSearch.toLowerCase()) ||
+                        (r.code ?? '').toLowerCase().includes(resourceSearch.toLowerCase()) ||
                         r.category?.toLowerCase().includes(resourceSearch.toLowerCase())
                       ).length || 0) ? 'Deselect All' : 'Select All'}
                     </Button>
@@ -5956,7 +5998,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
                     </Button>
                     <Button 
                       onClick={() => {
-                        const library = resourceLibrarySource === 'enterprise' ? enterprise.resourceRates : project.resourceRates;
+                        const library = currentResourceLibrary;
                         const selected = library?.filter(r => selectedResourceIds.has(r.id)) || [];
                         handleAddResources(selected, resourceLibrarySource);
                       }}
