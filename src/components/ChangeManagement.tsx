@@ -1,18 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { supabase, subscribeToTable, raise } from '../lib/supabase';
+import { fetchCostCodes } from '../lib/costCodes';
+import {
+  fetchChanges, createChange, updateChange, deleteChanges, importChanges,
+  fetchChangeRecords, upsertChangeRecords, updateChangeRecord,
+  deleteChangeRecords, bulkUpdateChangeRecords,
+} from '../lib/changes';
 import { Project, Enterprise, Change, ChangeRecord, CostCode } from '../types';
-import { db, auth } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  getDocs,
-  writeBatch,
-  doc,
-  updateDoc,
-  addDoc,
-  deleteDoc
-} from 'firebase/firestore';
 import { 
   Search, 
   Plus, 
@@ -102,57 +96,6 @@ import {
   SelectValue 
 } from '@/components/ui/select';
 
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId: string | undefined;
-    email: string | null | undefined;
-    emailVerified: boolean | undefined;
-    isAnonymous: boolean | undefined;
-    tenantId: string | null | undefined;
-    providerInfo: {
-      providerId: string;
-      displayName: string | null;
-      email: string | null;
-      photoUrl: string | null;
-    }[];
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData.map(provider => ({
-        providerId: provider.providerId,
-        displayName: provider.displayName,
-        email: provider.email,
-        photoUrl: provider.photoURL
-      })) || []
-    },
-    operationType,
-    path
-  }
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  toast.error(`Database Error: ${errInfo.error}`);
-  throw new Error(JSON.stringify(errInfo));
-}
 
 interface ChangeManagementProps {
   project: Project;
@@ -283,50 +226,57 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
     setTheme(root.classList.contains('dark') ? 'dark' : 'light');
   }, []);
 
-  // Fetch Changes
-  useEffect(() => {
-    const q = query(collection(db, 'changes'), where('projectId', '==', project.id));
-    const unsub = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Change));
-      setChanges(data);
+  // Hoisted so the write handlers can refresh after their own writes rather
+  // than waiting for a change broadcast to tell them what they just did.
+  const reloadChanges = useCallback(async () => {
+    try {
+      setChanges(await fetchChanges(project.id));
+    } catch (error: any) {
+      console.error('ChangeManagement: changes fetch error:', error);
+      toast.error(`Failed to load changes: ${error?.message || 'Unknown error'}`);
+    } finally {
       setIsLoading(false);
-    }, (error) => {
-      console.error("ChangeManagement: changes fetch error:", error);
-      toast.error("Failed to load changes: " + error.message);
-      setIsLoading(false);
-    });
-    return () => unsub();
+    }
   }, [project.id]);
 
-  // Fetch Change Records for selected change
   useEffect(() => {
+    void reloadChanges();
+    return subscribeToTable('changes', `project_id=eq.${project.id}`, () => void reloadChanges());
+  }, [reloadChanges, project.id]);
+
+  const reloadChangeRecords = useCallback(async () => {
     if (!selectedChangeId) {
       setChangeRecords([]);
       return;
     }
-    const q = query(
-      collection(db, 'changeRecords'), 
-      where('projectId', '==', project.id),
-      where('changeId', '==', selectedChangeId)
-    );
-    const unsub = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ChangeRecord));
-      setChangeRecords(data);
-    }, (error) => {
-      console.error("ChangeManagement: change records fetch error:", error);
-      toast.error("Failed to load change records: " + error.message);
-    });
-    return () => unsub();
-  }, [selectedChangeId]);
+    try {
+      setChangeRecords(await fetchChangeRecords(project.id, { changeId: selectedChangeId }));
+    } catch (error: any) {
+      console.error('ChangeManagement: change records fetch error:', error);
+      toast.error(`Failed to load change records: ${error?.message || 'Unknown error'}`);
+    }
+  }, [project.id, selectedChangeId]);
 
-  // Fetch Cost Codes for dropdown
   useEffect(() => {
-    const q = query(collection(db, 'costCodes'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as CostCode));
-      setCostCodes(data.sort((a, b) => a.sortOrder - b.sortOrder));
-    });
-    return () => unsubscribe();
+    void reloadChangeRecords();
+    if (!selectedChangeId) return;
+    // Filtered by the database, not by downloading the project's records.
+    return subscribeToTable('change_records', `change_id=eq.${selectedChangeId}`, () => void reloadChangeRecords());
+  }, [reloadChangeRecords, selectedChangeId]);
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const rows = await fetchCostCodes(project.id);
+        if (active) setCostCodes(rows);
+      } catch (error) {
+        console.error('ChangeManagement: cost codes fetch error:', error);
+      }
+    };
+    void load();
+    const unsubscribe = subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void load());
+    return () => { active = false; unsubscribe(); };
   }, [project.id]);
 
   const handleCreateChange = async (e: React.FormEvent) => {
@@ -367,7 +317,8 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         updatedAt: new Date().toISOString()
       };
 
-      await addDoc(collection(db, 'changes'), changeData);
+      await createChange(project.id, changeData as any);
+      await reloadChanges();
       toast.success("Change created successfully");
       setIsCreateChangeOpen(false);
       setNewChange({
@@ -378,24 +329,26 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         reference: '',
         periodId: ''
       });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, 'changes');
+    } catch (error: any) {
+      console.error('Error creating change:', error);
+      // (project_id, change_id) is unique, so a duplicate reference is caught
+      // by the database even when two people submit the same one at once.
+      toast.error(
+        error?.code === '23505'
+          ? `Change ID "${newChange.changeId}" already exists in this project.`
+          : `Failed to create change: ${error?.message || 'Unknown error'}`
+      );
     }
   };
 
   const handleDeleteChange = async () => {
     if (!changeToDelete) return;
     try {
-      const batch = writeBatch(db);
-      
-      // Delete all child records
-      const recordsSnap = await getDocs(query(collection(db, 'changeRecords'), where('changeId', '==', changeToDelete.id)));
-      recordsSnap.docs.forEach(d => batch.delete(d.ref));
-      
-      // Delete the change itself
-      batch.delete(doc(db, 'changes', changeToDelete.id));
-      
-      await batch.commit();
+      // The records go with the change by cascade. Deleting them here first
+      // and then the change was two steps that could half-commit, leaving
+      // records pointing at a change that no longer existed.
+      await deleteChanges([changeToDelete.id]);
+      await reloadChanges();
       toast.success("Change and associated records deleted");
       setIsDeleteChangeOpen(false);
       setChangeToDelete(null);
@@ -405,29 +358,26 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         next.delete(changeToDelete.id);
         return next;
       });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, 'changes');
+    } catch (error: any) {
+      console.error('Error deleting change:', error);
+      toast.error(`Failed to delete change: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleBulkDelete = async () => {
     if (selectedIds.size === 0) return;
     try {
-      const batch = writeBatch(db);
-      for (const id of selectedIds) {
-        // Delete child records
-        const recordsSnap = await getDocs(query(collection(db, 'changeRecords'), where('changeId', '==', id)));
-        recordsSnap.docs.forEach(d => batch.delete(d.ref));
-        // Delete change
-        batch.delete(doc(db, 'changes', id));
-      }
-      await batch.commit();
+      // One statement. The old loop issued a query PER selected change to find
+      // its records, so deleting fifty changes was fifty round trips before
+      // the batch even committed; the cascade does it here.
+      await deleteChanges(Array.from(selectedIds));
+      await reloadChanges();
       toast.success(`Deleted ${selectedIds.size} changes`);
       setSelectedIds(new Set());
       setIsBulkDeleteOpen(false);
       if (selectedChangeId && selectedIds.has(selectedChangeId)) setSelectedChangeId(null);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, 'changes/bulk');
+    } catch (error: any) {
+      toast.error(`Operation failed: ${(error as any)?.message || 'Unknown error'}`);
     }
   };
 
@@ -524,7 +474,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         const ws = wb.Sheets[wsname];
         const data = XLSX.utils.sheet_to_json(ws) as any[];
 
-        const batch = writeBatch(db);
+        const rows: any[] = [];
         let addedCount = 0;
         let duplicateCount = 0;
 
@@ -559,9 +509,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
             }
           });
 
-          const newChangeRef = doc(collection(db, 'changes'));
-          batch.set(newChangeRef, {
-            projectId: project.id,
+          rows.push({
             changeId: changeId.slice(0, 20),
             description: row['Description'] || '',
             type: '',
@@ -572,21 +520,24 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
             eac: Number(row['EAC']) || 0,
             enterpriseAttributes: entAttrs,
             projectAttributes: prjAttrs,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
           });
           addedCount++;
         }
 
         if (addedCount > 0) {
-          await batch.commit();
-          toast.success(`Imported ${addedCount} changes. ${duplicateCount > 0 ? `${duplicateCount} duplicates skipped.` : ''}`);
+          // One statement for the whole sheet. Budget and EAC are not sent:
+          // they are derived from the change's records by trigger, so a
+          // spreadsheet cannot put a total on a change that its own records
+          // do not add up to.
+          const imported = await importChanges(project.id, rows);
+          await reloadChanges();
+          toast.success(`Imported ${imported} changes. ${duplicateCount > 0 ? `${duplicateCount} duplicates skipped.` : ''}`);
         } else if (duplicateCount > 0) {
           toast.warning(`No changes added. ${duplicateCount} duplicates found.`);
         }
-      } catch (error) {
-        toast.error("Failed to import Excel file");
-        console.error(error);
+      } catch (error: any) {
+        console.error('Failed to import changes', error);
+        toast.error(`Failed to import: ${error?.message || 'Unknown error'}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -625,46 +576,25 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
     if (selectedRecordIds.size === 0) return;
 
     try {
-      const batch = writeBatch(db);
-      const updates: any = {
-        updatedAt: new Date().toISOString()
-      };
-
-      if (bulkRecordUpdateData.costCodeId) updates.costCodeId = bulkRecordUpdateData.costCodeId;
-      if (bulkRecordUpdateData.scope) updates.scope = bulkRecordUpdateData.scope.slice(0, 100);
-      if (bulkRecordUpdateData.budgetAmount !== '') updates.budgetAmount = Number(bulkRecordUpdateData.budgetAmount);
-      if (bulkRecordUpdateData.eacAmount !== '') updates.eacAmount = Number(bulkRecordUpdateData.eacAmount);
-
-      // Add attributes to updates
-      Object.entries(bulkRecordUpdateData.enterpriseAttributes).forEach(([id, val]) => {
-        if (val !== undefined && val !== '') {
-          updates[`enterpriseAttributes.${id}`] = val;
-        }
-      });
-      Object.entries(bulkRecordUpdateData.projectAttributes).forEach(([id, val]) => {
-        if (val !== undefined && val !== '') {
-          updates[`projectAttributes.${id}`] = val;
-        }
+      // Merged server-side against each row's current attributes. The old code
+      // built dotted keys ("enterpriseAttributes.<id>"), a Firestore idiom for
+      // merging into a nested map that nothing in SQL reads -- those updates
+      // would simply have been lost.
+      const updated = await bulkUpdateChangeRecords(Array.from(selectedRecordIds), {
+        costCodeId: bulkRecordUpdateData.costCodeId || undefined,
+        scope: bulkRecordUpdateData.scope ? bulkRecordUpdateData.scope.slice(0, 100) : undefined,
+        budgetAmount: bulkRecordUpdateData.budgetAmount !== '' ? Number(bulkRecordUpdateData.budgetAmount) : undefined,
+        eacAmount: bulkRecordUpdateData.eacAmount !== '' ? Number(bulkRecordUpdateData.eacAmount) : undefined,
+        enterpriseAttributes: bulkRecordUpdateData.enterpriseAttributes,
+        projectAttributes: bulkRecordUpdateData.projectAttributes,
       });
 
-      selectedRecordIds.forEach(id => {
-        batch.update(doc(db, 'changeRecords', id), updates);
-      });
+      await reloadChangeRecords();
+      // The changes' budget and EAC totals follow by trigger; this only
+      // refreshes what the grid shows.
+      await reloadChanges();
 
-      await batch.commit();
-      
-      // Update parent totals for all affected changes
-      const affectedChangeIds = new Set<string>();
-      selectedRecordIds.forEach(id => {
-        const record = changeRecords.find(r => r.id === id);
-        if (record) affectedChangeIds.add(record.changeId);
-      });
-
-      for (const changeId of affectedChangeIds) {
-        await updateParentTotals(changeId);
-      }
-
-      toast.success(`Updated ${selectedRecordIds.size} records`);
+      toast.success(`Updated ${updated} record${updated === 1 ? '' : 's'}`);
       setIsBulkRecordUpdateOpen(false);
       setBulkRecordUpdateData({ 
         costCodeId: '', 
@@ -675,8 +605,9 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         projectAttributes: {}
       });
       setSelectedRecordIds(new Set());
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, 'changeRecords');
+    } catch (error: any) {
+      console.error('Error bulk updating change records:', error);
+      toast.error(`Failed to update records: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -694,9 +625,9 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         const ws = wb.Sheets[wsname];
         const data = XLSX.utils.sheet_to_json(ws) as any[];
 
-        const batch = writeBatch(db);
+        const recordRows: any[] = [];
         let addedCount = 0;
-        const affectedChangeIds = new Set<string>();
+        const unknownCodes = new Set<string>();
 
         for (const row of data) {
           const costCode = String(row['Cost Code'] || '').trim();
@@ -714,32 +645,40 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
             if (row[a.title]) prjAttrs[a.id] = String(row[a.title]);
           });
 
-          const newRecordRef = doc(collection(db, 'changeRecords'));
-          batch.set(newRecordRef, {
+          // The sheet holds the cost CODE; the column is a foreign key. An
+          // unrecognised code is reported rather than written as-is.
+          const resolved = costCodes.find(c => c.code === costCode);
+          if (!resolved) { unknownCodes.add(costCode); continue; }
+
+          recordRows.push({
             changeId: targetChangeId,
-            projectId: project.id,
-            costCodeId: costCode,
+            costCodeId: resolved.id,
             scope: String(row['Scope'] || '').slice(0, 100),
             enterpriseAttributes: entAttrs,
             projectAttributes: prjAttrs,
             budgetAmount: Number(row['Budget Amount']) || 0,
             eacAmount: Number(row['EAC Amount']) || 0,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
           });
           addedCount++;
-          affectedChangeIds.add(targetChangeId);
         }
 
         if (addedCount > 0) {
-          await batch.commit();
-          for (const cid of affectedChangeIds) {
-            await updateParentTotals(cid);
-          }
-          toast.success(`Imported ${addedCount} records`);
+          // One statement. The changes' totals follow by trigger, so there is
+          // no per-change recount loop afterwards.
+          const imported = await upsertChangeRecords(project.id, recordRows);
+          await reloadChangeRecords();
+          await reloadChanges();
+          toast.success(
+            unknownCodes.size > 0
+              ? `Imported ${imported} records. Skipped rows for unknown cost codes: ${Array.from(unknownCodes).join(', ')}`
+              : `Imported ${imported} records`
+          );
+        } else if (unknownCodes.size > 0) {
+          toast.error(`No records imported. Unknown cost codes: ${Array.from(unknownCodes).join(', ')}`);
         }
-      } catch (error) {
-        toast.error("Failed to import Excel file");
+      } catch (error: any) {
+        console.error('Failed to import change records', error);
+        toast.error(`Failed to import: ${error?.message || 'Unknown error'}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -751,25 +690,33 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
       toast.error("Please select a change first");
       return;
     }
+    if (costCodes.length === 0) {
+      toast.error("Create a cost code first -- a change record has to be against one.");
+      return;
+    }
     const toastId = toast.loading("Adding new record...");
     try {
-      const newRecord: Omit<ChangeRecord, 'id'> = {
+      const newRecord = {
         changeId: selectedChangeId,
-        projectId: project.id,
-        costCodeId: '',
+        // A record REFERENCES a cost code and cannot reference nothing, so a
+        // new row starts on the first cost code and is changed in the grid.
+        // It used to be created with an empty cost code, which the column
+        // cannot hold.
+        costCodeId: costCodes[0].id,
         scope: '',
         enterpriseAttributes: {},
         projectAttributes: {},
         budgetAmount: 0,
         eacAmount: 0,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
       };
-      await addDoc(collection(db, 'changeRecords'), newRecord);
+      await upsertChangeRecords(project.id, [newRecord as any]);
+      await reloadChangeRecords();
+      await reloadChanges();
       toast.success("Record added", { id: toastId });
-    } catch (error) {
+    } catch (error: any) {
       toast.dismiss(toastId);
-      handleFirestoreError(error, OperationType.WRITE, 'changeRecords');
+      console.error('Error adding change record:', error);
+      toast.error(`Failed to add record: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -809,9 +756,10 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         updates[colDef.field] = String(params.newValue).slice(0, 50);
       }
 
-      await updateDoc(doc(db, 'changes', data.id), updates);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `changes/${data.id}`);
+      await updateChange(data.id, updates);
+      await reloadChanges();
+    } catch (error: any) {
+      toast.error(`Operation failed: ${(error as any)?.message || 'Unknown error'}`);
     }
   };
 
@@ -841,33 +789,28 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
         updates.scope = String(params.newValue).slice(0, 100);
       }
 
-      await updateDoc(doc(db, 'changeRecords', data.id), updates);
+      await updateChangeRecord(data.id, updates);
+      await reloadChangeRecords();
+      // The change's totals follow by trigger.
+      await reloadChanges();
       
       // Update parent totals if amounts changed
       if (colDef.field === 'budgetAmount' || colDef.field === 'eacAmount') {
         updateParentTotals(data.changeId);
       }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `changeRecords/${data.id}`);
+    } catch (error: any) {
+      toast.error(`Operation failed: ${(error as any)?.message || 'Unknown error'}`);
     }
   };
 
-  const updateParentTotals = async (changeId: string) => {
-    try {
-      const recordsSnap = await getDocs(query(collection(db, 'changeRecords'), where('changeId', '==', changeId)));
-      const records = recordsSnap.docs.map(d => d.data() as ChangeRecord);
-      
-      const totalBudget = records.reduce((sum, r) => sum + (Number(r.budgetAmount) || 0), 0);
-      const totalEac = records.reduce((sum, r) => sum + (Number(r.eacAmount) || 0), 0);
-      
-      await updateDoc(doc(db, 'changes', changeId), {
-        budget: totalBudget,
-        eac: totalEac,
-        updatedAt: new Date().toISOString()
-      });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `changes/${changeId}/totals`);
-    }
+  // A change's budget and EAC are derived by a database trigger from its
+  // records, so there is nothing to recompute here. This used to read every
+  // record of the change back, sum them in the browser and write the totals
+  // onto the change -- which could leave a change showing a total that did
+  // not match its own records if it failed in between. Kept as a no-op
+  // refresh so callers still show the new totals.
+  const updateParentTotals = async (_changeId: string) => {
+    await reloadChanges();
   };
 
   const changeColumnDefs: (ColDef | ColGroupDef)[] = [
@@ -1152,7 +1095,9 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
             <button 
               onClick={async (e) => {
                 e.stopPropagation();
-                await deleteDoc(doc(db, 'changeRecords', p.data.id));
+                await deleteChangeRecords([p.data.id]);
+                await reloadChangeRecords();
+                await reloadChanges();
                 updateParentTotals(p.data.changeId);
               }}
               className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
@@ -1237,14 +1182,15 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
                   const newStatus = e.target.value;
                   if (!newStatus) return;
                   try {
-                    const batch = writeBatch(db);
-                    selectedIds.forEach(id => {
-                      batch.update(doc(db, 'changes', id), { 
-                        status: newStatus,
-                        updatedAt: new Date().toISOString()
-                      });
-                    });
-                    await batch.commit();
+                    // One statement for the whole selection. A status change
+                    // moves money in or out of every cost code the change
+                    // touches, since only Approved and Pending changes count.
+                    const { error } = await supabase
+                      .from('changes')
+                      .update({ status: newStatus })
+                      .in('id', Array.from(selectedIds));
+                    raise('update change status', error);
+                    await reloadChanges();
                     toast.success(`Updated ${selectedIds.size} changes to ${newStatus}`);
                     e.target.value = '';
                   } catch (error) {
@@ -1549,10 +1495,9 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
                     <button 
                       onClick={async () => {
                         if (confirm(`Delete ${selectedRecordIds.size} records?`)) {
-                          const batch = writeBatch(db);
-                          selectedRecordIds.forEach(id => batch.delete(doc(db, 'changeRecords', id)));
-                          await batch.commit();
-                          updateParentTotals(selectedChangeId);
+                          await deleteChangeRecords(Array.from(selectedRecordIds));
+                          await reloadChangeRecords();
+                          await reloadChanges();
                           setSelectedRecordIds(new Set());
                           toast.success(`Deleted ${selectedRecordIds.size} records`);
                         }
