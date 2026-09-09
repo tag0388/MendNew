@@ -1,7 +1,11 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Project, Enterprise, Subcontract, SubcontractLineItem, CostCode } from '../types';
-import { db } from '../firebase';
-import { collection, query, where, onSnapshot, doc, writeBatch, updateDoc } from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import { fetchCostCodes } from '../lib/costCodes';
+import {
+  fetchProjectLineItems, upsertLineItemsAcrossSubcontracts,
+  deleteLineItems, bulkUpdateLineItems, applyLineItemCellEdit,
+} from '../lib/subcontracts';
 import DataGridModule from './DataGridModule';
 import { ColDef, ColGroupDef, CellValueChangedEvent } from 'ag-grid-community';
 import toast from 'react-hot-toast';
@@ -38,7 +42,9 @@ interface FlattenedLineItem extends SubcontractLineItem {
 }
 
 const BulkSubcontractItems: React.FC<BulkSubcontractItemsProps> = ({ project, enterprise }) => {
-  const [subcontracts, setSubcontracts] = useState<Subcontract[]>([]);
+  // The grid's rows are line items, so it reads line items. It used to load
+  // every subcontract in the project and flatten their embedded arrays.
+  const [rowData, setRowData] = useState<FlattenedLineItem[]>([]);
   const [costCodes, setCostCodes] = useState<CostCode[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -58,38 +64,16 @@ const BulkSubcontractItems: React.FC<BulkSubcontractItemsProps> = ({ project, en
     if (!window.confirm(`Are you sure you want to delete ${selectedIds.length} items? This will remove them from their respective subcontracts.`)) return;
 
     try {
-      const batch = writeBatch(db);
-      const subcontractsToUpdate = new Map<string, Subcontract>();
-
-      selectedIds.forEach(id => {
-        const row = rowData.find(r => r.id === id);
-        if (!row) return;
-
-        let sub = subcontractsToUpdate.get(row.parentSubcontractId) || subcontracts.find(s => s.id === row.parentSubcontractId);
-        if (!sub) return;
-
-        if (!subcontractsToUpdate.has(row.parentSubcontractId)) {
-          sub = { ...sub!, lineItems: sub!.lineItems?.map(it => ({ ...it })) || [] };
-        }
-
-        sub!.lineItems = sub!.lineItems.filter(it => it.id !== id);
-        sub!.updatedAt = new Date().toISOString();
-        subcontractsToUpdate.set(row.parentSubcontractId, sub!);
-      });
-
-      for (const [id, updatedSub] of Array.from(subcontractsToUpdate.entries())) {
-        batch.update(doc(db, 'subcontracts', id), {
-          lineItems: updatedSub.lineItems,
-          updatedAt: updatedSub.updatedAt
-        });
-      }
-
-      await batch.commit();
+      // One statement. Each subcontract's total follows by trigger; this used
+      // to rebuild every affected subcontract's line item array in the browser
+      // and write the arrays back.
+      await deleteLineItems(selectedIds);
+      await reload();
       toast.success(`Deleted ${selectedIds.length} items.`);
       setSelectedIds([]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Bulk delete error:', error);
-      toast.error('Failed to delete items.');
+      toast.error(`Failed to delete items: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -153,207 +137,134 @@ const BulkSubcontractItems: React.FC<BulkSubcontractItemsProps> = ({ project, en
 
   const handleImportData = async (data: any[]) => {
     try {
-      const batch = writeBatch(db);
-      const subcontractsToUpdate = new Map<string, Subcontract>();
-      let updateCount = 0;
+      // A sheet row names its order and item number; those identify the row to
+      // update. Unmatched rows are reported rather than silently dropped.
+      const byKey = new Map<string, FlattenedLineItem>();
+      rowData.forEach(r => byKey.set(`${r.orderId}\u0000${r.itemNo}`, r));
+
+      const rows: any[] = [];
+      const unmatched: string[] = [];
 
       data.forEach(row => {
-        const orderId = row['Order ID'] || row['orderId'];
-        const itemNo = row['Item No'] || row['itemNo'];
+        const orderId = String(row['Order ID'] || row['orderId'] || '').trim();
+        const itemNo = String(row['Item No'] || row['itemNo'] || '').trim();
         if (!orderId || !itemNo) return;
 
-        // Find match in current subcontracts
-        const sub = subcontracts.find(s => s.orderId === orderId);
-        if (!sub) return;
+        const existing = byKey.get(`${orderId}\u0000${itemNo}`);
+        if (!existing) { unmatched.push(`${orderId} / ${itemNo}`); return; }
 
-        let updatedSub = subcontractsToUpdate.get(sub.id) || { ...sub, lineItems: sub.lineItems?.map(it => ({ ...it })) || [] };
-        
-        const itemIndex = updatedSub.lineItems.findIndex(it => it.itemNo === itemNo);
-        if (itemIndex === -1) return;
-
-        const originalItem = updatedSub.lineItems[itemIndex];
-        const updatedItem = { ...originalItem };
-
-        if (row['Description'] !== undefined) updatedItem.description = row['Description'];
-        if (row['Qty'] !== undefined) updatedItem.qty = Number(row['Qty']) || 0;
-        if (row['Unit'] !== undefined) updatedItem.unit = row['Unit'];
-        if (row['Rate'] !== undefined) updatedItem.rate = Number(row['Rate']) || 0;
-        if (row['Status'] !== undefined) updatedItem.status = row['Status'];
-        if (row['Type'] !== undefined) updatedItem.type = row['Type'];
-
-        // Recalculate total
-        updatedItem.total = (updatedItem.qty || 0) * (updatedItem.rate || 0);
-        updatedItem.updatedAt = new Date().toISOString();
-
-        updatedSub.lineItems[itemIndex] = updatedItem;
-        updatedSub.updatedAt = new Date().toISOString();
-        subcontractsToUpdate.set(sub.id, updatedSub);
-        updateCount++;
+        const patch: any = {
+          subcontractId: (existing as any).parentSubcontractId,
+          itemNo,
+        };
+        if (row['Description'] !== undefined) patch.description = String(row['Description']);
+        // qty and rate are the inputs; the database generates the total.
+        if (row['Qty'] !== undefined) patch.qty = Number(row['Qty']) || 0;
+        if (row['Unit'] !== undefined) patch.unit = String(row['Unit']);
+        if (row['Rate'] !== undefined) patch.rate = Number(row['Rate']) || 0;
+        if (row['Status'] !== undefined) patch.status = row['Status'];
+        if (row['Type'] !== undefined) patch.type = row['Type'];
+        rows.push(patch);
       });
 
-      for (const [id, updatedSub] of Array.from(subcontractsToUpdate.entries())) {
-        batch.update(doc(db, 'subcontracts', id), {
-          lineItems: updatedSub.lineItems,
-          updatedAt: updatedSub.updatedAt
-        });
+      if (rows.length === 0) {
+        toast.error('No sheet rows matched an existing order and item number.');
+        return;
       }
 
-      await batch.commit();
-      toast.success(`Import complete. Updated ${updateCount} items.`);
-    } catch (error) {
+      // One statement across every affected subcontract.
+      const updated = await upsertLineItemsAcrossSubcontracts(project.id, rows);
+      await reload();
+      toast.success(
+        unmatched.length > 0
+          ? `Import complete. Updated ${updated} items. Not found: ${unmatched.slice(0, 5).join(', ')}${unmatched.length > 5 ? ` and ${unmatched.length - 5} more` : ''}`
+          : `Import complete. Updated ${updated} items.`
+      );
+    } catch (error: any) {
       console.error('Import error:', error);
-      toast.error('Import failed.');
+      toast.error(`Import failed: ${error?.message || 'Unknown error'}`);
     }
   };
 
-  useEffect(() => {
-    if (!project.id) return;
-    const qSub = query(collection(db, 'subcontracts'), where('projectId', '==', project.id));
-    const unsubSub = onSnapshot(qSub, (snapshot) => {
-      setSubcontracts(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Subcontract)));
+  const reload = useCallback(async () => {
+    try {
+      setRowData(await fetchProjectLineItems(project.id) as any);
+    } catch (error: any) {
+      console.error('BulkSubcontractItems: line items fetch error:', error);
+      toast.error(`Failed to load line items: ${error?.message || 'Unknown error'}`);
+    } finally {
       setLoading(false);
-    }, (error) => {
-      console.error("BulkSubcontractItems: subcontracts fetch error:", error);
-      toast.error("Failed to load subcontracts: " + error.message);
-      setLoading(false);
-    });
-
-    const qCost = query(collection(db, 'costCodes'), where('projectId', '==', project.id));
-    const unsubCost = onSnapshot(qCost, (snapshot) => {
-      setCostCodes(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as CostCode)));
-    });
-
-    return () => {
-      unsubSub();
-      unsubCost();
-    };
+    }
   }, [project.id]);
 
-  const rowData = useMemo(() => {
-    const items: FlattenedLineItem[] = [];
-    subcontracts.forEach(sub => {
-      if (sub.lineItems) {
-        sub.lineItems.forEach(li => {
-          items.push({
-            ...li,
-            parentSubcontractId: sub.id,
-            orderId: sub.orderId || 'Unknown',
-            orderName: sub.orderName || 'Unknown',
-            vendorName: sub.vendorName || 'Unknown',
-            subStatus: sub.status || 'Unknown',
-          });
-        });
-      }
-    });
+  useEffect(() => {
+    if (!project.id) return;
+    void reload();
 
-    return items.sort((a, b) => {
-      const subCmp = (a.orderId || '').localeCompare(b.orderId || '');
-      if (subCmp !== 0) return subCmp;
-      return (a.itemNo || '').localeCompare(b.itemNo || '', undefined, { numeric: true });
-    });
-  }, [subcontracts]);
+    const loadCostCodes = async () => {
+      try {
+        setCostCodes(await fetchCostCodes(project.id));
+      } catch (error) {
+        console.error('BulkSubcontractItems: cost codes fetch error:', error);
+      }
+    };
+    void loadCostCodes();
+
+    const unsubItems = subscribeToTable('subcontract_line_items', `project_id=eq.${project.id}`, () => void reload());
+    // A rename or status change on the order shows in the grid's first columns.
+    const unsubSub = subscribeToTable('subcontracts', `project_id=eq.${project.id}`, () => void reload());
+    const unsubCost = subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void loadCostCodes());
+
+    return () => { unsubItems(); unsubSub(); unsubCost(); };
+  }, [project.id, reload]);
 
   const handleBulkUpdate = async () => {
     if (selectedIds.length === 0) return;
     try {
-      const batch = writeBatch(db);
-      const subcontractsToUpdate = new Map<string, Subcontract>();
-
-      selectedIds.forEach(id => {
-        const row = rowData.find(r => r.id === id);
-        if (!row) return;
-
-        let sub = subcontractsToUpdate.get(row.parentSubcontractId) || subcontracts.find(s => s.id === row.parentSubcontractId);
-        if (!sub) return;
-
-        if (!subcontractsToUpdate.has(row.parentSubcontractId)) {
-          sub = { ...sub!, lineItems: sub!.lineItems?.map(it => ({ ...it })) || [] };
-        }
-
-        sub!.lineItems = sub!.lineItems.map(it => {
-          if (it.id === id) {
-            const updated = { ...it };
-            if (bulkUpdateData.status) updated.status = bulkUpdateData.status as any;
-            if (bulkUpdateData.type) updated.type = bulkUpdateData.type as any;
-            updated.updatedAt = new Date().toISOString();
-            return updated;
-          }
-          return it;
-        });
-
-        sub!.updatedAt = new Date().toISOString();
-        subcontractsToUpdate.set(row.parentSubcontractId, sub!);
+      // One statement, whichever subcontracts the selected items belong to.
+      const updated = await bulkUpdateLineItems(selectedIds, {
+        status: bulkUpdateData.status || undefined,
+        type: bulkUpdateData.type || undefined,
       });
-
-      for (const [id, updatedSub] of Array.from(subcontractsToUpdate.entries())) {
-        batch.update(doc(db, 'subcontracts', id), {
-          lineItems: updatedSub.lineItems,
-          updatedAt: updatedSub.updatedAt
-        });
-      }
-
-      await batch.commit();
-      toast.success(`Updated ${selectedIds.length} items.`);
+      await reload();
+      toast.success(`Updated ${updated} items.`);
       setSelectedIds([]);
       setIsBulkUpdateOpen(false);
       setBulkUpdateData({ status: '', type: '' });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Bulk update error:', error);
-      toast.error('Failed to update items.');
+      toast.error(`Failed to update items: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleCellValueChanged = async (event: CellValueChangedEvent) => {
     const { data, colDef, newValue, oldValue } = event;
     if (newValue === oldValue) return;
-
-    const subcontractDocId = data.parentSubcontractId;
-    const lineItemId = data.id;
-
-    const sub = subcontracts.find(s => s.id === subcontractDocId);
-    if (!sub) return;
-
     const field = colDef.field!;
-    
-    const setNestedValue = (obj: any, path: string, value: any) => {
-      const parts = path.split('.');
-      let current = obj;
-      for (let i = 0; i < parts.length - 1; i++) {
-        const part = parts[i];
-        if (!current[part]) current[part] = {};
-        // Make a copy if it's an object to ensure immutability if needed, 
-        // though here we are building a new updatedItem.
-        current[part] = { ...current[part] };
-        current = current[part];
-      }
-      current[parts[parts.length - 1]] = value;
-    };
-
-    const updatedLineItems = (sub.lineItems || []).map(item => {
-      if (item.id === lineItemId) {
-        const updatedItem = JSON.parse(JSON.stringify(item)); // Deep copy to handle nested objects easily
-        setNestedValue(updatedItem, field, newValue);
-        
-        // Handle calculated fields for pricing
-        if (field === 'qty' || field === 'rate') {
-          updatedItem.total = (Number(updatedItem.qty) || 0) * (Number(updatedItem.rate) || 0);
-        }
-        
-        updatedItem.updatedAt = new Date().toISOString();
-        return updatedItem;
-      }
-      return item;
-    });
 
     try {
-      await updateDoc(doc(db, 'subcontracts', subcontractDocId), {
-        lineItems: updatedLineItems,
-        updatedAt: new Date().toISOString()
-      });
+      let value = newValue;
+      if (field === 'costCodeId' && value) {
+        // The column shows the cost CODE but holds the row id.
+        const resolved = costCodes.find(c => c.code === String(value).trim() || c.id === value);
+        if (!resolved) {
+          toast.error(`Unknown cost code "${value}"`);
+          await reload();
+          return;
+        }
+        value = resolved.id;
+      }
+
+      // The total is generated from qty x rate by the database, and the
+      // subcontract's roll-ups follow by trigger. Attribute columns carry a
+      // dotted path and are merged rather than sent as a column name.
+      await applyLineItemCellEdit(data.id, field, value);
+      await reload();
       toast.success('Line item updated');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error updating line item:', error);
-      toast.error('Failed to update line item.');
+      toast.error(`Failed to update line item: ${error?.message || 'Unknown error'}`);
+      await reload();
     }
   };
 

@@ -136,7 +136,7 @@ export async function fetchLineItems(subcontractId: string): Promise<Subcontract
 export async function fetchProjectLineItems(projectId: string): Promise<SubcontractLineItem[]> {
   const { data, error } = await supabase
     .from('subcontract_line_items')
-    .select('*, subcontracts(order_id, order_name)')
+    .select('*, subcontracts(order_id, order_name, status, vendors(name))')
     .eq('project_id', projectId)
     .order('sort_order');
   raise('load line items', error);
@@ -144,10 +144,39 @@ export async function fetchProjectLineItems(projectId: string): Promise<Subcontr
     const { subcontracts, ...rest } = row;
     return {
       ...fromRow<SubcontractLineItem>(rest)!,
+      // The bulk grid shows which order each item belongs to.
+      parentSubcontractId: rest.subcontract_id,
       orderId: subcontracts?.order_id ?? '',
       orderName: subcontracts?.order_name ?? '',
-    } as SubcontractLineItem;
+      subStatus: subcontracts?.status ?? '',
+      vendorName: subcontracts?.vendors?.name ?? '',
+    } as any;
   });
+}
+
+/**
+ * Insert or update line items that may belong to different subcontracts.
+ *
+ * Still one statement: the conflict target is (subcontract_id, item_no), so
+ * each row carries its own subcontract and the whole sheet goes in together.
+ */
+export async function upsertLineItemsAcrossSubcontracts(
+  projectId: string,
+  rows: Array<Partial<SubcontractLineItem> & { subcontractId: string; itemNo: string }>
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const { data, error } = await supabase
+    .from('subcontract_line_items')
+    .upsert(
+      rows.map((r) => {
+        const { total, orderId, orderName, subStatus, vendorName, parentSubcontractId, ...rest } = r as any;
+        return { ...toRow(rest), project_id: projectId };
+      }),
+      { onConflict: 'subcontract_id,item_no' }
+    )
+    .select('id');
+  raise('save line items', error);
+  return data?.length ?? 0;
 }
 
 /**
@@ -166,7 +195,7 @@ export async function upsertLineItems(
     .from('subcontract_line_items')
     .upsert(
       rows.map((r) => {
-        const { total, orderId, orderName, ...rest } = r as any;
+        const { total, orderId, orderName, subStatus, vendorName, parentSubcontractId, ...rest } = r as any;
         return { ...toRow(rest), project_id: projectId, subcontract_id: subcontractId };
       }),
       { onConflict: 'subcontract_id,item_no' }
@@ -177,7 +206,7 @@ export async function upsertLineItems(
 }
 
 export async function updateLineItem(id: string, patch: Partial<SubcontractLineItem>): Promise<void> {
-  const { total, orderId, orderName, ...rest } = patch as any;
+  const { total, orderId, orderName, subStatus, vendorName, parentSubcontractId, ...rest } = patch as any;
   const { error } = await supabase
     .from('subcontract_line_items')
     .update(toRow(rest))
@@ -540,5 +569,125 @@ export async function applyLineItemPhasing(
     p_item_ids: itemIds && itemIds.length > 0 ? itemIds : null,
   });
   raise('calculate phasing', error);
+  return (data as number) ?? 0;
+}
+
+// ------------------------------------------------------- invoice summary ----
+
+/**
+ * One row per invoice with its order, vendor, and this-period claimed and
+ * certified totals, for the bulk invoices grid. Those totals are aggregates of
+ * the invoice's items; the browser used to load every invoice in the project
+ * with all of its items to produce them.
+ */
+export async function fetchInvoiceSummaries(projectId: string): Promise<any[]> {
+  const { data, error } = await supabase
+    .from('invoice_summary')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('order_id')
+    .order('invoice_id');
+  raise('load invoices', error);
+  return fromRows<any>(data);
+}
+
+/**
+ * Set a this-period percentage across every item of the given invoices.
+ *
+ * The quantities and values follow from the percentage inside the function,
+ * measured from what the previous invoice certified -- the same rule the
+ * single-cell edit uses.
+ */
+export async function bulkSetInvoiceClaimPercent(
+  invoiceIds: string[],
+  patch: { periodicClaimPercent?: number; periodicCertifiedPercent?: number }
+): Promise<number> {
+  if (invoiceIds.length === 0) return 0;
+  const { data, error } = await supabase.rpc('bulk_set_invoice_claim_percent', {
+    p_invoice_ids: invoiceIds,
+    p_periodic_claim_percent: patch.periodicClaimPercent ?? null,
+    p_periodic_certified_percent: patch.periodicCertifiedPercent ?? null,
+  });
+  raise('apply claim percentage', error);
+  return (data as number) ?? 0;
+}
+
+/**
+ * Import invoice headers from a sheet.
+ *
+ * Upsert on (subcontract_id, invoice_id): a row whose invoice number already
+ * exists on that order updates it rather than raising a second invoice with
+ * the same reference. One statement, whatever the size of the sheet -- the
+ * browser used to chunk this into batches of 400.
+ */
+export async function importInvoices(
+  projectId: string,
+  rows: Array<Partial<Invoice> & { subcontractId: string; invoiceId: string }>
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const { data, error } = await supabase
+    .from('invoices')
+    .upsert(
+      rows.map((r) => {
+        const { items, vendorName, totalAmount, certifiedAmount, orderId, orderName, ...rest } = r as any;
+        return { ...toRow(rest), project_id: projectId };
+      }),
+      { onConflict: 'subcontract_id,invoice_id' }
+    )
+    .select('id');
+  raise('import invoices', error);
+  return data?.length ?? 0;
+}
+
+/** Bulk header edits across invoices, in one statement. */
+export async function bulkUpdateInvoices(ids: string[], patch: Partial<Invoice>): Promise<number> {
+  if (ids.length === 0) return 0;
+  const { items, vendorName, totalAmount, certifiedAmount, orderId, orderName, ...rest } = patch as any;
+  const row = toRow(rest);
+  if (Object.keys(row).length === 0) return 0;
+  const { data, error } = await supabase.from('invoices').update(row).in('id', ids).select('id');
+  raise('bulk update invoices', error);
+  return data?.length ?? 0;
+}
+
+/**
+ * Every invoice item in the project, with its order, invoice and the parent
+ * line item's reference fields, for the bulk invoice items grid.
+ */
+export async function fetchProjectInvoiceItemDetail(projectId: string): Promise<any[]> {
+  const { data, error } = await supabase
+    .from('invoice_item_detail')
+    .select('*, invoices!inner(invoice_id), subcontracts:subcontract_id(order_id, order_name, status, vendors(name))')
+    .eq('project_id', projectId)
+    .order('sort_order');
+  raise('load invoice items', error);
+  return (data ?? []).map((row: any) => {
+    const { invoices, subcontracts, ...rest } = row;
+    return {
+      ...fromRow<any>(rest)!,
+      // invoice_id on the row is the invoice's id; the grid also shows its
+      // user-facing number.
+      parentInvoiceId: invoices?.invoice_id ?? '',
+      orderId: subcontracts?.order_id ?? '',
+      orderName: subcontracts?.order_name ?? '',
+      subcontractStatus: subcontracts?.status ?? '',
+      vendorName: subcontracts?.vendors?.name ?? '',
+    };
+  });
+}
+
+/**
+ * Apply many claim edits in one call -- an imported sheet, or a bulk edit that
+ * sets a different figure per item.
+ *
+ * Each edit names the field the user supplied; the other eleven figures are
+ * derived in the database from the position stored there.
+ */
+export async function applyInvoiceItemClaims(
+  edits: Array<{ id: string; field: string; value: number }>
+): Promise<number> {
+  if (edits.length === 0) return 0;
+  const { data, error } = await supabase.rpc('apply_invoice_item_claims', { p_edits: edits });
+  raise('apply claim edits', error);
   return (data as number) ?? 0;
 }

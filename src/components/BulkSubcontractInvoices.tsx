@@ -1,7 +1,10 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Project, Enterprise, Invoice, Subcontract } from '../types';
-import { db } from '../firebase';
-import { collection, query, where, onSnapshot, doc, updateDoc, writeBatch } from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  fetchInvoiceSummaries, fetchSubcontractSummaries, deleteInvoices,
+  bulkUpdateInvoices, bulkSetInvoiceClaimPercent, updateInvoice, importInvoices,
+} from '../lib/subcontracts';
 import DataGridModule from './DataGridModule';
 import { ColDef, ColGroupDef, CellValueChangedEvent, ValueFormatterParams } from 'ag-grid-community';
 import toast from 'react-hot-toast';
@@ -38,7 +41,10 @@ interface FlattenedInvoice extends Invoice {
 }
 
 const BulkSubcontractInvoices: React.FC<BulkSubcontractInvoicesProps> = ({ project, enterprise }) => {
-  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  // Rows come from invoice_summary: the order, the vendor and the this-period
+  // totals are already joined and aggregated. The subcontracts are kept only
+  // to resolve an Order ID on import.
+  const [rowData, setRowData] = useState<FlattenedInvoice[]>([]);
   const [subcontracts, setSubcontracts] = useState<Subcontract[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -57,72 +63,54 @@ const BulkSubcontractInvoices: React.FC<BulkSubcontractInvoicesProps> = ({ proje
     certifiedPercent: '',
   });
 
-  useEffect(() => {
-    if (!project.id) return;
-
-    const qSub = query(collection(db, 'subcontracts'), where('projectId', '==', project.id));
-    const unsubSub = onSnapshot(qSub, (snapshot) => {
-      setSubcontracts(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Subcontract)));
-    }, (error) => {
-      console.error("BulkSubcontractInvoices: subcontracts fetch error:", error);
-      toast.error("Failed to load subcontracts: " + error.message);
+  const reload = useCallback(async () => {
+    try {
+      setRowData(await fetchInvoiceSummaries(project.id) as any);
+    } catch (error: any) {
+      console.error('BulkSubcontractInvoices: invoices fetch error:', error);
+      toast.error(`Failed to load invoices: ${error?.message || 'Unknown error'}`);
+    } finally {
       setLoading(false);
-    });
-
-    const qInv = query(collection(db, 'invoices'), where('projectId', '==', project.id));
-    const unsubInv = onSnapshot(qInv, (snapshot) => {
-      setInvoices(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Invoice)));
-      setLoading(false);
-    }, (error) => {
-      console.error("BulkSubcontractInvoices: invoices fetch error:", error);
-      toast.error("Failed to load invoices: " + error.message);
-      setLoading(false);
-    });
-
-    return () => {
-      unsubSub();
-      unsubInv();
-    };
+    }
   }, [project.id]);
 
-  const rowData = useMemo(() => {
-    const flat = invoices.map(inv => {
-      const sub = subcontracts.find(s => s.id === inv.subcontractId);
-      
-      // Periodic totals are the sum of periodic fields of line items
-      const periodicClaimed = (inv.items || []).reduce((sum, item) => sum + (item.periodicClaimValue || 0), 0);
-      const periodicCertified = (inv.items || []).reduce((sum, item) => sum + (item.periodicCertifiedValue || 0), 0);
+  useEffect(() => {
+    if (!project.id) return;
+    void reload();
 
-      return {
-        ...inv,
-        orderId: sub?.orderId || 'Unknown',
-        orderName: sub?.orderName || 'Unknown',
-        periodicClaimed,
-        periodicCertified,
-      } as FlattenedInvoice;
+    const loadSubcontracts = async () => {
+      try {
+        setSubcontracts(await fetchSubcontractSummaries(project.id));
+      } catch (error) {
+        console.error('BulkSubcontractInvoices: subcontracts fetch error:', error);
+      }
+    };
+    void loadSubcontracts();
+
+    const unsubInv = subscribeToTable('invoices', `project_id=eq.${project.id}`, () => void reload());
+    // An item's periodic figures roll up into the row's totals.
+    const unsubItems = subscribeToTable('invoice_items', undefined, () => void reload());
+    const unsubSub = subscribeToTable('subcontracts', `project_id=eq.${project.id}`, () => {
+      void loadSubcontracts();
+      void reload();
     });
 
-    return flat.sort((a, b) => {
-      const subCmp = (a.orderId || '').localeCompare(b.orderId || '');
-      if (subCmp !== 0) return subCmp;
-      return (a.invoiceId || '').localeCompare(b.invoiceId || '', undefined, { numeric: true });
-    });
-  }, [invoices, subcontracts]);
+    return () => { unsubInv(); unsubItems(); unsubSub(); };
+  }, [project.id, reload]);
 
   const handleBulkDelete = async () => {
     if (selectedIds.length === 0) return;
     try {
-      const batch = writeBatch(db);
-      selectedIds.forEach(id => {
-        batch.delete(doc(db, 'invoices', id));
-      });
-      await batch.commit();
+      // One statement. Each invoice's items cascade, and the subcontracts'
+      // positions follow.
+      await deleteInvoices(selectedIds);
+      await reload();
       toast.success(`Deleted ${selectedIds.length} invoices.`);
       setSelectedIds([]);
       setIsBulkDeleteOpen(false);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Bulk delete error:', error);
-      toast.error('Failed to delete invoices.');
+      toast.error(`Failed to delete invoices: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -156,169 +144,158 @@ const BulkSubcontractInvoices: React.FC<BulkSubcontractInvoicesProps> = ({ proje
   const handleBulkUpdate = async () => {
     if (selectedIds.length === 0) return;
     try {
-      const batch = writeBatch(db);
-      selectedIds.forEach(id => {
-        const updateData: any = { updatedAt: new Date().toISOString() };
-        if (bulkUpdateData.status) updateData.status = bulkUpdateData.status;
-        if (bulkUpdateData.initiator) updateData.initiator = bulkUpdateData.initiator;
-        if (bulkUpdateData.submittedDate) updateData.submittedDate = bulkUpdateData.submittedDate;
-        if (bulkUpdateData.certifiedDate) updateData.certifiedDate = bulkUpdateData.certifiedDate;
-        if (bulkUpdateData.paymentDate) updateData.paymentDate = bulkUpdateData.paymentDate;
-        
-        // Apply percentages to items if provided
-        const invoice = invoices.find(inv => inv.id === id);
-        if (invoice && (bulkUpdateData.claimPercent || bulkUpdateData.certifiedPercent)) {
-          const updatedItems = (invoice.items || []).map(item => {
-            const newItem = { ...item };
-            const lineTotal = newItem.total || 0;
-            const rate = newItem.rate || 0;
+      const header: any = {};
+      if (bulkUpdateData.status) header.status = bulkUpdateData.status;
+      if (bulkUpdateData.initiator) header.initiator = bulkUpdateData.initiator;
+      if (bulkUpdateData.submittedDate) header.submittedDate = bulkUpdateData.submittedDate;
+      if (bulkUpdateData.certifiedDate) header.certifiedDate = bulkUpdateData.certifiedDate;
+      if (bulkUpdateData.paymentDate) header.paymentDate = bulkUpdateData.paymentDate;
 
-            if (bulkUpdateData.claimPercent) {
-              newItem.periodicClaimPercent = Number(bulkUpdateData.claimPercent);
-              newItem.periodicClaimValue = (newItem.periodicClaimPercent / 100) * lineTotal;
-              if (rate > 0) newItem.periodicClaimQty = newItem.periodicClaimValue / rate;
-            }
+      if (Object.keys(header).length > 0) {
+        await bulkUpdateInvoices(selectedIds, header);
+      }
 
-            if (bulkUpdateData.certifiedPercent) {
-              newItem.periodicCertifiedPercent = Number(bulkUpdateData.certifiedPercent);
-              newItem.periodicCertifiedValue = (newItem.periodicCertifiedPercent / 100) * lineTotal;
-              if (rate > 0) newItem.periodicCertifiedQty = newItem.periodicCertifiedValue / rate;
-            }
+      // The percentages apply to every item of every selected invoice. The
+      // quantities and values follow from them inside the database, measured
+      // from what the previous invoice certified; this used to be worked out
+      // in the browser and written back as whole item arrays.
+      if (bulkUpdateData.claimPercent || bulkUpdateData.certifiedPercent) {
+        await bulkSetInvoiceClaimPercent(selectedIds, {
+          periodicClaimPercent: bulkUpdateData.claimPercent !== '' ? Number(bulkUpdateData.claimPercent) : undefined,
+          periodicCertifiedPercent: bulkUpdateData.certifiedPercent !== '' ? Number(bulkUpdateData.certifiedPercent) : undefined,
+        });
+      }
 
-            return newItem;
-          });
-
-          updateData.items = updatedItems;
-          updateData.totalAmount = updatedItems.reduce((sum, it) => sum + (it.periodicClaimValue || 0), 0);
-          updateData.certifiedAmount = updatedItems.reduce((sum, it) => sum + (it.periodicCertifiedValue || 0), 0);
-        }
-        
-        batch.update(doc(db, 'invoices', id), updateData);
-      });
-      await batch.commit();
+      await reload();
       toast.success(`Updated ${selectedIds.length} invoices.`);
       setSelectedIds([]);
       setIsBulkUpdateOpen(false);
       setBulkUpdateData({ status: '', initiator: '', submittedDate: '', certifiedDate: '', paymentDate: '', claimPercent: '', certifiedPercent: '' });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Bulk update error:', error);
-      toast.error('Failed to update invoices.');
+      toast.error(`Failed to update invoices: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleCellValueChanged = async (event: CellValueChangedEvent) => {
     const { data, colDef, newValue, oldValue } = event;
     if (newValue === oldValue) return;
-
-    const invoiceId = data.id;
     const field = colDef.field!;
 
-    try {
-      let updateData: any = {
-        updatedAt: new Date().toISOString()
-      };
+    // The claimed and certified columns are sums of the invoice's items, so
+    // they are not editable here -- typing over a total would leave it
+    // disagreeing with the items it is a sum of. They are edited on the
+    // invoice's own items grid.
+    if (field === 'periodicClaimed' || field === 'periodicCertified' ||
+        field === 'totalAmount' || field === 'certifiedAmount') {
+      toast.error('Claimed and certified amounts come from the invoice\u2019s items. Edit them on the invoice.');
+      await reload();
+      return;
+    }
 
-      if (field === 'periodicClaimed') {
-        updateData.totalAmount = Number(newValue) || 0;
-      } else if (field === 'periodicCertified') {
-        updateData.certifiedAmount = Number(newValue) || 0;
-      } else {
-        updateData[field] = (newValue instanceof Date) ? dateToISO(newValue) : newValue;
+    try {
+      await updateInvoice(data.id, {
+        [field]: (newValue instanceof Date) ? dateToISO(newValue) : newValue,
+      } as any);
+      await reload();
+      toast.success('Invoice updated successfully');
+    } catch (error: any) {
+      console.error('Error updating invoice:', error);
+      toast.error(`Failed to update invoice: ${error?.message || 'Unknown error'}`);
+      await reload();
+    }
+  };
+
+  /**
+   * Import invoice headers from a sheet.
+   *
+   * There were two copies of this, one behind the file input and one behind
+   * the grid's import button, differing only in which spelling of each column
+   * they accepted. Both are this.
+   */
+  const importFromSheet = async (excelData: any[]) => {
+    const toastId = toast.loading('Importing invoices...');
+    try {
+      if (excelData.length === 0) {
+        toast.error('The Excel file is empty.', { id: toastId });
+        return;
       }
 
-      await updateDoc(doc(db, 'invoices', invoiceId), updateData);
-      toast.success('Invoice updated successfully');
-    } catch (error) {
-      console.error('Error updating invoice:', error);
-      toast.error('Failed to update invoice.');
+      const pick = (row: any, ...keys: string[]) => {
+        for (const k of keys) if (row[k] !== undefined && row[k] !== '') return row[k];
+        return undefined;
+      };
+      const asDate = (v: any) => (v ? dateToISO(new Date(v)) : undefined);
+
+      // A sheet that names the same invoice twice would have the second row
+      // silently win, so it is refused instead.
+      const seen = new Set<string>();
+      const duplicates: string[] = [];
+      const rows: any[] = [];
+      const unknownOrders = new Set<string>();
+
+      excelData.forEach(row => {
+        const orderId = String(pick(row, 'Order ID', 'orderId') || '').trim();
+        const invoiceNo = String(pick(row, 'Invoice No.', 'invoiceId') || '').trim();
+        if (!orderId || !invoiceNo) return;
+
+        const key = `${orderId.toLowerCase()}_${invoiceNo.toLowerCase()}`;
+        if (seen.has(key)) { duplicates.push(key); return; }
+        seen.add(key);
+
+        const targetSub = subcontracts.find(sub => sub.orderId === orderId);
+        if (!targetSub) { unknownOrders.add(orderId); return; }
+
+        rows.push({
+          subcontractId: targetSub.id,
+          invoiceId: invoiceNo,
+          description: String(pick(row, 'Description', 'description') || ''),
+          status: pick(row, 'Status', 'status') || 'Draft',
+          initiator: String(pick(row, 'Initiator', 'initiator') || ''),
+          vendorId: targetSub.vendorId || undefined,
+          submittedDate: asDate(pick(row, 'Submitted Date', 'submittedDate')),
+          certifiedDate: asDate(pick(row, 'Certified Date', 'certifiedDate')),
+          paymentDate: asDate(pick(row, 'Payment Date', 'paymentDate')),
+        });
+      });
+
+      if (duplicates.length > 0) {
+        toast.error(`Duplicate invoices found in file: ${duplicates.join(', ')}`, { id: toastId });
+        return;
+      }
+      if (rows.length === 0) {
+        toast.error(
+          unknownOrders.size > 0
+            ? `No rows imported. Unknown orders: ${Array.from(unknownOrders).join(', ')}`
+            : 'No rows in the sheet carried an Order ID and an Invoice No.',
+          { id: toastId }
+        );
+        return;
+      }
+
+      // One statement, whatever the size of the sheet. This used to be split
+      // into batches of 400 because Firestore capped a batch at 500 writes.
+      const imported = await importInvoices(project.id, rows);
+      await reload();
+      toast.success(
+        unknownOrders.size > 0
+          ? `Imported ${imported} invoices. Unknown orders skipped: ${Array.from(unknownOrders).join(', ')}`
+          : `Imported ${imported} invoices.`,
+        { id: toastId }
+      );
+    } catch (error: any) {
+      console.error('Import error:', error);
+      toast.error(`Failed to import invoices: ${error?.message || 'Unknown error'}`, { id: toastId });
     }
   };
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onload = async (evt) => {
-      const toastId = toast.loading('Reading file...');
-      try {
-        const bstr = evt.target?.result;
-        const wb = XLSX.read(bstr, { type: 'binary', cellDates: true });
-        const wsname = wb.SheetNames[0];
-        const ws = wb.Sheets[wsname];
-        const excelData = XLSX.utils.sheet_to_json(ws) as any[];
-
-        if (excelData.length === 0) {
-          toast.dismiss(toastId);
-          toast.error('The Excel file is empty.');
-          return;
-        }
-
-        // Chunked Processing
-        const chunkSize = 400;
-        const totalChunks = Math.ceil(excelData.length / chunkSize);
-        let importedCount = 0;
-
-        for (let i = 0; i < totalChunks; i++) {
-          const chunk = excelData.slice(i * chunkSize, (i + 1) * chunkSize);
-          const batch = writeBatch(db);
-          toast.loading(`Importing invoice chunk ${i + 1} of ${totalChunks}...`, { id: toastId });
-
-          for (const row of chunk) {
-            const orderId = String(row['Order ID'] || '').trim();
-            const targetSub = subcontracts.find(s => s.orderId === orderId);
-            if (!targetSub) continue;
-
-            const invoiceNo = String(row['Invoice No.'] || '');
-            if (!invoiceNo) continue;
-
-            const existingInvoice = invoices.find(i => i.subcontractId === targetSub.id && i.invoiceId === invoiceNo);
-            
-            if (existingInvoice) {
-              const updateProps: any = { updatedAt: new Date().toISOString() };
-              if (row['Description']) updateProps.description = String(row['Description']);
-              if (row['Status']) updateProps.status = row['Status'];
-              if (row['Initiator']) updateProps.initiator = row['Initiator'];
-              if (row['Submitted Date']) updateProps.submittedDate = dateToISO(new Date(row['Submitted Date']));
-              if (row['Certified Date']) updateProps.certifiedDate = dateToISO(new Date(row['Certified Date']));
-              if (row['Payment Date']) updateProps.paymentDate = dateToISO(new Date(row['Payment Date']));
-
-              batch.update(doc(db, 'invoices', existingInvoice.id), updateProps);
-            } else {
-              const newInvRef = doc(collection(db, 'invoices'));
-              const newInv: Invoice = {
-                id: newInvRef.id,
-                subcontractId: targetSub.id,
-                projectId: project.id,
-                enterpriseId: enterprise.id,
-                invoiceId: invoiceNo,
-                description: String(row['Description'] || ''),
-                status: (row['Status'] || 'Draft') as any,
-                initiator: String(row['Initiator'] || ''),
-                vendorId: targetSub.vendorId,
-                vendorName: targetSub.vendorName,
-                totalAmount: 0,
-                certifiedAmount: 0,
-                items: [],
-                submittedDate: row['Submitted Date'] ? dateToISO(new Date(row['Submitted Date'])) : undefined,
-                certifiedDate: row['Certified Date'] ? dateToISO(new Date(row['Certified Date'])) : undefined,
-                paymentDate: row['Payment Date'] ? dateToISO(new Date(row['Payment Date'])) : undefined,
-                createdAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
-              };
-              batch.set(newInvRef, newInv);
-            }
-            importedCount++;
-          }
-          await batch.commit();
-        }
-
-        toast.success(`Successfully processed ${importedCount} invoices.`, { id: toastId });
-      } catch (error) {
-        console.error('Import error:', error);
-        toast.dismiss(toastId);
-        toast.error('Failed to import invoices.');
-      }
+      const wb = XLSX.read(evt.target?.result, { type: 'binary', cellDates: true });
+      await importFromSheet(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]) as any[]);
     };
     reader.readAsBinaryString(file);
     e.target.value = '';
@@ -442,92 +419,7 @@ const BulkSubcontractInvoices: React.FC<BulkSubcontractInvoicesProps> = ({ proje
         columnDefs={columnDefs}
         pinnedBottomRowData={pinnedBottomRowData}
         gridRef={gridRef}
-        onImportData={(excelData) => {
-          const processImport = async () => {
-            const toastId = toast.loading('Importing invoices...');
-            try {
-              // Duplicate check in file
-              const idsInFile = new Set<string>();
-              const duplicates = [];
-              excelData.forEach((row, idx) => {
-                const orderId = String(row['Order ID'] || row.orderId || '').trim();
-                const invoiceNo = String(row['Invoice No.'] || row.invoiceId || '').trim();
-                if (orderId && invoiceNo) {
-                  const key = `${orderId.toLowerCase()}_${invoiceNo.toLowerCase()}`;
-                  if (idsInFile.has(key)) duplicates.push({ row: idx + 1, key });
-                  idsInFile.add(key);
-                }
-              });
-
-              if (duplicates.length > 0) {
-                toast.error(`Duplicate invoices found in file: ${duplicates.map(d => d.key).join(', ')}`, { id: toastId });
-                return;
-              }
-
-              const chunkSize = 400;
-              const totalChunks = Math.ceil(excelData.length / chunkSize);
-              let importedCount = 0;
-
-              for (let i = 0; i < totalChunks; i++) {
-                const chunk = excelData.slice(i * chunkSize, (i + 1) * chunkSize);
-                const batch = writeBatch(db);
-
-                for (const row of chunk) {
-                  const orderId = String(row['Order ID'] || row.orderId || '').trim();
-                  const targetSub = subcontracts.find(s => s.orderId === orderId);
-                  if (!targetSub) continue;
-
-                  const invoiceNo = String(row['Invoice No.'] || row.invoiceId || '');
-                  if (!invoiceNo) continue;
-
-                  const existingInvoice = invoices.find(i => i.subcontractId === targetSub.id && i.invoiceId === invoiceNo);
-                  
-                  if (existingInvoice) {
-                    const updateProps: any = { updatedAt: new Date().toISOString() };
-                    if (row['Description'] || row.description) updateProps.description = String(row['Description'] || row.description);
-                    if (row['Status'] || row.status) updateProps.status = row['Status'] || row.status;
-                    if (row['Initiator'] || row.initiator) updateProps.initiator = row['Initiator'] || row.initiator;
-                    if (row['Submitted Date'] || row.submittedDate) updateProps.submittedDate = dateToISO(new Date(row['Submitted Date'] || row.submittedDate));
-                    if (row['Certified Date'] || row.certifiedDate) updateProps.certifiedDate = dateToISO(new Date(row['Certified Date'] || row.certifiedDate));
-                    if (row['Payment Date'] || row.paymentDate) updateProps.paymentDate = dateToISO(new Date(row['Payment Date'] || row.paymentDate));
-
-                    batch.update(doc(db, 'invoices', existingInvoice.id), updateProps);
-                  } else {
-                    const newInvRef = doc(collection(db, 'invoices'));
-                    const newInv: Invoice = {
-                      id: newInvRef.id,
-                      subcontractId: targetSub.id,
-                      projectId: project.id,
-                      enterpriseId: enterprise.id,
-                      invoiceId: invoiceNo,
-                      description: String(row['Description'] || row.description || ''),
-                      status: (row['Status'] || row.status || 'Draft') as any,
-                      initiator: String(row['Initiator'] || row.initiator || ''),
-                      vendorId: targetSub.vendorId,
-                      vendorName: targetSub.vendorName,
-                      totalAmount: 0,
-                      certifiedAmount: 0,
-                      items: [],
-                      submittedDate: (row['Submitted Date'] || row.submittedDate) ? dateToISO(new Date(row['Submitted Date'] || row.submittedDate)) : undefined,
-                      certifiedDate: (row['Certified Date'] || row.certifiedDate) ? dateToISO(new Date(row['Certified Date'] || row.certifiedDate)) : undefined,
-                      paymentDate: (row['Payment Date'] || row.paymentDate) ? dateToISO(new Date(row['Payment Date'] || row.paymentDate)) : undefined,
-                      createdAt: new Date().toISOString(),
-                      updatedAt: new Date().toISOString(),
-                    };
-                    batch.set(newInvRef, newInv);
-                  }
-                  importedCount++;
-                }
-                await batch.commit();
-              }
-              toast.success(`Imported ${importedCount} invoices.`, { id: toastId });
-            } catch (error: any) {
-              console.error("Import error:", error);
-              toast.error("Failed to import invoices: " + error.message, { id: toastId });
-            }
-          };
-          processImport();
-        }}
+        onImportData={(excelData) => { void importFromSheet(excelData); }}
         selectedCount={selectedIds.length}
         onBulkUpdate={() => setIsBulkUpdateOpen(true)}
         onBulkDelete={() => setIsBulkDeleteOpen(true)}
