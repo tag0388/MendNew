@@ -3,7 +3,6 @@ import { Project, Enterprise } from '../types';
 import { DollarSign, Tag, List, ChevronLeft, Menu, Settings, Hash, Database, Calendar, Target, ClipboardList } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { auth } from '../firebase';
 import ProjectCostCodeAttributes from './ProjectCostCodeAttributes';
 import ProjectResourceRates from './ProjectResourceRates';
 import CostReportingPeriod from './CostReportingPeriod';
@@ -12,6 +11,7 @@ import ActualCost from './ActualCost';
 import BaselineBudget from './BaselineBudget';
 import GlobalTimephasing from './GlobalTimephasing';
 import BulkEtcDetails from './BulkEtcDetails';
+import { useProjectRole } from '../lib/useProjectRole';
 
 interface CostManagementProps {
   project: Project;
@@ -32,11 +32,11 @@ const CostManagement: React.FC<CostManagementProps> = ({
   const [expandedSections, setExpandedSections] = useState<string[]>(['overview', 'settings']);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
-  const userId = auth.currentUser?.uid;
-  const userEmail = auth.currentUser?.email;
-  const isSystemAdmin = userEmail?.toLowerCase() === 'tarek.guindy@gmail.com' || userEmail?.toLowerCase() === 'tarek_guindy@hotmail.com';
-  const isEnterpriseAdmin = userId && enterprise?.users?.[userId]?.role === 'Enterprise System Admin';
-  const isProjectAdmin = userId && (isEnterpriseAdmin || project?.users?.[userId] === 'Project Admin' || isSystemAdmin);
+  // From the database, not from a map on the project object and not from a
+  // hardcoded email address. The two map lookups this replaces read Firestore
+  // document shapes that no longer exist, so they were always undefined --
+  // which left one hardcoded address as the only thing granting admin.
+  const { isProjectAdmin, loading: roleLoading } = useProjectRole(projectId);
 
   const toggleSection = (sectionId: string) => {
     setExpandedSections(prev => 
@@ -154,6 +154,23 @@ const CostManagement: React.FC<CostManagementProps> = ({
       {/* Main Content Area */}
       <div className="flex-1 overflow-auto">
         <div className="h-full flex flex-col min-h-0">
+          {/* The sidebar hides the settings section from non-admins, but a URL
+              can be typed or bookmarked, so the content is gated too. The
+              database refuses the writes either way -- this is so the screen
+              says no rather than offering controls that will fail. */}
+          {isSettingsTab && !roleLoading && !isProjectAdmin ? (
+            <div className="flex-1 flex items-center justify-center p-8">
+              <div className="max-w-sm text-center">
+                <h2 className="text-lg font-semibold mb-2 dark:text-white">Project administrators only</h2>
+                <p className="text-sm text-gray-500">
+                  These settings change cost data across every cost code in the
+                  project, so they are limited to project administrators. Ask a
+                  project administrator if you need a change made here.
+                </p>
+              </div>
+            </div>
+          ) : (
+          <>
           {activeTab === 'costCodes' && (
             <div className="flex-1 flex flex-col overflow-hidden p-8">
               <CostCodes 
@@ -188,6 +205,8 @@ const CostManagement: React.FC<CostManagementProps> = ({
           {activeTab === 'costCodeAttributes' && <div className="flex-1 flex flex-col overflow-hidden"><ProjectCostCodeAttributes project={project} /></div>}
           {activeTab === 'resourceRates' && <div className="flex-1 flex flex-col overflow-hidden"><ProjectResourceRates project={project} /></div>}
           {activeTab === 'reportingPeriod' && <div className="flex-1 flex flex-col overflow-hidden"><CostReportingPeriod project={project} /></div>}
+          </>
+          )}
         </div>
       </div>
     </div>

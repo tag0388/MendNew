@@ -1660,7 +1660,15 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     if (updatedCount > 0) {
       try {
         const written = await applyEtcPhasing(phasedRows);
+        // Phasing changes what this cost code's ETC adds up to, so the cost
+        // code's own ETC and EAC are re-derived here rather than leaving the
+        // user to press the main Calculate afterwards. Scoped to this one
+        // cost code, so it stays cheap however large the project is.
+        if (selectedEtcCodeId) {
+          await recalculateProjectCosts(project.id, [selectedEtcCodeId]);
+        }
         await reloadEtcRows();
+        await reloadCostCodes();
         const skippedTotal = Object.values(skipped).reduce((a, b) => a + b, 0);
         if (noCalendarCount > 0) {
           toast.warning(
@@ -2498,9 +2506,13 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     }
     etcColumnDefsRef.current = defs;
     return defs;
+  // etcRows is deliberately NOT a dependency. It was one, and nothing in the
+  // definitions above reads it -- but it meant every saved cell rebuilt the
+  // column definitions, and AG Grid resets column groups to their default
+  // open/closed state whenever the definitions change. So collapsing the
+  // groups and then typing anything re-expanded all of them.
   }, [
-    project.reportingPeriods, 
-    etcRows,
+    project.reportingPeriods,
     theme,
     calendars,
     scheduleItems,
@@ -3226,8 +3238,13 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     setIsSaving(true);
     const toastId = toast.loading('Recalculating project costs...');
     try {
-      const scope = selectedIds.size > 0 ? Array.from(selectedIds) : undefined;
-      const updated = await recalculateProjectCosts(project.id, scope);
+      // The WHOLE project, deliberately -- not narrowed to the current
+      // selection. This button's job is to leave nothing stale: baseline
+      // budgets, approved changes, actual costs, ETC and subcontract
+      // commitments re-derived for every cost code. Scoping it to selected
+      // rows made it quietly partial, which is worse than slow when the
+      // numbers are what people report.
+      const updated = await recalculateProjectCosts(project.id);
       await reloadCostCodes();
       toast.success(
         `Recalculated ${updated} cost code${updated === 1 ? '' : 's'}.`,
@@ -3239,7 +3256,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     } finally {
       setIsSaving(false);
     }
-  }, [project.id, costCodes.length, selectedIds, reloadCostCodes]);
+  }, [project.id, costCodes.length, reloadCostCodes]);
 
   const handleUpdateField = async (id: string, field: string, value: any) => {
     try {
