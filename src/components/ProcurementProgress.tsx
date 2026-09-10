@@ -1,16 +1,12 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { db } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  doc, 
-  writeBatch, 
-  orderBy 
-} from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import { fetchProjectCalendars } from '../lib/projectSettings';
+import { updateProject } from '../lib/projects';
+import {
+  fetchProjectSteps, fetchProcurementItems, createProcurementItem,
+  updateProcurementItem, deleteProcurementItems, saveProcurementStepData,
+  importProcurementItems,
+} from '../lib/procurement';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Project, Enterprise, ProcurementStepDefinition, ProcurementItem, Calendar as ProjectCalendar } from '../types';
 import { AgGridReact } from 'ag-grid-react';
 import { ColDef, ColGroupDef, ValueFormatterParams, CellValueChangedEvent } from 'ag-grid-community';
@@ -54,43 +50,41 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 1. Data Fetching
+  const reloadItems = useCallback(async () => {
+    try {
+      setItems(await fetchProcurementItems(project.id) as any);
+    } catch (error: any) {
+      console.error('Procurement items fetch error:', error);
+      toast.error(`Failed to load procurement packages: ${error?.message || 'Unknown error'}`);
+    }
+  }, [project.id]);
+
   useEffect(() => {
     if (!project.id) return;
-    
-    // Fetch Project Steps
-    const stepsQuery = query(
-      collection(db, 'procurementStepDefinitions'), 
-      where('projectId', '==', project.id),
-      orderBy('order', 'asc')
-    );
-    const unsubSteps = onSnapshot(stepsQuery, (snapshot) => {
-      setStepDefinitions(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProcurementStepDefinition)));
-    }, (error) => {
-      console.error("Firestore Error fetching steps:", error);
-    });
+    void reloadItems();
 
-    // Fetch Packages
-    const itemsQuery = query(collection(db, 'procurementItems'), where('projectId', '==', project.id));
-    const unsubItems = onSnapshot(itemsQuery, (snapshot) => {
-      setItems(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProcurementItem)));
-    }, (error) => {
-       console.error("Firestore Error fetching items:", error);
-    });
-
-    // Fetch Calendars
-    const calendarsQuery = query(collection(db, 'calendars'), where('projectId', '==', project.id));
-    const unsubCalendars = onSnapshot(calendarsQuery, (snapshot) => {
-      setCalendars(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProjectCalendar)));
-    }, (error) => {
-       console.error("Firestore Error fetching calendars:", error);
-    });
-
-    return () => {
-      unsubSteps();
-      unsubItems();
-      unsubCalendars();
+    const loadSteps = async () => {
+      try {
+        setStepDefinitions(await fetchProjectSteps(project.id) as any);
+      } catch (error) {
+        console.error('Procurement steps fetch error:', error);
+      }
     };
-  }, [project.id]);
+    const loadCalendars = async () => {
+      try {
+        setCalendars(await fetchProjectCalendars(project.id) as any);
+      } catch (error) {
+        console.error('Calendars fetch error:', error);
+      }
+    };
+    void loadSteps();
+    void loadCalendars();
+
+    const unsubItems = subscribeToTable('procurement_items', `project_id=eq.${project.id}`, () => void reloadItems());
+    const unsubSteps = subscribeToTable('procurement_step_definitions', `project_id=eq.${project.id}`, () => void loadSteps());
+    const unsubCal = subscribeToTable('calendars', `project_id=eq.${project.id}`, () => void loadCalendars());
+    return () => { unsubItems(); unsubSteps(); unsubCal(); };
+  }, [project.id, reloadItems]);
 
   // 1.5 Sync Engine: Recalculate on load
   const hasSyncedInitialRef = useRef(false);
@@ -99,33 +93,27 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
       hasSyncedInitialRef.current = true;
       
       const syncItems = async () => {
-        const batch = writeBatch(db);
-        let hasChanges = false;
+        const changed: Array<{ packageId: string; stepData: any }> = [];
 
         items.forEach(item => {
           const calendar = calendars.find(c => c.id === item.calendarId) || calendars[0] || { weekends: [0, 6], holidays: [] } as any;
-          let updatedStepData = { ...item.stepData };
-          
-          const stepDataWithPlanned = recalculatePlannedDates(updatedStepData, stepDefinitions, calendar);
+          const stepDataWithPlanned = recalculatePlannedDates({ ...item.stepData }, stepDefinitions, calendar);
           const finalStepData = recalculateForecastDates(stepDataWithPlanned, stepDefinitions, calendar, project.cutoffDate);
-          
-          // Only update if data actually changed
+
+          // Only write the packages whose dates actually moved.
           if (JSON.stringify(item.stepData) !== JSON.stringify(finalStepData)) {
-            batch.update(doc(db, 'procurementItems', item.id), {
-              stepData: finalStepData,
-              updatedAt: new Date().toISOString()
-            });
-            hasChanges = true;
+            changed.push({ packageId: item.packageId, stepData: finalStepData });
           }
         });
 
-        if (hasChanges) {
-          try {
-            await batch.commit();
-            toast.success('Procurement schedule synchronized');
-          } catch (e) {
-            console.error('Initial sync failed:', e);
-          }
+        if (changed.length === 0) return;
+        try {
+          // One statement for every package that moved.
+          await saveProcurementStepData(project.id, changed);
+          await reloadItems();
+          toast.success('Procurement schedule synchronized');
+        } catch (e) {
+          console.error('Initial sync failed:', e);
         }
       };
 
@@ -381,13 +369,16 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
     }
 
     try {
-      await updateDoc(doc(db, 'procurementItems', data.id), {
+      await updateProcurementItem(data.id, {
         stepData: updatedStepData,
-        calendarId: data.calendarId || '',
-        updatedAt: new Date().toISOString()
+        // No calendar is null; '' is not a uuid.
+        calendarId: data.calendarId || null,
       });
-    } catch (e) {
-      handleFirestoreError(e, OperationType.UPDATE, `procurementItems/${data.id}`);
+      await reloadItems();
+    } catch (e: any) {
+      console.error('Failed to update procurement package', e);
+      toast.error(`Failed to update package: ${e?.message || 'Unknown error'}`);
+      await reloadItems();
     }
   };
 
@@ -416,23 +407,19 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
       const initialStepDataWithPlanned = recalculatePlannedDates(initialStepData, stepDefinitions, calendar);
       const finalInitialStepData = recalculateForecastDates(initialStepDataWithPlanned, stepDefinitions, calendar, project.cutoffDate);
 
-      const now = new Date().toISOString();
-      const path = 'procurementItems';
-      await addDoc(collection(db, path), {
-        projectId: project.id,
-        packageId: packageId,
-        description: description,
-        calendarId: calendar.id || '',
+      await createProcurementItem(project.id, {
+        packageId,
+        description,
+        calendarId: calendar.id || undefined,
         enterpriseAttributes: defaults?.attributeValues || {},
-        projectAttributes: {},
         stepData: finalInitialStepData,
-        createdAt: now,
-        updatedAt: now
       });
+      await reloadItems();
       toast.success('Package added successfully');
       setIsCreateModalOpen(false);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.CREATE, 'procurementItems');
+    } catch (e: any) {
+      console.error('Failed to add procurement package', e);
+      toast.error(`Failed to add package: ${e?.message || 'Unknown error'}`);
     }
   };
 
@@ -441,25 +428,22 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
     if (!confirm(`Are you sure you want to delete ${selectedIds.size} packages?`)) return;
 
     try {
-      const batch = writeBatch(db);
-      selectedIds.forEach(id => {
-        batch.delete(doc(db, 'procurementItems', id));
-      });
-      await batch.commit();
+      await deleteProcurementItems(Array.from(selectedIds));
+      await reloadItems();
       setSelectedIds(new Set());
       toast.success('Packages deleted');
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
-      toast.error('Failed to delete packages');
+      toast.error(`Failed to delete packages: ${e?.message || 'Unknown error'}`);
     }
   };
 
   const handleCutoffDateChange = async (newDate: string) => {
     try {
-      await updateDoc(doc(db, 'projects', project.id), {
+      await updateProject(project.id, {
         cutoffDate: newDate,
-        dateLastModified: new Date().toISOString()
-      });
+        dateLastModified: new Date().toISOString(),
+      } as any);
       // Trigger a batch update for all items to recalculate based on new cutoff
       await handleRecalculateAll(newDate);
       toast.success('Cut-off date updated and schedule recalculated');
@@ -471,30 +455,27 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
 
   const handleRecalculateAll = async (cutoffOverride?: string) => {
     const targetCutoff = cutoffOverride || project.cutoffDate || new Date().toISOString().split('T')[0];
-    const batch = writeBatch(db);
-    let hasChanges = false;
-    
+    const changed: Array<{ packageId: string; stepData: any }> = [];
+
     items.forEach(item => {
       const calendar = calendars.find(c => c.id === item.calendarId) || calendars[0] || { weekends: [0, 6], holidays: [] } as any;
       const stepDataWithPlanned = recalculatePlannedDates(item.stepData, stepDefinitions, calendar);
       const finalStepData = recalculateForecastDates(stepDataWithPlanned, stepDefinitions, calendar, targetCutoff);
-      
+
       if (JSON.stringify(item.stepData) !== JSON.stringify(finalStepData)) {
-        batch.update(doc(db, 'procurementItems', item.id), {
-          stepData: finalStepData,
-          updatedAt: new Date().toISOString()
-        });
-        hasChanges = true;
+        changed.push({ packageId: item.packageId, stepData: finalStepData });
       }
     });
 
-    if (hasChanges) {
+    if (changed.length > 0) {
       try {
-        await batch.commit();
+        // One statement for every package whose dates moved.
+        await saveProcurementStepData(project.id, changed);
+        await reloadItems();
         if (!cutoffOverride) toast.success('All schedules recalculated');
-      } catch (e) {
+      } catch (e: any) {
         console.error(e);
-        toast.error('Failed to recalculate items');
+        toast.error(`Failed to recalculate items: ${e?.message || 'Unknown error'}`);
       }
     } else if (!cutoffOverride) {
       toast.info('No changes detected in schedules');
@@ -563,15 +544,11 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
           return;
         }
 
-        const batch = writeBatch(db);
-        const now = new Date().toISOString();
+        const rows: any[] = [];
         const allAttributes = [
           ...(enterprise.procurementAttributes || []),
           ...(project.procurementAttributes || [])
         ].filter(attr => attr.title);
-
-        let updateCount = 0;
-        let createCount = 0;
 
         for (const row of data) {
           const packageId = row['Package ID'] || row['packageId'];
@@ -622,39 +599,31 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
           const afterPlanned = recalculatePlannedDates(stepData, stepDefinitions, cal);
           const finalSD = recalculateForecastDates(afterPlanned, stepDefinitions, cal, project.cutoffDate);
 
-          if (existingItem) {
-            batch.update(doc(db, 'procurementItems', existingItem.id), {
-              description,
-              calendarId,
-              enterpriseAttributes,
-              projectAttributes,
-              stepData: finalSD,
-              updatedAt: now
-            });
-            updateCount++;
-          } else {
-            const newItemRef = doc(collection(db, 'procurementItems'));
-            batch.set(newItemRef, {
-              projectId: project.id,
-              packageId,
-              description,
-              calendarId,
-              enterpriseAttributes,
-              projectAttributes,
-              stepData: finalSD,
-              createdAt: now,
-              updatedAt: now
-            });
-            createCount++;
-          }
+          rows.push({
+            packageId,
+            description,
+            calendarId: calendarId || null,
+            enterpriseAttributes,
+            projectAttributes,
+            stepData: finalSD,
+          });
         }
 
-        await batch.commit();
-        toast.success(`Import complete: ${createCount} added, ${updateCount} updated`);
+        if (rows.length === 0) {
+          toast.error('No rows in the sheet carried a Package ID.');
+          return;
+        }
+
+        // One statement. Upsert on (project_id, package_id), so the database
+        // decides whether a sheet row is a new package or an update -- the
+        // browser used to scan the packages it happened to be holding.
+        const imported = await importProcurementItems(project.id, rows);
+        await reloadItems();
+        toast.success(`Import complete: ${imported} packages`);
         if (fileInputRef.current) fileInputRef.current.value = '';
-      } catch (e) {
+      } catch (e: any) {
         console.error(e);
-        toast.error('Import failed - check console for details');
+        toast.error(`Import failed: ${e?.message || 'Unknown error'}`);
       }
     };
     reader.readAsBinaryString(file);

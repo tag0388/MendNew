@@ -257,3 +257,24 @@ export function resolveCurrentPeriodIndex(
   const i = periods.findIndex((p) => p.id === currentPeriodId);
   return i === -1 ? 0 : i;
 }
+
+/**
+ * Close a progress period, stamping each progress item with what it earned.
+ *
+ * The earned quantity comes from the item's rule of credit -- the weighted
+ * steps and how far each has progressed -- and is computed in the database.
+ * The browser used to read every progress item and every rule of credit in
+ * the project, work it out in JavaScript and write the results back in
+ * batches of 400, which were not atomic with each other.
+ */
+export async function closeProgressPeriod(
+  projectId: string,
+  periodId: string
+): Promise<number> {
+  const { data, error } = await supabase.rpc('close_progress_period', {
+    p_project_id: projectId,
+    p_period_id: periodId,
+  });
+  raise('close progress period', error);
+  return (data as number) ?? 0;
+}
