@@ -212,3 +212,52 @@ export async function deleteSteps(ids: string[]): Promise<void> {
   const { error } = await supabase.from('rule_of_credit_steps').delete().in('id', ids);
   raise('delete steps', error);
 }
+
+/** One patch across many steps, whichever rules they belong to. */
+export async function bulkUpdateSteps(
+  ids: string[],
+  patch: Partial<RuleOfCreditStep>
+): Promise<number> {
+  if (ids.length === 0) return 0;
+  const row = toStepRow(patch);
+  if (Object.keys(row).length === 0) return 0;
+  const { data, error } = await supabase
+    .from('rule_of_credit_steps')
+    .update(row)
+    .in('id', ids)
+    .select('id');
+  raise('bulk update steps', error);
+  return data?.length ?? 0;
+}
+
+/**
+ * Replace the steps of the given rules with the ones supplied.
+ *
+ * An imported sheet states a rule's steps in full, so the rules it names have
+ * their existing steps removed and the sheet's inserted. Rules the sheet does
+ * not mention are untouched.
+ */
+export async function replaceStepsForRules(
+  stepsByRuleId: Record<string, Array<Partial<RuleOfCreditStep>>>
+): Promise<number> {
+  const ruleIds = Object.keys(stepsByRuleId);
+  if (ruleIds.length === 0) return 0;
+
+  const { error: delError } = await supabase
+    .from('rule_of_credit_steps')
+    .delete()
+    .in('rule_of_credit_id', ruleIds);
+  raise('replace steps', delError);
+
+  const rows = ruleIds.flatMap((ruleId) =>
+    stepsByRuleId[ruleId].map((s) => ({ ...toStepRow(s), rule_of_credit_id: ruleId }))
+  );
+  if (rows.length === 0) return 0;
+
+  const { data, error } = await supabase
+    .from('rule_of_credit_steps')
+    .insert(rows)
+    .select('id');
+  raise('replace steps', error);
+  return data?.length ?? 0;
+}

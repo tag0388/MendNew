@@ -1,15 +1,10 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  fetchRulesOfCredit, updateStep as updateStepRow, deleteSteps,
+  bulkUpdateSteps, replaceStepsForRules,
+} from '../lib/rulesOfCredit';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Project, RuleOfCredit, RuleOfCreditStep } from '../types';
-import { db, auth } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  updateDoc, 
-  doc, 
-  writeBatch
-} from 'firebase/firestore';
 import { Download, Upload, Trash2, Loader2, Search, Edit2 } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -20,29 +15,6 @@ import { toast } from 'sonner';
 import { AgGridReact } from 'ag-grid-react';
 import { ColDef, ICellRendererParams } from 'ag-grid-community';
 import * as XLSX from 'xlsx';
-
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-    },
-    operationType,
-    path
-  };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  toast.error(`Firestore Error: ${errInfo.error}`);
-}
 
 interface BulkRulesOfCreditProps {
   project: Project;
@@ -60,19 +32,24 @@ export default function BulkRulesOfCredit({ project, theme = 'light' }: BulkRule
   const [quickFilterText, setQuickFilterText] = useState('');
   const [isImporting, setIsImporting] = useState(false);
 
+  const reload = useCallback(async () => {
+    try {
+      setRules(await fetchRulesOfCredit(project.id) as any);
+    } catch (error: any) {
+      console.error('Rules of credit fetch error:', error);
+      toast.error(`Failed to load rules of credit: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
   useEffect(() => {
     if (!project.id) return;
-    const path = 'rulesOfCredit';
-    const q = query(collection(db, path), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as RuleOfCredit));
-      setRules(data);
-      setLoading(false);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, path);
-    });
-    return unsubscribe;
-  }, [project.id]);
+    void reload();
+    const unsubRules = subscribeToTable('rules_of_credit', `project_id=eq.${project.id}`, () => void reload());
+    const unsubSteps = subscribeToTable('rule_of_credit_steps', undefined, () => void reload());
+    return () => { unsubRules(); unsubSteps(); };
+  }, [reload, project.id]);
 
   const flattenedSteps = useMemo(() => {
     const steps: FlattenedStep[] = [];
@@ -91,35 +68,28 @@ export default function BulkRulesOfCredit({ project, theme = 'light' }: BulkRule
     });
   }, [rules]);
 
-  const updateStepInRoC = async (parentRoCId: string, stepId: string, updates: Partial<RuleOfCreditStep>) => {
-    const rule = rules.find(r => r.id === parentRoCId);
-    if (!rule) return;
-
-    const newSteps = (rule.steps || []).map(s => {
-      if (s.id === stepId) {
-        return { ...s, ...updates };
-      }
-      return s;
-    });
-
+  // A step is a row, so it is edited and deleted by its own id. All of this
+  // used to rebuild the parent rule's whole step array and write it back.
+  const updateStepInRoC = async (_parentRoCId: string, stepId: string, updates: Partial<RuleOfCreditStep>) => {
     try {
-      await updateDoc(doc(db, 'rulesOfCredit', parentRoCId), { steps: newSteps });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `rulesOfCredit/${parentRoCId}`);
+      await updateStepRow(stepId, updates as any);
+      await reload();
+    } catch (error: any) {
+      console.error('Failed to update step', error);
+      toast.error(`Failed to update step: ${error?.message || 'Unknown error'}`);
+      await reload();
     }
   };
 
-  const deleteStepFromRoC = async (parentRoCId: string, stepId: string) => {
+  const deleteStepFromRoC = async (_parentRoCId: string, stepId: string) => {
     if (!window.confirm('Delete this step?')) return;
-    const rule = rules.find(r => r.id === parentRoCId);
-    if (!rule) return;
-
-    const newSteps = (rule.steps || []).filter(s => s.id !== stepId);
     try {
-      await updateDoc(doc(db, 'rulesOfCredit', parentRoCId), { steps: newSteps });
+      await deleteSteps([stepId]);
+      await reload();
       toast.success('Step deleted');
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, `rulesOfCredit/${parentRoCId}`);
+    } catch (error: any) {
+      console.error('Failed to delete step', error);
+      toast.error(`Failed to delete step: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -129,31 +99,16 @@ export default function BulkRulesOfCredit({ project, theme = 'light' }: BulkRule
     if (selectedSteps.length === 0) return;
     if (!window.confirm(`Delete ${selectedSteps.length} selected steps from their respective Rules of Credit?`)) return;
 
-    // Group selected steps by parentRoCId
-    const groupedByRoC: Record<string, string[]> = {};
-    selectedSteps.forEach(s => {
-      if (!groupedByRoC[s.parentRoCId]) groupedByRoC[s.parentRoCId] = [];
-      groupedByRoC[s.parentRoCId].push(s.id);
-    });
-
-    const batch = writeBatch(db);
-    let affectedRules = 0;
-
-    for (const rocId in groupedByRoC) {
-      const rule = rules.find(r => r.id === rocId);
-      if (rule) {
-        const remainingSteps = (rule.steps || []).filter(s => !groupedByRoC[rocId].includes(s.id));
-        batch.update(doc(db, 'rulesOfCredit', rocId), { steps: remainingSteps });
-        affectedRules++;
-      }
-    }
-
     try {
-      await batch.commit();
-      toast.success(`Deleted ${selectedSteps.length} steps from ${affectedRules} rules`);
+      // One statement. Steps are rows, so there is nothing to group by rule
+      // and no step arrays to rebuild.
+      await deleteSteps(selectedSteps.map(s => s.id));
+      await reload();
+      toast.success(`Deleted ${selectedSteps.length} steps`);
       setSelectedSteps([]);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, 'rulesOfCredit');
+    } catch (error: any) {
+      console.error('Failed to delete steps', error);
+      toast.error(`Failed to delete steps: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -163,44 +118,22 @@ export default function BulkRulesOfCredit({ project, theme = 'light' }: BulkRule
   const handleBulkUpdateSteps = async () => {
     if (!bulkUpdateData.field || selectedSteps.length === 0) return;
 
-    // Group selected steps by parentRoCId
-    const groupedByRoC: Record<string, string[]> = {};
-    selectedSteps.forEach(s => {
-      if (!groupedByRoC[s.parentRoCId]) groupedByRoC[s.parentRoCId] = [];
-      groupedByRoC[s.parentRoCId].push(s.id);
-    });
-
-    const batch = writeBatch(db);
-    let affectedRules = 0;
-
-    for (const rocId in groupedByRoC) {
-      const rule = rules.find(r => r.id === rocId);
-      if (rule) {
-        const newSteps = (rule.steps || []).map(s => {
-          if (groupedByRoC[rocId].includes(s.id)) {
-            const val = bulkUpdateData.value;
-            if (bulkUpdateData.field === 'weight' || bulkUpdateData.field === 'orderNo') {
-              return { ...s, [bulkUpdateData.field]: parseFloat(val) || 0 };
-            }
-            return { ...s, [bulkUpdateData.field]: val };
-          }
-          return s;
-        });
-        batch.update(doc(db, 'rulesOfCredit', rocId), { steps: newSteps });
-        affectedRules++;
-      }
-    }
-
     try {
-      await batch.commit();
-      toast.success(`Updated ${selectedSteps.length} steps in ${affectedRules} rules`);
+      const field = bulkUpdateData.field;
+      const value = (field === 'weight' || field === 'orderNo')
+        ? parseFloat(bulkUpdateData.value) || 0
+        : bulkUpdateData.value;
+
+      const updated = await bulkUpdateSteps(selectedSteps.map(s => s.id), { [field]: value } as any);
+      await reload();
+      toast.success(`Updated ${updated} steps`);
       setIsBulkUpdateOpen(false);
       setSelectedSteps([]);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, 'rulesOfCredit');
+    } catch (error: any) {
+      console.error('Failed to bulk update steps', error);
+      toast.error(`Failed to update steps: ${error?.message || 'Unknown error'}`);
     }
   };
-
   const columnDefs = useMemo<ColDef[]>(() => [
     { 
       field: 'ruleId', 
@@ -291,43 +224,45 @@ export default function BulkRulesOfCredit({ project, theme = 'light' }: BulkRule
         const ws = wb.Sheets[wsname];
         const data = XLSX.utils.sheet_to_json(ws) as any[];
 
-        // Group steps by RoC ID
-        const groupedSteps: Record<string, RuleOfCreditStep[]> = {};
-        data.forEach((row, index) => {
+        // The sheet states each rule's steps in full, so the rules it names
+        // have their steps replaced. Rules it does not mention are untouched.
+        const byRuleRowId: Record<string, any[]> = {};
+        const unknownRules = new Set<string>();
+
+        data.forEach(row => {
           const rocId = row['RoC ID']?.toString().trim();
           if (!rocId) return;
 
-          if (!groupedSteps[rocId]) groupedSteps[rocId] = [];
-          
-          groupedSteps[rocId].push({
-            id: Math.random().toString(36).substr(2, 9),
+          const rule = rules.find(r => r.ruleId.toLowerCase() === rocId.toLowerCase());
+          if (!rule) { unknownRules.add(rocId); return; }
+
+          if (!byRuleRowId[rule.id]) byRuleRowId[rule.id] = [];
+          byRuleRowId[rule.id].push({
             orderNo: parseFloat(row['Order No']) || 0,
             description: row['Description']?.toString() || '',
-            weight: parseFloat(row['Weight %']) || 0
+            weight: parseFloat(row['Weight %']) || 0,
           });
         });
 
-        // Batch update
-        const batch = writeBatch(db);
-        let updatedCount = 0;
-
-        for (const rocId in groupedSteps) {
-          const rule = rules.find(r => r.ruleId.toLowerCase() === rocId.toLowerCase());
-          if (rule) {
-            batch.update(doc(db, 'rulesOfCredit', rule.id), { steps: groupedSteps[rocId] });
-            updatedCount++;
-          }
+        const ruleCount = Object.keys(byRuleRowId).length;
+        if (ruleCount === 0) {
+          toast.info(
+            unknownRules.size > 0
+              ? `No matching Rule of Credit IDs found: ${Array.from(unknownRules).join(', ')}. Create the parent rules first.`
+              : 'No rows in the sheet carried a RoC ID.'
+          );
+          return;
         }
 
-        if (updatedCount > 0) {
-          await batch.commit();
-          toast.success(`Imported steps for ${updatedCount} Rules of Credit`);
-        } else {
-          toast.info('No matching Rule of Credit IDs found. Ensure parent RoCs are created first.');
-        }
-      } catch (error) {
+        const inserted = await replaceStepsForRules(byRuleRowId);
+        await reload();
+        toast.success(
+          `Imported ${inserted} steps for ${ruleCount} Rules of Credit.` +
+          (unknownRules.size > 0 ? ` Unknown rules skipped: ${Array.from(unknownRules).join(', ')}` : '')
+        );
+      } catch (error: any) {
         console.error('Import error:', error);
-        toast.error('Failed to parse Excel file');
+        toast.error(`Failed to import steps: ${error?.message || 'Unknown error'}`);
       } finally {
         setIsImporting(false);
         if (e.target) e.target.value = '';
