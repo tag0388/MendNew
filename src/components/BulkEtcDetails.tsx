@@ -4,7 +4,7 @@ import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, Calendar as ProjectCalendar, EtcDetail, ResourceRate, ScheduleItem } from '../types';
 import { subscribeToTable } from '../lib/supabase';
 import { fetchProjectResourceRates } from '../lib/projectSettings';
-import { resolvePhasingWindow, parsePastedDate, toStoredDate } from '../lib/phasing';
+import { parsePastedDate, toStoredDate } from '../lib/phasing';
 import {
   fetchCostCodes,
   fetchCalendars,
@@ -13,7 +13,9 @@ import {
   insertEtcDetailsAt,
   upsertEtcDetail,
   upsertEtcDetails,
-  applyEtcPhasing,
+  applyEtcAutoPhasing,
+  summariseEtcPhasing,
+  recalculateProjectCosts,
   deleteEtcDetails,
   bulkUpdateEtcDetails,
 } from '../lib/costCodes';
@@ -524,370 +526,55 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
 
   const handleCalculatePhasing = async () => {
     const selectedRows = etcGridRef.current?.api.getSelectedRows() || [];
-    let rowsToPhase = etcRows.filter(r => r.phasingMethod === 'Auto-Phase');
-    
-    // If user has selected specific rows, only phase those
-    if (selectedRows.length > 0) {
-      rowsToPhase = selectedRows;
-    }
+    const rowsToPhase = selectedRows.length > 0
+      ? selectedRows
+      : etcRows.filter(r => r.phasingMethod === 'Auto-Phase');
 
     if (rowsToPhase.length === 0) {
-      toast.info("No rows selected for phasing");
+      toast.info('No rows selected for phasing');
       return;
     }
 
-    if (!project.reportingPeriods?.periods) return;
-
-    const allPeriods = project.reportingPeriods.periods;
-    const currentPeriodId = project.reportingPeriods.currentPeriodId;
-    const currentIndex = resolveCurrentPeriodIndex(allPeriods, currentPeriodId);
-    
-    // Distribution periods (starting from next period)
-    const distributionPeriods = allPeriods.slice(currentIndex + 1);
-    // Clearing periods (starting from current period to ensure no old forecast pollution)
-    const periodsToClear = allPeriods.slice(currentIndex);
-
-    if (distributionPeriods.length === 0) {
-      toast.error("No periods available for future phasing");
-      return;
-    }
-
-    // Collected and written in one upsert. Each row already knows its cost
-    // code, so the upsert carries costCodeId straight from the row rather
-    // than from a pane-level selection -- this grid spans every cost code.
-    const phasedRows: Array<{
-      id: string; periodValues: Record<string, number>; qty: number;
-      phasingStartDate?: string | null; phasingEndDate?: string | null;
-    }> = [];
-    let updatedCount = 0;
-
-    // Every reason a row drops out was a silent `continue`, so a run that
-    // phased nothing looked the same as one with nothing to do.
-    const skipped: Record<string, number> = {};
-    const skip = (reason: string) => { skipped[reason] = (skipped[reason] || 0) + 1; };
-    let noCalendarCount = 0;
-
-    const parseDateToUTCMidnight = (val: any): Date | null => {
-      if (!val) return null;
-      if (typeof val === 'string' && val.includes('-')) {
-        const parts = val.split('T')[0].split('-');
-        if (parts.length >= 3) {
-          const p0 = Number(parts[0]);
-          const p1 = Number(parts[1]);
-          const p2 = Number(parts[2]);
-          if (!isNaN(p0) && !isNaN(p1) && !isNaN(p2)) {
-            if (parts[0].length === 4) {
-              return new Date(Date.UTC(p0, p1 - 1, p2));
-            } else if (parts[2].length === 4) {
-              return new Date(Date.UTC(p2, p1 - 1, p0));
-            }
-          }
-        }
-      }
-      let d: Date;
-      if (val instanceof Date) d = val;
-      else if (typeof val === 'object' && 'toDate' in val) d = val.toDate();
-      else d = new Date(val);
-      if (isNaN(d.getTime())) return null;
-      return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
-    };
-
+    const toastId = toast.loading('Calculating phasing...');
     try {
-      for (const row of rowsToPhase) {
-        const phasingQty = Number(row.phasingQty) || 0;
-        if (!phasingQty) { skip('no Phasing Qty'); continue; }
-        if (!row.phasingUnit) { skip('no Phasing Unit'); continue; }
+      // One statement in the database. This screen carried its own copy of the
+      // day-by-day calendar walk, alongside the one in the cost code's ETC
+      // Details tab; there is one implementation now and both screens call it.
+      const outcomes = await applyEtcAutoPhasing(project.id, rowsToPhase.map(r => r.id));
+      const { phased, skipped } = summariseEtcPhasing(outcomes);
 
-        // A row linked to a schedule activity takes its dates from that
-        // activity, read fresh here rather than trusted from the copy stored
-        // when the link was made, so re-phasing follows the programme.
-        const activity = row.activityId
-          ? scheduleItems.find(sch => sch.activityId === row.activityId)
-          : undefined;
-        if (row.activityId && !activity) {
-          skip(`activity ${row.activityId} is not in the schedule`);
-          continue;
-        }
-        const effStart = activity ? activity.currentStartDate : row.phasingStartDate;
-        const effEnd = activity ? activity.currentEndDate : row.phasingEndDate;
-        const userStartRaw = parseDateToUTCMidnight(effStart);
-        const userEndRaw = parseDateToUTCMidnight(effEnd);
-
-        // Retain past periods but clear out all distribution periods before writing new values
-        const newPeriodValues: Record<string, number> = { ...(row.periodValues as Record<string, number> || {}) };
-        periodsToClear.forEach(p => {
-          delete newPeriodValues[p.id];
-          Object.keys(newPeriodValues).forEach(k => { if (k.startsWith(p.id + '_')) delete newPeriodValues[k]; });
-        });
-
-        if (row.phasingUnit === 'Profile' && (!userStartRaw || !userEndRaw)) {
-          const existingPeriodValues = (row.periodValues || {}) as Record<string, number>;
-          let totalWeight = 0;
-          const periodWeights: Record<string, number> = {};
-          
-          distributionPeriods.forEach(p => {
-            let pWeight = Number(existingPeriodValues[p.id]) || 0;
-            Object.entries(existingPeriodValues).forEach(([key, val]) => {
-              if (key.startsWith(p.id + '_')) pWeight += Number(val) || 0;
-            });
-            periodWeights[p.id] = pWeight;
-            totalWeight += pWeight;
-          });
-
-          if (totalWeight > 0) {
-            let remainingQty = phasingQty;
-            distributionPeriods.forEach((p, idx) => {
-              if (idx === distributionPeriods.length - 1) {
-                newPeriodValues[p.id] = Math.round(remainingQty * 10000) / 10000;
-              } else {
-                const weight = periodWeights[p.id] || 0;
-                const periodQty = Math.round(phasingQty * (weight / totalWeight) * 10000) / 10000;
-                newPeriodValues[p.id] = periodQty;
-                remainingQty -= periodQty;
-              }
-            });
-          } else {
-            let remainingQty = phasingQty;
-            const evenQty = Math.round((phasingQty / distributionPeriods.length) * 10000) / 10000;
-            distributionPeriods.forEach((p, idx) => {
-              if (idx === distributionPeriods.length - 1) {
-                newPeriodValues[p.id] = Math.round(remainingQty * 10000) / 10000;
-              } else {
-                newPeriodValues[p.id] = evenQty;
-                remainingQty -= evenQty;
-              }
-            });
-          }
-          
-          phasedRows.push({
-            id: row.id,
-            periodValues: newPeriodValues,
-            qty: Object.keys(newPeriodValues)
-              .filter(key => distributionPeriods.some(dp => dp.id === key))
-              .reduce((sum, key) => sum + (newPeriodValues[key] || 0), 0),
-          });
-          updatedCount++;
-          continue;
-        }
-
-        // Same shared rule as the per-cost-code pane, tested in
-        // src/lib/phasing.test.mjs.
-        const phasingWindow = resolvePhasingWindow(
-          userStartRaw,
-          userEndRaw,
-          distributionPeriods.length > 0
-            ? parseDateToUTCMidnight(distributionPeriods[0].startDate)
-            : null
-        );
-        if (phasingWindow.reason) { skip(phasingWindow.reason); continue; }
-        const userStart = phasingWindow.start!;
-        const userEnd = phasingWindow.end!;
-
-        const calendar = calendars.find(c => c.id === row.calendarId);
-        // No calendar on the row means no weekends and no holidays are known,
-        // so every day counts. That is a 7-day week, which is almost never
-        // what "working days" means -- counted here and reported, rather than
-        // quietly inflating the forecast, and rather than guessing a calendar
-        // on the user's behalf.
-        if (!calendar) noCalendarCount++;
-        const isWorkingDay = (date: Date) => {
-          if (!calendar) return true;
-          const day = date.getUTCDay();
-          const dateStr = date.toISOString().split('T')[0];
-          if (Array.isArray(calendar.weekends) && calendar.weekends.includes(day)) return false;
-          if (Array.isArray(calendar.holidays) && calendar.holidays.includes(dateStr)) return false;
-          return true;
-        };
-
-        const workingDaysInPeriod: Record<string, number> = {};
-        const distributionPeriodIds: string[] = [];
-        let totalWorkingDaysInRange = 0;
-
-        let tempStep = new Date(userStart.getTime());
-        while (tempStep <= userEnd) {
-          if (isWorkingDay(tempStep)) {
-            totalWorkingDaysInRange++; // Count ALL working days in the user's date range
-            const period = distributionPeriods.find(p => {
-              const ps = parseDateToUTCMidnight(p.startDate);
-              const pe = parseDateToUTCMidnight(p.endDate);
-              if (!ps || !pe) return false;
-              // IMPORTANT: we only map to periods that are inside the valid timeline (inclusive)
-              return tempStep >= ps && tempStep <= pe;
-            });
-            if (period) {
-              if (!workingDaysInPeriod[period.id]) {
-                distributionPeriodIds.push(period.id);
-                workingDaysInPeriod[period.id] = 0;
-              }
-              workingDaysInPeriod[period.id]++;
-            }
-          }
-          tempStep.setUTCDate(tempStep.getUTCDate() + 1);
-        }
-
-        if (totalWorkingDaysInRange === 0) { skip('no working days in the date range (check the calendar)'); continue; }
-        if (distributionPeriodIds.length === 0) { skip('the date range does not overlap any future reporting period'); continue; }
-
-        const phasingQtyVal = Number(row.phasingQty) || 0;
-
-        // Total working days strictly covered by configured periods
-        const totalDaysInPeriods = distributionPeriodIds.reduce((sum, pid) => sum + workingDaysInPeriod[pid], 0);
-
-        let sumDistributed = 0;
-        
-        if (row.phasingUnit === 'Total') {
-          // As requested: calculate working days from End Date - MAX(StartDate, Next Period)
-          // then divide the 'Phasing Qty' by the working days to get daily rate.
-          if (totalWorkingDaysInRange > 0) {
-            const dailyQty = phasingQtyVal / totalWorkingDaysInRange;
-            sumDistributed = 0;
-            distributionPeriodIds.forEach((pid, idx) => {
-              if (idx === distributionPeriodIds.length - 1) {
-                 // Distribute any remaining quantity to the last period to ensure 
-                 // the full amount is always phased, even with rounding or period truncation
-                 newPeriodValues[pid] = Math.round((phasingQtyVal - sumDistributed) * 10000) / 10000;
-              } else {
-                 const periodQty = Math.round(dailyQty * workingDaysInPeriod[pid] * 10000) / 10000;
-                 newPeriodValues[pid] = periodQty;
-                 sumDistributed += periodQty;
-              }
-            });
-          }
-        } else if (row.phasingUnit === 'Profile') {
-          const existingPeriodValues = (row.periodValues || {}) as Record<string, number>;
-          let totalWeight = 0;
-          const weights: Record<string, number> = {};
-          
-          distributionPeriodIds.forEach(pid => {
-            let pWeight = Number(existingPeriodValues[pid]) || 0;
-            Object.entries(existingPeriodValues).forEach(([key, val]) => {
-              if (key.startsWith(pid + '_')) pWeight += Number(val) || 0;
-            });
-            weights[pid] = pWeight;
-            totalWeight += pWeight;
-          });
-
-          if (totalWeight > 0) {
-            sumDistributed = 0;
-            distributionPeriodIds.forEach((pid, idx) => {
-              if (idx === distributionPeriodIds.length - 1) {
-                newPeriodValues[pid] = Math.round((phasingQtyVal - sumDistributed) * 10000) / 10000;
-              } else {
-                const weight = weights[pid] / totalWeight;
-                const periodQty = Math.round(phasingQtyVal * weight * 10000) / 10000;
-                newPeriodValues[pid] = periodQty;
-                sumDistributed += periodQty;
-              }
-            });
-          } else {
-            // Fallback for profile behaves like distributing purely over the covered periods
-            sumDistributed = 0;
-            if (totalDaysInPeriods > 0) {
-              distributionPeriodIds.forEach((pid, idx) => {
-                if (idx === distributionPeriodIds.length - 1) {
-                  newPeriodValues[pid] = Math.round((phasingQtyVal - sumDistributed) * 10000) / 10000;
-                } else {
-                  const weight = workingDaysInPeriod[pid] / totalDaysInPeriods;
-                  const periodQty = Math.round(phasingQtyVal * weight * 10000) / 10000;
-                  newPeriodValues[pid] = periodQty;
-                  sumDistributed += periodQty;
-                }
-              });
-            }
-          }
-        } else {
-          let current = new Date(userStart.getTime());
-          while (current <= userEnd) {
-            if (!isWorkingDay(current)) {
-              current.setUTCDate(current.getUTCDate() + 1);
-              continue;
-            }
-
-            const period = distributionPeriods.find(p => {
-              const ps = parseDateToUTCMidnight(p.startDate);
-              const pe = parseDateToUTCMidnight(p.endDate);
-              if (!ps || !pe) return false;
-              return current >= ps && current <= pe;
-            });
-
-            if (period) {
-              let dailyQty = 0;
-              if (row.phasingUnit === 'Daily') {
-                dailyQty = phasingQtyVal;
-              } else if (row.phasingUnit === 'Weekly') {
-                let weekWorkingDays = 0;
-                let weekEnd = new Date(current.getTime());
-                let diff = (weekEndingDay - weekEnd.getUTCDay() + 7) % 7;
-                weekEnd.setUTCDate(weekEnd.getUTCDate() + diff);
-                let weekStart = new Date(weekEnd.getTime());
-                weekStart.setUTCDate(weekStart.getUTCDate() - 6);
-                let weekTemp = new Date(weekStart.getTime());
-                while (weekTemp <= weekEnd) {
-                  if (isWorkingDay(weekTemp)) weekWorkingDays++;
-                  weekTemp.setUTCDate(weekTemp.getUTCDate() + 1);
-                }
-                dailyQty = weekWorkingDays > 0 ? phasingQtyVal / weekWorkingDays : 0;
-              } else if (row.phasingUnit === 'Monthly') {
-                let monthWorkingDays = 0;
-                let monthStart = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), 1));
-                let monthEnd = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 0));
-                let monthTemp = new Date(monthStart.getTime());
-                while (monthTemp <= monthEnd) {
-                  if (isWorkingDay(monthTemp)) monthWorkingDays++;
-                  monthTemp.setUTCDate(monthTemp.getUTCDate() + 1);
-                }
-                dailyQty = monthWorkingDays > 0 ? phasingQtyVal / monthWorkingDays : 0;
-              }
-              newPeriodValues[period.id] = (newPeriodValues[period.id] || 0) + dailyQty;
-            }
-            current.setUTCDate(current.getUTCDate() + 1);
-          }
-
-          distributionPeriodIds.forEach(pid => {
-            newPeriodValues[pid] = Math.round((newPeriodValues[pid] || 0) * 10000) / 10000;
-          });
-        }
-
-        const newFutureQtyTotal = distributionPeriods.reduce((acc, p) => acc + (newPeriodValues[p.id] || 0), 0);
-        
-        phasedRows.push({
-          id: row.id,
-          periodValues: newPeriodValues,
-          qty: Math.round(newFutureQtyTotal * 10000) / 10000,
-          ...(activity
-            ? { phasingStartDate: toDateOnly(effStart), phasingEndDate: toDateOnly(effEnd) }
-            : {}),
-        });
-        updatedCount++;
+      // Phasing changes what each affected cost code's ETC adds up to. Only
+      // the cost codes actually touched are recalculated.
+      const touchedCodes = Array.from(new Set(
+        rowsToPhase.map(r => r.costCodeId).filter(Boolean)
+      )) as string[];
+      if (phased > 0 && touchedCodes.length > 0) {
+        await recalculateProjectCosts(project.id, touchedCodes);
       }
+      await reloadEtcRows();
 
-      if (updatedCount > 0) {
-        const written = await applyEtcPhasing(phasedRows);
-        await reloadEtcRows();
-        const skippedTotal = Object.values(skipped).reduce((a, b) => a + b, 0);
-        if (noCalendarCount > 0) {
-          toast.warning(
-            `${noCalendarCount} row${noCalendarCount === 1 ? ' has' : 's have'} no Calendar set, ` +
-            `so every day counted as a working day (weekends included).`
-          );
-        }
+      const skippedTotal = Object.values(skipped).reduce((a: number, b: number) => a + b, 0);
+      const reasons = Object.entries(skipped)
+        .map(([reason, n]) => `${n} with ${reason}`)
+        .join(', ');
+
+      if (phased > 0) {
         toast.success(
           skippedTotal > 0
-            ? `Phased ${written} row${written === 1 ? '' : 's'}. Skipped ${skippedTotal}: ` +
-              Object.entries(skipped).map(([r, n]) => `${n} with ${r}`).join(', ') + '.'
-            : `Phasing calculated for ${written} row${written === 1 ? '' : 's'}`
+            ? `Phased ${phased} row${phased === 1 ? '' : 's'}. Skipped ${skippedTotal}: ${reasons}.`
+            : `Calculated phasing for ${phased} row${phased === 1 ? '' : 's'}`,
+          { id: toastId }
         );
       } else {
-        const reasons = Object.entries(skipped)
-          .map(([reason, n]) => `${n} with ${reason}`)
-          .join(', ');
         toast.warning(
           reasons
             ? `Nothing to phase: ${reasons}.`
-            : 'Nothing to phase. Set Method to Auto-Phase on the rows you want to calculate.'
+            : 'Nothing to phase. Set Method to Auto-Phase on the rows you want to calculate.',
+          { id: toastId }
         );
       }
     } catch (error: any) {
+      toast.dismiss(toastId);
       console.error('Error calculating phasing:', error);
       toast.error(`Failed to calculate phasing: ${error?.message || 'Unknown error'}`);
     }
