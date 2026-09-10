@@ -1,6 +1,7 @@
+import { subscribeToTable } from '../lib/supabase';
+import { fetchProjectCalendars } from '../lib/projectSettings';
+import { createProjectStep, updateStep, deleteSteps, saveProcurementDefaults } from '../lib/procurement';
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import { db } from '../firebase';
-import { collection, addDoc, deleteDoc, doc, serverTimestamp, updateDoc, query, where, onSnapshot } from 'firebase/firestore';
 import { Project, Enterprise, ProcurementStepDefinition, Calendar as ProjectCalendar } from '../types';
 import { Plus, Trash2, Save, Settings, Calendar as CalendarIcon, Tag, Info } from 'lucide-react';
 import { toast } from 'sonner';
@@ -30,24 +31,29 @@ export default function ProcurementStepConfig({ project, enterprise, currentStep
 
   useEffect(() => {
     if (!project.id) return;
-    const calQuery = query(collection(db, 'calendars'), where('projectId', '==', project.id));
-    const unsubCal = onSnapshot(calQuery, (snapshot) => {
-      setCalendars(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProjectCalendar)));
-    });
-    return () => unsubCal();
+    let active = true;
+    const load = async () => {
+      try {
+        const rows = await fetchProjectCalendars(project.id);
+        if (active) setCalendars(rows as any);
+      } catch (error) {
+        console.error('Calendars fetch error:', error);
+      }
+    };
+    void load();
+    const unsubCal = subscribeToTable('calendars', `project_id=eq.${project.id}`, () => void load());
+    return () => { active = false; unsubCal(); };
   }, [project.id]);
 
   const handleAddStep = async () => {
     if (!newStepName) return;
     try {
       const maxOrder = currentSteps.length > 0 ? Math.max(...currentSteps.map(s => s.order || 0)) : 0;
-      await addDoc(collection(db, 'procurementStepDefinitions'), {
-        projectId: project.id,
+      await createProjectStep(project.id, {
         name: newStepName,
         order: maxOrder + 1,
         defaultDurationDays: 5,
         isEnterpriseStandard: false,
-        createdAt: serverTimestamp()
       });
       setNewStepName('');
       setIsAdding(false);
@@ -61,11 +67,13 @@ export default function ProcurementStepConfig({ project, enterprise, currentStep
   const onCellValueChanged = async (params: CellValueChangedEvent) => {
     const { data } = params;
     try {
-      await updateDoc(doc(db, 'procurementStepDefinitions', data.id), {
+      await updateStep(data.id, {
         name: data.name,
         order: Number(data.order) || 0,
         defaultDurationDays: Number(data.defaultDurationDays) || 0,
-        enterpriseStepId: data.enterpriseStepId || ''
+        // A step derived from no enterprise standard has no link, not '' --
+        // an empty string is not a uuid.
+        enterpriseStepId: data.enterpriseStepId || undefined,
       });
       toast.success('Step updated');
     } catch (e) {
@@ -77,9 +85,7 @@ export default function ProcurementStepConfig({ project, enterprise, currentStep
   const handleSaveDefaults = async () => {
     try {
       setIsSavingDefaults(true);
-      await updateDoc(doc(db, 'projects', project.id), {
-        procurementDefaults: defaults
-      });
+      await saveProcurementDefaults(project.id, defaults);
       toast.success('Project settings updated');
     } catch (e) {
       console.error(e);
@@ -149,7 +155,7 @@ export default function ProcurementStepConfig({ project, enterprise, currentStep
         <button 
           onClick={async () => {
             if (confirm(`Delete step "${params.data.name}"?`)) {
-              await deleteDoc(doc(db, 'procurementStepDefinitions', params.data.id));
+              await deleteSteps([params.data.id]);
               toast.success('Step deleted');
             }
           }}

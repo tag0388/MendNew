@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { db } from '../firebase';
-import { collection, query, where, onSnapshot, orderBy } from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import { fetchProjectSteps, fetchEnterpriseSteps } from '../lib/procurement';
 import { Project, Enterprise, ProcurementStepDefinition } from '../types';
 import ProcurementStepConfig from './ProcurementStepConfig';
 
@@ -15,31 +15,27 @@ export default function ProcurementStepConfigWrapper({ project, enterprise }: Pr
 
   useEffect(() => {
     if (!project.id) return;
-    
-    // Fetch Project Steps
-    const stepsQuery = query(
-      collection(db, 'procurementStepDefinitions'), 
-      where('projectId', '==', project.id),
-      orderBy('order', 'asc')
-    );
-    const unsubSteps = onSnapshot(stepsQuery, (snapshot) => {
-      setCurrentSteps(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProcurementStepDefinition)));
-    });
+    let active = true;
 
-    // Fetch Enterprise Steps
-    const entStepsQuery = query(
-      collection(db, 'procurementStepDefinitions'), 
-      where('enterpriseId', '==', project.enterpriseId),
-      orderBy('order', 'asc')
-    );
-    const unsubEntSteps = onSnapshot(entStepsQuery, (snapshot) => {
-      setEnterpriseSteps(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProcurementStepDefinition)));
-    });
-
-    return () => {
-      unsubSteps();
-      unsubEntSteps();
+    // Both lists come from procurement_step_definitions; a row belongs to the
+    // enterprise or to a project depending on which id it carries.
+    const load = async () => {
+      try {
+        const [steps, entSteps] = await Promise.all([
+          fetchProjectSteps(project.id),
+          project.enterpriseId ? fetchEnterpriseSteps(project.enterpriseId) : Promise.resolve([]),
+        ]);
+        if (!active) return;
+        setCurrentSteps(steps);
+        setEnterpriseSteps(entSteps);
+      } catch (error) {
+        console.error('Procurement steps fetch error:', error);
+      }
     };
+    void load();
+
+    const unsubscribe = subscribeToTable('procurement_step_definitions', undefined, () => void load());
+    return () => { active = false; unsubscribe(); };
   }, [project.id, project.enterpriseId]);
 
   return (
