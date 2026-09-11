@@ -260,7 +260,7 @@ const ProcurementAttributes: React.FC<ProcurementAttributesProps> = ({ project, 
 
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-[#141414]">
-      <div className="flex-1 flex gap-8 p-8 min-h-0">
+      <div className="flex-1 flex gap-4 xl:gap-8 p-4 xl:p-8 min-h-0">
         {/* Left Sidebar */}
         <div className="w-80 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden shadow-sm shrink-0">
           <div className="p-4 border-b border-gray-100 dark:border-white/10">
@@ -306,7 +306,7 @@ const ProcurementAttributes: React.FC<ProcurementAttributesProps> = ({ project, 
         </div>
 
         {/* Right Side */}
-        <div className="flex-1 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden shadow-sm">
+        <div className="flex-1 min-w-0 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden shadow-sm">
           <AnimatePresence mode="wait">
             {selectedAttrId ? (
               <motion.div
