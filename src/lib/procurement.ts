@@ -126,18 +126,24 @@ export async function fetchProcurementItems(projectId: string): Promise<any[]> {
 export async function createProcurementItem(
   projectId: string,
   item: { packageId: string; description?: string; calendarId?: string; enterpriseAttributes?: any; projectAttributes?: any; stepData?: any }
-): Promise<void> {
-  const { error } = await supabase.from('procurement_items').insert({
-    project_id: projectId,
-    package_id: item.packageId,
-    description: item.description ?? '',
-    calendar_id: item.calendarId || null,
-    enterprise_attributes: item.enterpriseAttributes ?? {},
-    project_attributes: item.projectAttributes ?? {},
-    step_data: item.stepData ?? {},
-  });
+): Promise<string> {
+  const { data, error } = await supabase
+    .from('procurement_items')
+    .insert({
+      project_id: projectId,
+      package_id: item.packageId,
+      description: item.description ?? '',
+      calendar_id: item.calendarId || null,
+      enterprise_attributes: item.enterpriseAttributes ?? {},
+      project_attributes: item.projectAttributes ?? {},
+      step_data: item.stepData ?? {},
+    })
+    .select('id')
+    .single();
   // (project_id, package_id) is unique, so a duplicate package is refused.
   raise('add procurement package', error);
+  // The caller needs the id to have the database date its steps.
+  return data?.id as string;
 }
 
 export async function updateProcurementItem(
@@ -165,28 +171,6 @@ export async function deleteProcurementItems(ids: string[]): Promise<void> {
   if (ids.length === 0) return;
   const { error } = await supabase.from('procurement_items').delete().in('id', ids);
   raise('delete procurement packages', error);
-}
-
-/**
- * Write back many packages' recalculated step data in one statement.
- *
- * Upsert on (project_id, package_id), so the rows go in together instead of
- * one write per package.
- */
-export async function saveProcurementStepData(
-  projectId: string,
-  rows: Array<{ packageId: string; stepData: any }>
-): Promise<number> {
-  if (rows.length === 0) return 0;
-  const { data, error } = await supabase
-    .from('procurement_items')
-    .upsert(
-      rows.map((r) => ({ project_id: projectId, package_id: r.packageId, step_data: r.stepData })),
-      { onConflict: 'project_id,package_id' }
-    )
-    .select('id');
-  raise('save procurement schedule', error);
-  return data?.length ?? 0;
 }
 
 /**
@@ -224,4 +208,30 @@ export async function importProcurementItems(
     .select('id');
   raise('import procurement packages', error);
   return data?.length ?? 0;
+}
+
+/**
+ * Recalculate the planned and forecast dates for a project's packages.
+ *
+ * Planned dates are worked backward from the last step, forecast dates
+ * forward from the first, both counting in working days from the package's
+ * calendar. The whole chain runs in the database -- one statement per step,
+ * across every package at once -- so a project with thousands of packages
+ * costs the same round trip as one with ten.
+ *
+ * Pass `packageIds` to recalculate just those packages, e.g. after a single
+ * cell edit. Returns how many packages actually moved, so the caller can stay
+ * quiet when nothing changed.
+ */
+export async function recalculateProcurementDates(
+  projectId: string,
+  packageIds?: string[]
+): Promise<number> {
+  assertId('project', projectId);
+  const { data, error } = await supabase.rpc('recalculate_procurement_dates', {
+    p_project_id: projectId,
+    p_package_ids: packageIds && packageIds.length > 0 ? packageIds : null,
+  });
+  raise('recalculate procurement dates', error);
+  return (data as number) ?? 0;
 }

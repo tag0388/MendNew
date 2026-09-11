@@ -89,7 +89,10 @@ declare
   this_step    uuid;
   next_step    uuid;
   prev_step    uuid;
-  touched      integer := 0;
+  -- The packages each statement actually wrote. Counting by updated_at would
+  -- also catch rows inserted earlier in the same transaction.
+  changed      uuid[] := '{}';
+  written      uuid[];
 begin
   select coalesce(pr.cutoff_date, current_date) into cutoff
     from projects pr where pr.id = p_project_id;
@@ -137,15 +140,20 @@ begin
                b.weekends, b.holidays)::text as new_date
         from base b
        where try_date(b.step_data #>> array[next_step::text, 'plannedDate']) is not null
+    ),
+    done as (
+      update procurement_items t
+         set step_data = jsonb_merge_step(t.step_data, this_step::text, 'plannedDate', to_jsonb(c.new_date)),
+             updated_at = now()
+        from calc c
+       where t.id = c.id
+         and c.new_date is not null
+         -- Only the packages whose date actually moved are written.
+         and (t.step_data #>> array[this_step::text, 'plannedDate']) is distinct from c.new_date
+      returning t.id
     )
-    update procurement_items t
-       set step_data = jsonb_merge_step(t.step_data, this_step::text, 'plannedDate', to_jsonb(c.new_date)),
-           updated_at = now()
-      from calc c
-     where t.id = c.id
-       and c.new_date is not null
-       -- Only the packages whose date actually moved are written.
-       and (t.step_data #>> array[this_step::text, 'plannedDate']) is distinct from c.new_date;
+    select coalesce(array_agg(id), '{}') into written from done;
+    changed := changed || written;
   end loop;
 
   -- ----------------------------------------------- forecast, forward ----
@@ -164,14 +172,19 @@ begin
           from procurement_items it
          where it.project_id = p_project_id
            and (p_package_ids is null or it.id = any (p_package_ids))
+      ),
+      done as (
+        update procurement_items t
+           set step_data = jsonb_merge_step(t.step_data, this_step::text, 'forecastDate', to_jsonb(c.new_date)),
+               updated_at = now()
+          from calc c
+         where t.id = c.id
+           and c.new_date is not null
+           and (t.step_data #>> array[this_step::text, 'forecastDate']) is distinct from c.new_date
+        returning t.id
       )
-      update procurement_items t
-         set step_data = jsonb_merge_step(t.step_data, this_step::text, 'forecastDate', to_jsonb(c.new_date)),
-             updated_at = now()
-        from calc c
-       where t.id = c.id
-         and c.new_date is not null
-         and (t.step_data #>> array[this_step::text, 'forecastDate']) is distinct from c.new_date;
+      select coalesce(array_agg(id), '{}') into written from done;
+      changed := changed || written;
     else
       prev_step := step_ids[i - 1];
 
@@ -205,26 +218,24 @@ begin
                    b.weekends, b.holidays)::text
                ) as new_date
           from base b
+      ),
+      done as (
+        update procurement_items t
+           set step_data = jsonb_merge_step(t.step_data, this_step::text, 'forecastDate', to_jsonb(c.new_date)),
+               updated_at = now()
+          from calc c
+         where t.id = c.id
+           and c.new_date is not null
+           and (t.step_data #>> array[this_step::text, 'forecastDate']) is distinct from c.new_date
+        returning t.id
       )
-      update procurement_items t
-         set step_data = jsonb_merge_step(t.step_data, this_step::text, 'forecastDate', to_jsonb(c.new_date)),
-             updated_at = now()
-        from calc c
-       where t.id = c.id
-         and c.new_date is not null
-         and (t.step_data #>> array[this_step::text, 'forecastDate']) is distinct from c.new_date;
+      select coalesce(array_agg(id), '{}') into written from done;
+      changed := changed || written;
     end if;
   end loop;
 
-  -- now() is the transaction timestamp, so this counts exactly the packages
-  -- the loops above wrote.
-  select count(*) into touched
-    from procurement_items it
-   where it.project_id = p_project_id
-     and (p_package_ids is null or it.id = any (p_package_ids))
-     and it.updated_at = now();
-
-  return touched;
+  -- A package is counted once however many of its steps moved.
+  return (select count(distinct id) from unnest(changed) as u(id));
 end;
 $$;
 
