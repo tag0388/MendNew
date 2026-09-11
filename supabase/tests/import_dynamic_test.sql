@@ -43,15 +43,16 @@ begin
   -- ---------------------------------------------------------- writing ----
   res := apply_import('etc_details', proj, jsonb_build_array(
     jsonb_build_object('Cost Code ID','1100','Item','Labour',
-                       'E_Discipline','Civil', 'E_Phase','Fit-out', 'P_Area','Level 3',
+                       'E_Discipline','d1', 'E_Phase','Fit-out', 'P_Area','Level 3',
                        'Numeric 1','42', 'Text 1','a note',
                        'Jan 26','1000', 'Feb 26','2,500')));
   insert into results values ('the row landed','1', res ->> 'inserted');
   insert into results values ('nothing was left unrecognised','[]', res ->> 'ignored_columns');
 
-  -- The sheet shows what a person reads; the database keeps the id.
+  -- The sheet carries the value's ID, which is what the row stores. The
+  -- description is a label on the attribute definition and stays there.
   insert into results
-  select 'a description is stored as its id','d1', enterprise_attributes ->> '01'
+  select 'the attribute ID is stored exactly as typed','d1', enterprise_attributes ->> '01'
     from etc_details where project_id = proj;
   insert into results
   select 'a free-text attribute is stored as typed','Fit-out', enterprise_attributes ->> '02'
@@ -80,12 +81,14 @@ begin
 
   -- ------------------------------------------------------- validation ----
   rep := validate_import('etc_details', proj, jsonb_build_array(
-    jsonb_build_object('Cost Code ID','1100','Item','x','E_Discipline','Plumbing'),
+    jsonb_build_object('Cost Code ID','1100','Item','x','E_Discipline','Civil'),
     jsonb_build_object('Cost Code ID','1100','Item','y','Numeric 2','lots'),
     jsonb_build_object('Cost Code ID','1100','Item','z','Jan 26','not a number')));
+  -- A description is not an ID. The message names the codes, each with its
+  -- description, so the user can tell which one they meant.
   insert into results
-  select 'an attribute value off the list is caught, and the list is named',
-         'must be one of: Civil, Mech', e ->> 'message'
+  select 'a value that is not one of the defined IDs is refused',
+         'must be one of: d1 (Civil), d2 (Mech)', e ->> 'message'
     from jsonb_array_elements(rep -> 'errors') e where e ->> 'column' = 'E_Discipline';
   insert into results
   select 'text in a user-defined number column is caught','must be a number',
@@ -116,7 +119,7 @@ begin
 
   res := apply_import('subcontract_line_items', sub, jsonb_build_array(
     jsonb_build_object('Item No','1','Description','First','Qty','2','Rate','5',
-                       'E_Trade','Civil','E_Zone','North','Jan 26','100')));
+                       'E_Trade','CIV','E_Zone','NTH','Jan 26','100')));
   -- Pretend the phasing engine had broken that period into weeks.
   update subcontract_line_items
      set period_values = period_values
@@ -129,14 +132,14 @@ begin
          count(*)::text from subcontract_line_items where project_id = proj;
 
   res := apply_import('subcontract_line_items', sub, jsonb_build_array(
-    jsonb_build_object('Item No','1','E_Trade','Mech','Jan 26','250')));
+    jsonb_build_object('Item No','1','E_Trade','MEC','Jan 26','250')));
   insert into results values ('the second sheet updated rather than added','1', res ->> 'updated');
 
   insert into results
-  select 'the attribute in the sheet changed','Mech', enterprise_attributes ->> '01'
+  select 'the attribute in the sheet changed','MEC', enterprise_attributes ->> '01'
     from subcontract_line_items where subcontract_id = sub;
   insert into results
-  select 'the attribute NOT in the sheet survived','North', enterprise_attributes ->> '02'
+  select 'the attribute NOT in the sheet survived','NTH', enterprise_attributes ->> '02'
     from subcontract_line_items where subcontract_id = sub;
   insert into results
   select 'a column not in the sheet kept its value','First', description
