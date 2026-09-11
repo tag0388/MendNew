@@ -395,6 +395,19 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     }
   };
 
+  // Maps the component's short type name onto the attribute set the data
+  // layer knows. Previously an inline chain of ternaries repeated at a dozen
+  // call sites.
+  //
+  // It has to be declared above getAttributes rather than beside its other
+  // helpers: valueIdExists below calls getAttributes during the render body,
+  // which reaches this. A const is in the temporal dead zone until its own
+  // line runs, so declaring it later crashed the screen the moment the Add
+  // Value dialog opened -- the one render where valueIdExists is evaluated.
+  const attributeSetFor = (
+    type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress'
+  ): AttributeSet => `${type}Attributes` as AttributeSet;
+
   const getAttributes = (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress') => {
     const attrs = (enterprise as any)[attributeSetFor(type)] || [];
     
@@ -706,13 +719,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       return aVal < bVal ? 1 : -1;
     });
   }, [enterprise.vendors, vendorSearch, vendorSort, columnFilters.vendors]);
-
-  // Maps the component's short type name onto the attribute set the data
-  // layer knows. Previously an inline chain of ternaries repeated at a dozen
-  // call sites.
-  const attributeSetFor = (
-    type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress'
-  ): AttributeSet => `${type}Attributes` as AttributeSet;
 
   const bulkDeleteProjects = async () => {
     await deleteProjects(Array.from(selectedProjectIds));
