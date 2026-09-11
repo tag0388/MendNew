@@ -1,18 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { Project, Enterprise, CostCode, Subcontract, ScheduleItem } from '../types';
-import { db, auth } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  getDocs,
-  writeBatch,
-  doc,
-  updateDoc,
-  addDoc
-} from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import { fetchCostCodes, fetchScheduleItems } from '../lib/costCodes';
+import {
+  fetchTimephasing, saveCostPhasing, bulkSaveCostPhasing,
+  upsertCostPhasingRows, applyCostPhasing,
+} from '../lib/timephasing';
 import { 
   Search, 
   Download, 
@@ -104,6 +98,14 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
     return formatCurrency(params.value);
   }, []);
 
+  /** A DATE column takes yyyy-mm-dd, not a full ISO timestamp. */
+  const toDateString = (date: Date) => {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  };
+
   const safeDateSetter = (field: string) => (params: any) => {
     const val = params.newValue;
     if (!val) {
@@ -119,440 +121,124 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
     return true;
   };
 
-  // Fetch all cost codes
-  useEffect(() => {
-    const q = query(
-      collection(db, 'costCodes'), 
-      where('projectId', '==', project.id)
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const allCodes = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as CostCode));
-      
-      // Filter codes based on assignedUsers
-      const currentUser = auth.currentUser;
-      const isAdmin = project.users[currentUser?.uid || ''] === 'Project Admin';
-      
-      const filteredCodes = isAdmin 
-        ? allCodes 
-        : allCodes.filter(code => 
-            !code.assignedUsers || 
-            code.assignedUsers.length === 0 || 
-            code.assignedUsers.includes(currentUser?.uid || '')
-          );
-
-      setCostCodes(filteredCodes);
+  // Cost codes. RLS already limits a project user to their assigned codes, so
+  // the browser no longer re-filters what it was sent -- it used to compare
+  // the signed-in id against an assignedUsers array that RLS had already
+  // decided on.
+  const reloadCostCodes = useCallback(async () => {
+    try {
+      setCostCodes(await fetchCostCodes(project.id));
+    } catch (error: any) {
+      console.error('Cost codes fetch error:', error);
+      toast.error(`Failed to fetch cost codes: ${error?.message || 'Unknown error'}`);
+    } finally {
       setLoading(false);
-    }, (error) => {
-      console.error("Cost codes fetch error:", error);
-      toast.error("Failed to fetch cost codes.");
-      setLoading(false);
-    });
-    return () => unsubscribe();
-  }, [project.id, project.users]);
-
-  // Fetch all subcontracts
-  useEffect(() => {
-    const q = query(
-      collection(db, 'subcontracts'),
-      where('projectId', '==', project.id)
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setSubcontracts(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Subcontract)));
-    });
-    return () => unsubscribe();
+    }
   }, [project.id]);
 
-  // Fetch all schedule items
   useEffect(() => {
-    const q = query(
-      collection(db, 'scheduleItems'),
-      where('projectId', '==', project.id)
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setScheduleItems(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ScheduleItem)));
-    });
-    return () => unsubscribe();
-  }, [project.id]);
+    void reloadCostCodes();
+    return subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void reloadCostCodes());
+  }, [reloadCostCodes, project.id]);
 
-  // Fetch all phasing data and construct rows
+  // Schedule activities, for the Activity ID column's date sync.
   useEffect(() => {
-    if (costCodes.length === 0) return;
-
-    setIsTimephasingLoading(true);
-    
-    const fetchData = async () => {
+    let active = true;
+    const load = async () => {
       try {
-        const periods = project.reportingPeriods?.periods || [];
-        const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-        const currentPeriodIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
-        
-        // 1. Get ALL Phasing data for the project
-        const phasingQuery = query(
-          collection(db, 'costPhasing'),
-          where('projectId', '==', project.id)
-        );
-        const phasingSnap = await getDocs(phasingQuery);
-        const allPhasing = phasingSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
-
-        // 2. Get ALL Actuals for the project
-        const actualsQuery = query(
-          collection(db, 'actualCosts'),
-          where('projectId', '==', project.id)
-        );
-        const actualsSnap = await getDocs(actualsQuery);
-        const allActuals = actualsSnap.docs.map(doc => doc.data());
-
-        // 3. Get ALL ETC Details for the project
-        const etcQuery = query(
-          collection(db, 'etcDetails'),
-          where('projectId', '==', project.id)
-        );
-        const etcSnap = await getDocs(etcQuery);
-        const allEtcDetails = etcSnap.docs.map(doc => doc.data());
-
-        // 4. Construct Rows for each cost code
-        const allRows: any[] = [];
-
-        costCodes.forEach(code => {
-          const codePhasing = allPhasing.filter((p: any) => p.costCodeId === code.code);
-          const baselineDoc = codePhasing.find((p: any) => p.type === 'baseline');
-          const approvedDoc = codePhasing.find((p: any) => p.type === 'approved');
-          const eacDoc = codePhasing.find((p: any) => p.type === 'eac');
-
-          const filteredActuals = allActuals.filter((a: any) => a.costCodeId === code.id || a.costCodeId === code.code);
-          const actualsByPeriod: Record<string, number> = {};
-          filteredActuals.forEach((a: any) => {
-            actualsByPeriod[a.reportingPeriodId] = (actualsByPeriod[a.reportingPeriodId] || 0) + (a.cost || 0);
-          });
-
-          const etcDetails = allEtcDetails.filter((etc: any) => etc.costCode === code.code);
-          const etcByPeriod: Record<string, number> = {};
-          const futurePeriodIds = periods.slice(currentPeriodIndex + 1).map(p => p.id);
-          etcDetails.forEach((etc: any) => {
-            if (etc.periodValues) {
-              Object.entries(etc.periodValues).forEach(([periodId, value]) => {
-                if (futurePeriodIds.includes(periodId)) {
-                  etcByPeriod[periodId] = (etcByPeriod[periodId] || 0) + (Number(value) || 0) * (etc.rate || 0);
-                }
-              });
-            }
-          });
-
-          // Subcontract Phasing Aggregation
-          const subphasingByPeriod: Record<string, number> = {};
-          const matchCode = code.code.trim().toUpperCase();
-          
-          subcontracts.forEach(sub => {
-            (sub.lineItems || []).forEach(li => {
-              if (li.status === 'Rejected') return;
-              
-              const rawId = li.costCodeId;
-              const assignedCodeId = (rawId && rawId.trim() !== '') ? rawId : sub.defaultCostCodeId;
-              if (!assignedCodeId) return;
-
-              const assignedClean = assignedCodeId.toString().trim().toUpperCase();
-              const assignedCodeOnly = assignedClean.split(' - ')[0].trim();
-
-              let isMatch = (assignedClean === matchCode || assignedCodeOnly === matchCode);
-              if (!isMatch) {
-                const targetId = (code.id || '').toString().trim().toUpperCase();
-                const targetCodeValue = (code.code || '').toString().trim().toUpperCase();
-                if (assignedClean === targetId || assignedCodeOnly === targetId || assignedClean === targetCodeValue || assignedCodeOnly === targetCodeValue) {
-                  isMatch = true;
-                }
-              }
-
-              if (isMatch && li.periodValues) {
-                Object.entries(li.periodValues).forEach(([pid, val]) => {
-                  subphasingByPeriod[pid] = (subphasingByPeriod[pid] || 0) + (Number(val) || 0);
-                });
-              }
-            });
-          });
-
-          // Baseline Row
-          allRows.push({
-            id: `${code.code}_baseline`,
-            costCode: code.code,
-            costCodeName: code.name,
-            type: 'Baseline Budget',
-            rowType: 'baseline',
-            phasingSource: baselineDoc?.phasingSource || 'Manual',
-            startDate: baselineDoc?.startDate ? new Date(baselineDoc.startDate) : '',
-            endDate: baselineDoc?.endDate ? new Date(baselineDoc.endDate) : '',
-            distribution: baselineDoc?.distribution || 'Even',
-            activityId: baselineDoc?.activityId || '',
-            periodValues: periods.reduce((acc, p) => {
-              const source = baselineDoc?.phasingSource || 'Manual';
-              if (source === 'SubContract') {
-                acc[p.id] = subphasingByPeriod[p.id] || 0;
-              } else {
-                acc[p.id] = baselineDoc?.periodValues?.[p.id] || 0;
-              }
-              return acc;
-            }, {} as Record<string, number>),
-            totalFromCode: code.baselineBudget || 0,
-            docId: baselineDoc?.id
-          });
-
-          // Approved Row
-          allRows.push({
-            id: `${code.code}_approved`,
-            costCode: code.code,
-            costCodeName: code.name,
-            type: 'Approved Budget',
-            rowType: 'approved',
-            phasingSource: approvedDoc?.phasingSource || 'Manual',
-            startDate: approvedDoc?.startDate ? new Date(approvedDoc.startDate) : '',
-            endDate: approvedDoc?.endDate ? new Date(approvedDoc.endDate) : '',
-            distribution: approvedDoc?.distribution || 'Even',
-            activityId: approvedDoc?.activityId || '',
-            periodValues: periods.reduce((acc, p) => {
-              const source = approvedDoc?.phasingSource || 'Manual';
-              if (source === 'SubContract') {
-                acc[p.id] = subphasingByPeriod[p.id] || 0;
-              } else {
-                acc[p.id] = approvedDoc?.periodValues?.[p.id] || 0;
-              }
-              return acc;
-            }, {} as Record<string, number>),
-            totalFromCode: code.approvedBudget || 0,
-            docId: approvedDoc?.id
-          });
-
-          // EAC Row
-          allRows.push({
-            id: `${code.code}_eac`,
-            costCode: code.code,
-            costCodeName: code.name,
-            type: 'Estimate At Completion',
-            rowType: 'eac',
-            phasingSource: eacDoc?.phasingSource || 'ETC Details',
-            startDate: eacDoc?.startDate ? new Date(eacDoc.startDate) : '',
-            endDate: eacDoc?.endDate ? new Date(eacDoc.endDate) : '',
-            distribution: eacDoc?.distribution || 'Even',
-            activityId: eacDoc?.activityId || '',
-            totalFromCode: code.estimateAtCompletion || 0,
-            docId: eacDoc?.id,
-            periodValues: periods.reduce((acc, p, idx) => {
-              const phasingSource = eacDoc?.phasingSource || 'ETC Details';
-              if (phasingSource === 'ETC Details') {
-                if (idx <= currentPeriodIndex) {
-                  acc[p.id] = actualsByPeriod[p.id] || 0;
-                } else {
-                  acc[p.id] = etcByPeriod[p.id] || 0;
-                }
-              } else if (phasingSource === 'SubContract') {
-                if (idx <= currentPeriodIndex) {
-                  acc[p.id] = actualsByPeriod[p.id] || 0;
-                } else {
-                  acc[p.id] = subphasingByPeriod[p.id] || 0;
-                }
-              } else {
-                acc[p.id] = eacDoc?.periodValues?.[p.id] || 0;
-                if (idx <= currentPeriodIndex) {
-                  acc[p.id] = actualsByPeriod[p.id] || 0;
-                }
-              }
-              return acc;
-            }, {} as Record<string, number>)
-          });
-
-          // EAC Previous Row (for chart only)
-          const eacPrevDoc = codePhasing.find((p: any) => p.type === 'eacPrevious');
-          if (eacPrevDoc) {
-            allRows.push({
-              id: `${code.code}_eac_prev`,
-              costCode: code.code,
-              costCodeName: code.name,
-              type: 'EAC Previous',
-              rowType: 'eacPrevious',
-              periodValues: eacPrevDoc.periodValues || {},
-              totalFromCode: code.estimateAtCompletionPrevious || 0,
-              docId: eacPrevDoc.id,
-              hidden: true
-            });
-          }
-        });
-
-        setTimephasingRows(allRows);
-        setIsTimephasingLoading(false);
+        const items = await fetchScheduleItems(project.id);
+        if (active) setScheduleItems(items as any);
       } catch (error) {
-        console.error("Error fetching global timephasing data:", error);
-        setIsTimephasingLoading(false);
+        console.error('Schedule items fetch error:', error);
       }
     };
+    void load();
+    const unsubscribe = subscribeToTable('schedule_items', `project_id=eq.${project.id}`, () => void load());
+    return () => { active = false; unsubscribe(); };
+  }, [project.id]);
 
-    fetchData();
-  }, [costCodes, project.id, project.reportingPeriods, refreshTrigger, subcontracts]);
-
-  const calculatePhasing = useCallback((
-    total: number,
-    startDate: string | Date,
-    endDate: string | Date,
-    distribution: string,
-    periods: any[],
-    existingPeriodValues?: Record<string, number>
-  ) => {
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    if (isNaN(start.getTime()) || isNaN(end.getTime()) || start >= end) return {};
-
-    const periodValues: Record<string, number> = {};
-    const activePeriods = periods.filter(p => {
-      const pStart = new Date(p.startDate);
-      const pEnd = new Date(p.endDate);
-      return (pStart <= end && pEnd >= start);
-    });
-
-    if (activePeriods.length === 0) return {};
-
-    const n = activePeriods.length;
-    let weights: number[] = [];
-
-    switch (distribution) {
-      case 'Even':
-        weights = new Array(n).fill(1);
-        break;
-      case 'Front load':
-        weights = activePeriods.map((_, i) => n - i);
-        break;
-      case 'Back load':
-        weights = activePeriods.map((_, i) => i + 1);
-        break;
-      case 'Bell Curve':
-        weights = activePeriods.map((_, i) => {
-          const x = (i - (n - 1) / 2) / (n / 4 || 1);
-          return Math.exp(-0.5 * x * x);
-        });
-        break;
-      case 'S-Curve':
-        weights = activePeriods.map((_, i) => {
-          const x = (i / (n - 1 || 1)) * 10 - 5;
-          const sigmoid = 1 / (1 + Math.exp(-x));
-          const prevX = ((i - 1) / (n - 1 || 1)) * 10 - 5;
-          const prevSigmoid = i === 0 ? 0 : 1 / (1 + Math.exp(-prevX));
-          return sigmoid - prevSigmoid;
-        });
-        break;
-      case 'Profile':
-        if (existingPeriodValues) {
-          weights = activePeriods.map(p => existingPeriodValues[p.id] || 0);
-          const weightSum = weights.reduce((a, b) => a + b, 0);
-          if (weightSum === 0) {
-            weights = new Array(n).fill(1);
-          }
-        } else {
-          weights = new Array(n).fill(1);
-        }
-        break;
-      default:
-        weights = new Array(n).fill(1);
+  /**
+   * The grid's rows, from project_timephasing.
+   *
+   * This replaces the largest browser-side aggregation in the app: it used to
+   * fetch every cost phasing row, every actual cost transaction, every ETC
+   * detail line and every subcontract in the project, then work out each cost
+   * code's value per period in JavaScript. The rules are unchanged; they run
+   * in SQL now, and only the finished rows cross the network.
+   */
+  const reloadRows = useCallback(async () => {
+    setIsTimephasingLoading(true);
+    try {
+      const rows = await fetchTimephasing(project.id);
+      setTimephasingRows(rows.map(r => ({
+        ...r,
+        // The grid keys its rows by cost code and type, and its date editors
+        // want Date objects.
+        id: `${r.costCode}_${r.rowType}`,
+        startDate: r.startDate ? new Date(r.startDate) : '',
+        endDate: r.endDate ? new Date(r.endDate) : '',
+        hidden: r.rowType === 'eacPrevious',
+      })) as any);
+    } catch (error: any) {
+      console.error('Error fetching global timephasing data:', error);
+      toast.error(`Failed to load timephasing: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setIsTimephasingLoading(false);
     }
+  }, [project.id]);
 
-    const totalWeight = weights.reduce((a, b) => a + b, 0);
-    activePeriods.forEach((p, i) => {
-      periodValues[p.id] = (weights[i] / (totalWeight || 1)) * total;
-    });
-
-    return periodValues;
-  }, []);
+  useEffect(() => {
+    void reloadRows();
+    // The rows are derived from five tables, so each of them refreshes the grid.
+    const unsubs = [
+      subscribeToTable('cost_phasing', `project_id=eq.${project.id}`, () => void reloadRows()),
+      subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void reloadRows()),
+      subscribeToTable('actual_costs', `project_id=eq.${project.id}`, () => void reloadRows()),
+      subscribeToTable('etc_details', `project_id=eq.${project.id}`, () => void reloadRows()),
+      subscribeToTable('subcontract_line_items', `project_id=eq.${project.id}`, () => void reloadRows()),
+    ];
+    return () => unsubs.forEach(u => u());
+  }, [reloadRows, project.id, refreshTrigger]);
 
   const handleCalculateAutoPhasing = useCallback(async () => {
-    const selectedNodes = gridRef.current?.api.getSelectedNodes();
-    const selectedRows = selectedNodes?.map(node => node.data) || [];
-    
-    let rowsToProcess = [];
-    if (selectedRows.length > 0) {
-      rowsToProcess = selectedRows.filter(r => r.phasingSource === 'Auto');
-      if (rowsToProcess.length === 0) {
-        toast.info("Selected rows are not set to 'Auto' phasing source.");
-        return;
-      }
-    } else {
-      rowsToProcess = timephasingRows.filter(r => r.phasingSource === 'Auto');
-      if (rowsToProcess.length === 0) {
-        toast.info("No rows set to 'Auto' phasing source.");
-        return;
-      }
+    const selectedRows = (gridRef.current?.api.getSelectedNodes() || []).map(node => node.data);
+    const scoped = selectedRows.length > 0;
+    const autoRows = (scoped ? selectedRows : timephasingRows).filter(r => r?.phasingSource === 'Auto');
+
+    if (autoRows.length === 0) {
+      toast.info(scoped
+        ? "Selected rows are not set to 'Auto' phasing source."
+        : "No rows set to 'Auto' phasing source.");
+      return;
     }
 
     setIsTimephasingLoading(true);
     try {
-      const batch = writeBatch(db);
-      const periods = project.reportingPeriods?.periods || [];
-      const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-      const currentPeriod = periods.find(p => p.id === currentPeriodId);
-      const currentPeriodEnd = currentPeriod ? new Date(currentPeriod.endDate) : null;
-      const currentIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
-      const nextPeriodStart = (currentIndex !== -1 && currentIndex < periods.length - 1) 
-        ? periods[currentIndex + 1].startDate 
-        : null;
-
-      let updatedCount = 0;
-
-      for (const row of rowsToProcess) {
-        if (row.startDate && row.endDate && row.distribution) {
-          let total = row.totalFromCode || 0;
-          let effectiveStartDate = row.startDate;
-
-          // SPECIAL LOGIC FOR EAC
-          if (row.rowType === 'eac') {
-            const code = costCodes.find(c => c.code === row.costCode);
-            total = code?.estimateToComplete || 0;
-            
-            if (currentPeriodEnd && nextPeriodStart) {
-              const userStart = new Date(row.startDate);
-              if (userStart <= currentPeriodEnd) {
-                effectiveStartDate = nextPeriodStart;
-              }
-            }
-          }
-
-          const newPhasing = calculatePhasing(
-            total,
-            effectiveStartDate,
-            row.endDate,
-            row.distribution,
-            periods,
-            row.periodValues
-          );
-
-          const updatePayload = {
-            projectId: project.id,
-            costCodeId: row.costCode,
-            type: row.rowType,
-            phasingSource: 'Auto',
-            startDate: row.startDate instanceof Date ? row.startDate.toISOString() : row.startDate,
-            endDate: row.endDate instanceof Date ? row.endDate.toISOString() : row.endDate,
-            distribution: row.distribution,
-            periodValues: newPhasing,
-            updatedAt: new Date().toISOString()
-          };
-
-          if (row.docId) {
-            batch.update(doc(db, 'costPhasing', row.docId), updatePayload);
-          } else {
-            batch.set(doc(collection(db, 'costPhasing')), updatePayload);
-          }
-          updatedCount++;
-        }
-      }
-
-      if (updatedCount > 0) {
-        await batch.commit();
-        toast.success(`Recalculated phasing for ${updatedCount} row(s)`);
-        setRefreshTrigger(prev => prev + 1);
+      // The whole calculation is one statement in the database: which periods
+      // each row's dates touch, the weight per period for its distribution
+      // curve, and the amount to spread -- the budget for a budget row, the
+      // estimate still to spend for an EAC row, which cannot start before the
+      // next open period.
+      //
+      // It used to run here, over every row in the project, and write the
+      // results back in a batch.
+      const phased = await applyCostPhasing(
+        project.id,
+        scoped ? autoRows.map(r => r.phasingId).filter(Boolean) : undefined
+      );
+      await reloadRows();
+      if (phased > 0) {
+        toast.success(`Recalculated phasing for ${phased} row(s)`);
       } else {
-        toast.warning("Incomplete auto-phasing settings (Dates or Distribution missing)");
+        toast.warning('Incomplete auto-phasing settings (dates or distribution missing)');
       }
-    } catch (error) {
-      console.error("Error calculating auto phasing:", error);
-      toast.error("Failed to calculate auto phasing");
+    } catch (error: any) {
+      console.error('Error calculating auto phasing:', error);
+      toast.error(`Failed to calculate auto phasing: ${error?.message || 'Unknown error'}`);
     } finally {
       setIsTimephasingLoading(false);
     }
-  }, [project.id, project.reportingPeriods, costCodes, timephasingRows, calculatePhasing]);
+  }, [project.id, timephasingRows, reloadRows]);
 
   const onCellValueChanged = useCallback(async (params: any) => {
     const { data, colDef, newValue, oldValue } = params;
@@ -562,25 +248,21 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
     const isPeriodValue = field?.startsWith('periodValues.');
 
     try {
-      const updatePayload: any = {
-        projectId: project.id,
-        costCodeId: data.costCode,
-        type: data.rowType,
-        updatedAt: new Date().toISOString()
-      };
+      const patch: any = {};
 
       if (isPeriodValue) {
-        updatePayload.periodValues = data.periodValues;
+        patch.periodValues = data.periodValues;
       } else {
-        updatePayload[field] = newValue instanceof Date ? newValue.toISOString() : newValue;
-        
+        // start_date / end_date are DATE columns; an ISO timestamp is refused.
+        patch[field] = newValue instanceof Date ? toDateString(newValue) : newValue;
+
         // Auto-populate dates if Activity ID changes
         if (field === 'activityId' && newValue) {
-          const scheduleItem = scheduleItems.find(s => s.activityId === newValue);
+          const scheduleItem = scheduleItems.find(sch => sch.activityId === newValue);
           if (scheduleItem) {
             let startDate = '';
             let endDate = '';
-            
+
             if (data.rowType === 'baseline') {
               startDate = scheduleItem.baselineStartDate;
               endDate = scheduleItem.baselineEndDate;
@@ -591,10 +273,10 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
               startDate = scheduleItem.currentStartDate;
               endDate = scheduleItem.currentEndDate;
             }
-            
-            if (startDate) updatePayload.startDate = startDate;
-            if (endDate) updatePayload.endDate = endDate;
-            
+
+            if (startDate) patch.startDate = startDate;
+            if (endDate) patch.endDate = endDate;
+
             // Update local row data for immediate feedback
             data.startDate = startDate ? new Date(startDate) : '';
             data.endDate = endDate ? new Date(endDate) : '';
@@ -603,66 +285,49 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
         }
       }
 
-      if (data.docId) {
-        await updateDoc(doc(db, 'costPhasing', data.docId), updatePayload);
-      } else {
-        const docRef = await addDoc(collection(db, 'costPhasing'), updatePayload);
-        data.docId = docRef.id;
-      }
-      
+      // (cost_code_id, type) is unique, so this creates the phasing row or
+      // updates it. The browser used to track whether one existed.
+      await saveCostPhasing(project.id, data.costCodeId, data.rowType, patch);
+
       if (field === 'activityId') {
         toast.success('Synced dates from schedule');
-        setRefreshTrigger(prev => prev + 1);
       }
-    } catch (error) {
-      console.error("Error updating phasing cell:", error);
-      toast.error("Failed to save changes");
+      await reloadRows();
+    } catch (error: any) {
+      console.error('Error updating phasing cell:', error);
+      toast.error(`Failed to save changes: ${error?.message || 'Unknown error'}`);
+      await reloadRows();
     }
-  }, [project.id, scheduleItems]);
+  }, [project.id, scheduleItems, reloadRows]);
 
   const handleBulkUpdate = async () => {
-    const selectedNodes = gridRef.current?.api.getSelectedNodes();
-    const selectedRows = selectedNodes?.map(node => node.data) || [];
+    const selectedRows = (gridRef.current?.api.getSelectedNodes() || []).map(node => node.data);
 
     if (selectedRows.length === 0) {
-      toast.warning("Please select rows to bulk update");
+      toast.warning('Please select rows to bulk update');
       return;
     }
 
     setIsTimephasingLoading(true);
     try {
-      const batch = writeBatch(db);
-      let updatedCount = 0;
-
-      for (const row of selectedRows) {
-        const updatePayload: any = {
-          projectId: project.id,
-          costCodeId: row.costCode,
-          type: row.rowType,
-          updatedAt: new Date().toISOString()
-        };
-
-        if (bulkUpdateData.phasingSource) updatePayload.phasingSource = bulkUpdateData.phasingSource;
-        if (bulkUpdateData.startDate) updatePayload.startDate = bulkUpdateData.startDate;
-        if (bulkUpdateData.endDate) updatePayload.endDate = bulkUpdateData.endDate;
-        if (bulkUpdateData.distribution) updatePayload.distribution = bulkUpdateData.distribution;
-
-        if (row.docId) {
-          batch.update(doc(db, 'costPhasing', row.docId), updatePayload);
-        } else {
-          batch.set(doc(collection(db, 'costPhasing')), updatePayload);
+      // One upsert for every selected row.
+      const updated = await bulkSaveCostPhasing(
+        project.id,
+        selectedRows.map(r => ({ costCodeId: r.costCodeId, type: r.rowType })),
+        {
+          phasingSource: bulkUpdateData.phasingSource || undefined,
+          startDate: bulkUpdateData.startDate || undefined,
+          endDate: bulkUpdateData.endDate || undefined,
+          distribution: bulkUpdateData.distribution || undefined,
         }
-        updatedCount++;
-      }
-
-      await batch.commit();
-      toast.success(`Bulk updated ${updatedCount} row(s)`);
+      );
+      await reloadRows();
+      toast.success(`Bulk updated ${updated} row(s)`);
       setIsBulkUpdateOpen(false);
       setBulkUpdateData({});
-      setRefreshTrigger(prev => prev + 1);
-    } catch (error) {
-      console.error("Error bulk updating phasing:", error);
-      toast.error("Failed to bulk update");
+    } catch (error: any) {
+      console.error('Error bulk updating phasing:', error);
+      toast.error(`Failed to bulk update: ${error?.message || 'Unknown error'}`);
     } finally {
       setIsTimephasingLoading(false);
     }
@@ -906,49 +571,40 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
     const reader = new FileReader();
     reader.onload = async (evt) => {
       try {
-        const bstr = evt.target?.result;
-        const wb = XLSX.read(bstr, { type: 'binary' });
-        const wsname = wb.SheetNames[0];
-        const ws = wb.Sheets[wsname];
-        const data = XLSX.utils.sheet_to_json(ws) as any[];
+        const wb = XLSX.read(evt.target?.result, { type: 'binary' });
+        const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]) as any[];
 
         const periods = project.reportingPeriods?.periods || [];
-        const batch = writeBatch(db);
-        let importCount = 0;
+        const labelToRowType: Record<string, string> = {
+          'Baseline Budget': 'baseline',
+          'Approved Budget': 'approved',
+          'Estimate At Completion': 'eac',
+        };
         const errors: string[] = [];
+        const writes: Array<{ costCodeId: string; rowType: string; periodValues: Record<string, number> }> = [];
 
         for (const excelRow of data) {
           const costCode = excelRow['Cost Code'];
           const typeLabel = excelRow['Type'];
-          
           if (!costCode || !typeLabel) continue;
 
-          // Validation 1: Check if Cost Code exists in project
-          const costCodeExists = costCodes.some(c => c.code === costCode);
-          if (!costCodeExists) {
+          const code = costCodes.find(c => c.code === costCode);
+          if (!code) {
             errors.push(`Cost Code "${costCode}" does not exist in this project.`);
             continue;
           }
 
-          // Determine rowType from label
-          let rowType = '';
-          const validTypes = ['Baseline Budget', 'Approved Budget', 'Estimate At Completion'];
-          if (typeLabel === 'Baseline Budget') rowType = 'baseline';
-          else if (typeLabel === 'Approved Budget') rowType = 'approved';
-          else if (typeLabel === 'Estimate At Completion') rowType = 'eac';
-
-          // Validation 2: Check if Type is valid
+          const rowType = labelToRowType[typeLabel];
           if (!rowType) {
-            errors.push(`Invalid Type "${typeLabel}" for Cost Code "${costCode}". Must be one of: ${validTypes.join(', ')}`);
+            errors.push(`Invalid Type "${typeLabel}" for Cost Code "${costCode}". Must be one of: ${Object.keys(labelToRowType).join(', ')}`);
             continue;
           }
 
-          // Rule 1: Always ignore EAC actuals
+          // An EAC row's periods are actual cost up to the current period and
+          // a forecast after it, both derived; a sheet cannot overwrite them.
           if (rowType === 'eac') continue;
 
-          // Find existing row to get docId
           const existingRow = timephasingRows.find(r => r.costCode === costCode && r.rowType === rowType);
-          
           const periodValues: Record<string, number> = { ...(existingRow?.periodValues || {}) };
           let hasChanges = false;
 
@@ -962,49 +618,39 @@ export default function GlobalTimephasing({ project, enterprise, theme = 'light'
             }
           });
 
-          if (hasChanges) {
-            const updatePayload: any = {
-              projectId: project.id,
-              costCodeId: costCode,
-              type: rowType,
-              periodValues,
-              updatedAt: new Date().toISOString()
-            };
-
-            // Rule 2: Formulas (Total, Total Phased, Difference) are ignored (not in payload)
-            // Rule 3: Phasing Source, Dates, Distribution are kept as is unless user changed them in grid
-            // Here we only update periodValues from Excel
-
-            if (existingRow?.docId) {
-              batch.update(doc(db, 'costPhasing', existingRow.docId), updatePayload);
-            } else {
-              batch.set(doc(collection(db, 'costPhasing')), updatePayload);
-            }
-            importCount++;
-          }
+          // Totals and differences in the sheet are formulas; the phasing
+          // source, dates and distribution stay as the grid has them.
+          if (hasChanges) writes.push({ costCodeId: code.id, rowType, periodValues });
         }
 
         if (errors.length > 0) {
-          // Show first few errors to avoid overwhelming the toast
           const displayErrors = errors.slice(0, 3);
-          const errorMsg = displayErrors.join('\n') + (errors.length > 3 ? `\n...and ${errors.length - 3} more errors.` : '');
-          toast.error("Import failed due to validation errors:", {
-            description: errorMsg,
-            duration: 5000
+          toast.error('Import failed due to validation errors:', {
+            description: displayErrors.join('\n') + (errors.length > 3 ? `\n...and ${errors.length - 3} more errors.` : ''),
+            duration: 5000,
           });
           return;
         }
 
-        if (importCount > 0) {
-          await batch.commit();
-          toast.success(`Successfully imported phasing for ${importCount} rows`);
-          setRefreshTrigger(prev => prev + 1);
-        } else {
-          toast.info("No valid changes found in Excel file.");
+        if (writes.length === 0) {
+          toast.info('No valid changes found in Excel file.');
+          return;
         }
-      } catch (error) {
-        console.error("Excel import error:", error);
-        toast.error("Failed to import Excel file. Ensure format matches export.");
+
+        // Each row carries its own period map, and they all go in one
+        // statement -- (cost_code_id, type) is unique, so a row the project
+        // does not have yet is created rather than needing to be looked up
+        // first. This used to be a Firestore batch capped at 500 writes.
+        const saved = await upsertCostPhasingRows(project.id, writes.map(w => ({
+          costCodeId: w.costCodeId,
+          type: w.rowType,
+          periodValues: w.periodValues,
+        })));
+        await reloadRows();
+        toast.success(`Successfully imported phasing for ${saved} rows`);
+      } catch (error: any) {
+        console.error('Excel import error:', error);
+        toast.error(`Failed to import Excel file: ${error?.message || 'Ensure the format matches the export.'}`);
       }
     };
     reader.readAsBinaryString(file);

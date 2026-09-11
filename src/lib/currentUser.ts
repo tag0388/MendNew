@@ -1,15 +1,14 @@
 import { supabase } from './supabase';
 
 /**
- * TEMPORARY MIGRATION BRIDGE.
+ * The signed-in user, for display and for stamping created_by.
  *
- * 25 components still read `auth.currentUser?.uid` / `.email` from the Firebase
- * SDK. Porting 50k lines in one pass would be untestable, so this mirrors the
- * Supabase session behind the same shape, letting modules be converted one at
- * a time. Delete it once no component imports from '../firebase'.
+ * This began as a bridge while modules were converted one at a time; the SDK
+ * it mirrored is gone now and this is simply where the session is read from.
  *
- * Never use this for authorization -- it is a client-side convenience for
- * display and for stamping created_by. Access is decided by RLS.
+ * Never use it for authorization. Access is decided by RLS, which reads the
+ * session server-side -- what this object says is a client-side convenience
+ * and a browser can say anything.
  */
 export interface CurrentUser {
   uid: string;

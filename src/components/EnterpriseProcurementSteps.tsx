@@ -1,17 +1,8 @@
-import React, { useState, useEffect } from 'react';
-import { db } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  doc, 
-  serverTimestamp,
-  orderBy
-} from 'firebase/firestore';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  fetchEnterpriseSteps, createEnterpriseStep, updateStep, deleteSteps,
+} from '../lib/procurement';
+import React, { useState, useEffect, useCallback } from 'react';
 import { ProcurementStepDefinition } from '../types';
 import { 
   Plus, 
@@ -36,30 +27,31 @@ export default function EnterpriseProcurementSteps({ enterpriseId }: EnterpriseP
   const [editingStepId, setEditingStepId] = useState<string | null>(null);
   const [editData, setEditData] = useState<{ name: string; order: number }>({ name: '', order: 0 });
 
+  const reload = useCallback(async () => {
+    if (!enterpriseId) return;
+    try {
+      setSteps(await fetchEnterpriseSteps(enterpriseId));
+    } catch (error) {
+      console.error('Enterprise procurement steps fetch error:', error);
+    }
+  }, [enterpriseId]);
+
   useEffect(() => {
     if (!enterpriseId) return;
-    const q = query(
-      collection(db, 'procurementStepDefinitions'),
-      where('enterpriseId', '==', enterpriseId),
-      orderBy('order', 'asc')
-    );
-    const unsub = onSnapshot(q, (snapshot) => {
-      setSteps(snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProcurementStepDefinition)));
-    });
-    return () => unsub();
-  }, [enterpriseId]);
+    void reload();
+    return subscribeToTable(
+      'procurement_step_definitions', `enterprise_id=eq.${enterpriseId}`, () => void reload());
+  }, [reload, enterpriseId]);
 
   const handleAdd = async () => {
     if (!newStepName) return;
     try {
       const maxOrder = steps.length > 0 ? Math.max(...steps.map(s => s.order || 0)) : 0;
-      await addDoc(collection(db, 'procurementStepDefinitions'), {
-        enterpriseId,
+      await createEnterpriseStep(enterpriseId, {
         name: newStepName,
         order: maxOrder + 1,
-        isEnterpriseStandard: true,
-        createdAt: serverTimestamp()
       });
+      await reload();
       setNewStepName('');
       setIsAdding(false);
       toast.success('Standard step added');
@@ -79,10 +71,8 @@ export default function EnterpriseProcurementSteps({ enterpriseId }: EnterpriseP
         return;
       }
 
-      await updateDoc(doc(db, 'procurementStepDefinitions', id), {
-        name: editData.name,
-        order: order
-      });
+      await updateStep(id, { name: editData.name, order });
+      await reload();
       setEditingStepId(null);
       toast.success('Step updated');
     } catch (e) {
@@ -94,10 +84,12 @@ export default function EnterpriseProcurementSteps({ enterpriseId }: EnterpriseP
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this standard step? Projects already using it will not be affected.')) return;
     try {
-      await deleteDoc(doc(db, 'procurementStepDefinitions', id));
+      await deleteSteps([id]);
+      await reload();
       toast.success('Standard step deleted');
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      toast.error(`Failed to delete step: ${e?.message || 'Unknown error'}`);
     }
   };
 

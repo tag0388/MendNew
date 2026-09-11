@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Project, ProjectAttribute, ProjectAttributeValue, Enterprise } from '../types';
-import { db } from '../firebase';
-import { doc, updateDoc } from 'firebase/firestore';
+import { updateProjectAttributeSet } from '../lib/projectSettings';
 import { 
   Plus, 
   Trash2, 
@@ -74,7 +73,7 @@ const ProcurementAttributes: React.FC<ProcurementAttributesProps> = ({ project, 
 
   const handleGlobalSave = async (updatedAttrs: ProjectAttribute[]) => {
     try {
-      await updateDoc(doc(db, 'projects', project.id), { procurementAttributes: updatedAttrs });
+      await updateProjectAttributeSet(project.id, 'procurementAttributes', updatedAttrs);
     } catch (error) {
       console.error('Error saving procurement attributes:', error);
       toast.error('Failed to save changes.');

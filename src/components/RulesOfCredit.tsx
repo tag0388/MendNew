@@ -1,17 +1,12 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import { subscribeToTable, fromRows } from '../lib/supabase';
+import { supabase } from '../lib/supabase';
+import {
+  fetchRulesOfCredit, createRuleOfCredit, updateRuleOfCredit,
+  deleteRulesOfCredit, bulkUpdateRulesOfCredit, importRulesOfCredit,
+  upsertSteps, updateStep as updateStepRow, deleteSteps,
+} from '../lib/rulesOfCredit';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Project, RuleOfCredit, RuleOfCreditStep, ProgressPackage } from '../types';
-import { db, auth } from '../firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  doc, 
-  deleteDoc, 
-  writeBatch
-} from 'firebase/firestore';
 import { Download, Upload, Trash2, X, Loader2, Edit2, Plus } from 'lucide-react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -23,42 +18,6 @@ import { toast } from 'sonner';
 import { AgGridReact } from 'ag-grid-react';
 import { ColDef, ICellRendererParams } from 'ag-grid-community';
 import * as XLSX from 'xlsx';
-
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-    },
-    operationType,
-    path
-  };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  toast.error(`Firestore Error: ${errInfo.error}`);
-  throw new Error(JSON.stringify(errInfo));
-}
 
 interface RulesOfCreditProps {
   project: Project;
@@ -76,30 +35,46 @@ export default function RulesOfCredit({ project, theme = 'light' }: RulesOfCredi
 
   const selectedRule = useMemo(() => rules.find(r => r.id === selectedRuleId), [rules, selectedRuleId]);
 
-  useEffect(() => {
-    if (!project.id) return;
-    const path = 'rulesOfCredit';
-    const q = query(collection(db, path), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as RuleOfCredit));
-      setRules(data);
+  const reload = useCallback(async () => {
+    try {
+      // The rules come back with their steps attached, because that is the
+      // shape the grids draw -- but the steps are rows in their own table, so
+      // adding one no longer rewrites every step of the rule.
+      setRules(await fetchRulesOfCredit(project.id) as any);
+    } catch (error: any) {
+      console.error('Rules of credit fetch error:', error);
+      toast.error(`Failed to load rules of credit: ${error?.message || 'Unknown error'}`);
+    } finally {
       setLoading(false);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, path);
-    });
-    return unsubscribe;
+    }
   }, [project.id]);
 
   useEffect(() => {
     if (!project.id) return;
-    const q = query(collection(db, 'progressPackages'), where('projectId', '==', project.id));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProgressPackage));
-      setPackages(data);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, 'progressPackages');
-    });
-    return unsubscribe;
+    void reload();
+    const unsubRules = subscribeToTable('rules_of_credit', `project_id=eq.${project.id}`, () => void reload());
+    const unsubSteps = subscribeToTable('rule_of_credit_steps', undefined, () => void reload());
+    return () => { unsubRules(); unsubSteps(); };
+  }, [reload, project.id]);
+
+  useEffect(() => {
+    if (!project.id) return;
+    let active = true;
+    const load = async () => {
+      const { data, error } = await supabase
+        .from('progress_packages')
+        .select('*')
+        .eq('project_id', project.id)
+        .order('package_id');
+      if (error) {
+        console.error('Progress packages fetch error:', error);
+        return;
+      }
+      if (active) setPackages(fromRows<ProgressPackage>(data));
+    };
+    void load();
+    const unsubscribe = subscribeToTable('progress_packages', `project_id=eq.${project.id}`, () => void load());
+    return () => { active = false; unsubscribe(); };
   }, [project.id]);
 
   const handleAdd = async (e: React.FormEvent) => {
@@ -126,21 +101,20 @@ export default function RulesOfCredit({ project, theme = 'light' }: RulesOfCredi
     }
 
     setSaving(true);
-    const path = 'rulesOfCredit';
     try {
-      await addDoc(collection(db, path), {
+      // (project_id, rule_id) is unique, so a duplicate reference is refused
+      // by the database as well as by the check above.
+      await createRuleOfCredit(project.id, {
         ruleId: formData.ruleId,
         description: formData.description || '',
-        packageId: formData.packageId || '',
-        steps: [],
-        projectId: project.id,
-        createdAt: new Date().toISOString()
       });
+      await reload();
       setIsAdding(false);
       setFormData({ ruleId: '', description: '', packageId: '' });
       toast.success('Rule of Credit added');
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
+    } catch (error: any) {
+      console.error('Failed to add rule of credit', error);
+      toast.error(`Failed to add rule: ${error?.message || 'Unknown error'}`);
     } finally {
       setSaving(false);
     }
@@ -149,22 +123,26 @@ export default function RulesOfCredit({ project, theme = 'light' }: RulesOfCredi
   const deleteRule = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!window.confirm('Delete this Rule of Credit and all its steps?')) return;
-    const path = `rulesOfCredit/${id}`;
     try {
-      await deleteDoc(doc(db, 'rulesOfCredit', id));
+      // The rule's steps cascade with it.
+      await deleteRulesOfCredit([id]);
+      await reload();
       if (selectedRuleId === id) setSelectedRuleId(null);
       toast.success('Rule deleted');
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, path);
+    } catch (error: any) {
+      console.error('Failed to delete rule', error);
+      toast.error(`Failed to delete rule: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const updateRule = async (id: string, updates: Partial<RuleOfCredit>) => {
-    const path = `rulesOfCredit/${id}`;
     try {
-      await updateDoc(doc(db, 'rulesOfCredit', id), updates);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, path);
+      await updateRuleOfCredit(id, updates as any);
+      await reload();
+    } catch (error: any) {
+      console.error('Failed to update rule', error);
+      toast.error(`Failed to update rule: ${error?.message || 'Unknown error'}`);
+      await reload();
     }
   };
 
@@ -175,36 +153,37 @@ export default function RulesOfCredit({ project, theme = 'light' }: RulesOfCredi
       ? Math.max(...selectedRule.steps.map(s => s.orderNo)) + 1 
       : 1;
 
-    const newStep: RuleOfCreditStep = {
-      id: Math.random().toString(36).substr(2, 9),
-      orderNo: nextOrder,
-      description: 'New Step',
-      weight: 0
-    };
-
-    const newSteps = [...(selectedRule.steps || []), newStep];
-    await updateRule(selectedRuleId, { steps: newSteps });
+    // One row. Adding a step used to rewrite every step of the rule, because
+    // they were an array inside the rule's document.
+    try {
+      await upsertSteps(selectedRuleId, [{ orderNo: nextOrder, description: 'New Step', weight: 0 }]);
+      await reload();
+    } catch (error: any) {
+      console.error('Failed to add step', error);
+      toast.error(`Failed to add step: ${error?.message || 'Unknown error'}`);
+    }
   };
 
   const updateStep = async (stepId: string, updates: Partial<RuleOfCreditStep>) => {
-    if (!selectedRuleId || !selectedRule) return;
-
-    const newSteps = (selectedRule.steps || []).map(s => {
-      if (s.id === stepId) {
-        return { ...s, ...updates };
-      }
-      return s;
-    });
-
-    await updateRule(selectedRuleId, { steps: newSteps });
+    try {
+      await updateStepRow(stepId, updates as any);
+      await reload();
+    } catch (error: any) {
+      console.error('Failed to update step', error);
+      toast.error(`Failed to update step: ${error?.message || 'Unknown error'}`);
+      await reload();
+    }
   };
 
   const deleteStep = async (stepId: string) => {
-    if (!selectedRuleId || !selectedRule) return;
     if (!window.confirm('Delete this step?')) return;
-
-    const newSteps = (selectedRule.steps || []).filter(s => s.id !== stepId);
-    await updateRule(selectedRuleId, { steps: newSteps });
+    try {
+      await deleteSteps([stepId]);
+      await reload();
+    } catch (error: any) {
+      console.error('Failed to delete step', error);
+      toast.error(`Failed to delete step: ${error?.message || 'Unknown error'}`);
+    }
   };
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -213,18 +192,16 @@ export default function RulesOfCredit({ project, theme = 'light' }: RulesOfCredi
     if (selectedIds.length === 0) return;
     if (!window.confirm(`Delete ${selectedIds.length} Rules of Credit and all their steps?`)) return;
 
-    const batch = writeBatch(db);
-    selectedIds.forEach(id => {
-      batch.delete(doc(db, 'rulesOfCredit', id));
-    });
-
     try {
-      await batch.commit();
+      // One statement; each rule's steps cascade with it.
+      await deleteRulesOfCredit(selectedIds);
+      await reload();
       toast.success(`Deleted ${selectedIds.length} rules`);
-      setSelectedIds([]);
       if (selectedIds.includes(selectedRuleId || '')) setSelectedRuleId(null);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, 'rulesOfCredit');
+      setSelectedIds([]);
+    } catch (error: any) {
+      console.error('Failed to delete rules', error);
+      toast.error(`Failed to delete rules: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -234,18 +211,17 @@ export default function RulesOfCredit({ project, theme = 'light' }: RulesOfCredi
   const handleBulkUpdate = async () => {
     if (!bulkUpdateData.field || selectedIds.length === 0) return;
     
-    const batch = writeBatch(db);
-    selectedIds.forEach(id => {
-      batch.update(doc(db, 'rulesOfCredit', id), { [bulkUpdateData.field]: bulkUpdateData.value });
-    });
-
     try {
-      await batch.commit();
-      toast.success(`Updated ${selectedIds.length} rules`);
+      const updated = await bulkUpdateRulesOfCredit(selectedIds, {
+        [bulkUpdateData.field]: bulkUpdateData.value,
+      } as any);
+      await reload();
+      toast.success(`Updated ${updated} rules`);
       setIsBulkUpdateOpen(false);
       setSelectedIds([]);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, 'rulesOfCredit');
+    } catch (error: any) {
+      console.error('Failed to bulk update rules', error);
+      toast.error(`Failed to update rules: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -434,47 +410,33 @@ export default function RulesOfCredit({ project, theme = 'light' }: RulesOfCredi
         const ws = wb.Sheets[wsname];
         const data = XLSX.utils.sheet_to_json(ws) as any[];
 
-        const batch = writeBatch(db);
-        let count = 0;
-
-        for (const row of data) {
-          const rocId = row['RoC ID']?.toString().trim();
-          if (!rocId) continue;
-
-          // Check if it already exists
-          const existing = rules.find(r => r.ruleId.toLowerCase() === rocId.toLowerCase());
-          
-          const payload = {
-            ruleId: rocId,
+        const rows = data
+          .map(row => ({
+            ruleId: row['RoC ID']?.toString().trim() || '',
             description: row['Description']?.toString() || '',
-            packageId: row['Package ID']?.toString() || '',
             userField1: row['Field 1']?.toString() || '',
             userField2: row['Field 2']?.toString() || '',
             userField3: row['Field 3']?.toString() || '',
             userField4: row['Field 4']?.toString() || '',
             userField5: row['Field 5']?.toString() || '',
-            projectId: project.id,
-            updatedAt: new Date().toISOString()
-          };
+          }))
+          .filter(r => r.ruleId);
 
-          if (existing) {
-            batch.update(doc(db, 'rulesOfCredit', existing.id), payload);
-          } else {
-            const newDocRef = doc(collection(db, 'rulesOfCredit'));
-            batch.set(newDocRef, {
-              ...payload,
-              steps: [],
-              createdAt: new Date().toISOString()
-            });
-          }
-          count++;
+        if (rows.length === 0) {
+          toast.error('No rows in the sheet carried a RoC ID.');
+          return;
         }
 
-        await batch.commit();
-        toast.success(`Imported/Updated ${count} Rules of Credit`);
-      } catch (error) {
+        // One statement. Upsert on (project_id, rule_id), so the database
+        // decides whether a sheet row is a new rule or an existing one --
+        // this used to be a case-insensitive scan of the rules the browser
+        // happened to be holding.
+        const imported = await importRulesOfCredit(project.id, rows);
+        await reload();
+        toast.success(`Imported/Updated ${imported} Rules of Credit`);
+      } catch (error: any) {
         console.error('Import error:', error);
-        toast.error('Failed to parse Excel file');
+        toast.error(`Failed to import: ${error?.message || 'Unknown error'}`);
       } finally {
         setIsImporting(false);
         if (e.target) e.target.value = '';

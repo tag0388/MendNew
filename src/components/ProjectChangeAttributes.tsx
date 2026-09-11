@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Project, ProjectAttribute, ProjectAttributeValue } from '../types';
-import { db } from '../firebase';
-import { doc, updateDoc } from 'firebase/firestore';
+import { updateProjectAttributeSet } from '../lib/projectSettings';
 import { 
   Plus, 
   Trash2, 
@@ -73,7 +72,7 @@ const ProjectChangeAttributes: React.FC<ProjectChangeAttributesProps> = ({ proje
 
   const handleGlobalSave = async (updatedAttrs: ProjectAttribute[]) => {
     try {
-      await updateDoc(doc(db, 'projects', project.id), { changeAttributes: updatedAttrs });
+      await updateProjectAttributeSet(project.id, 'changeAttributes', updatedAttrs);
     } catch (error) {
       console.error('Error saving change attributes:', error);
       toast.error('Failed to save changes.');

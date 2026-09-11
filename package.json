@@ -28,7 +28,6 @@
     "dotenv": "^17.2.3",
     "esbuild": "^0.28.1",
     "express": "^4.21.2",
-    "firebase": "^11.0.0",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "next-themes": "^0.4.6",

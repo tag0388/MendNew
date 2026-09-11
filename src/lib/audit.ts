@@ -1,25 +1,35 @@
-import { db, auth } from '../firebase';
-import { collection, addDoc } from 'firebase/firestore';
+import { supabase } from './supabase';
+import { getCurrentUser } from './currentUser';
 
+/**
+ * Append-only record of who did what.
+ *
+ * The table has no update or delete policy, and its insert policy requires
+ * user_id to be the acting user, so a row cannot be written on someone else's
+ * behalf or edited afterwards.
+ *
+ * A failure here is logged and swallowed: an audit write must never take down
+ * the action it is recording.
+ */
 export async function logAuditAction(
-  enterpriseId: string, 
-  projectId: string | null, 
-  action: string, 
+  enterpriseId: string,
+  projectId: string | null,
+  action: string,
   details: any = {}
-) {
-  const user = auth.currentUser;
+): Promise<void> {
+  const user = getCurrentUser();
   if (!user) return;
 
   try {
-    await addDoc(collection(db, 'auditLogs'), {
-      enterpriseId,
-      projectId,
-      userId: user.uid,
-      userEmail: user.email,
+    const { error } = await supabase.from('audit_logs').insert({
+      enterprise_id: enterpriseId,
+      project_id: projectId,
+      user_id: user.uid,
+      user_email: user.email,
       action,
-      timestamp: new Date().toISOString(),
-      details
+      details,
     });
+    if (error) console.error('Audit log failed:', error.message);
   } catch (error) {
     console.error('Audit log failed:', error);
   }

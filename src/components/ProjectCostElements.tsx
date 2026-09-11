@@ -1,7 +1,10 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Project, Enterprise, ProjectCostElement, SavedView } from '../types';
-import { db, auth } from '../firebase';
-import { doc, updateDoc, onSnapshot, collection, query, where, addDoc, deleteDoc } from 'firebase/firestore';
+import { subscribeToTable, fromRow } from '../lib/supabase';
+import { getCurrentUser } from '../lib/currentUser';
+import { fetchSavedViews, createSavedView, deleteSavedView } from '../lib/savedViews';
+import { updateProject, fetchProject } from '../lib/projects';
+import { fetchEnterprise } from '../lib/session';
 import { 
   Search, 
   Plus, 
@@ -56,15 +59,22 @@ export default function ProjectCostElements({ project }: ProjectCostElementsProp
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load Enterprise Data
+  // Load Enterprise Data -- the enterprise's cost elements are the list a
+  // project element can be mapped to.
   useEffect(() => {
     if (!project.enterpriseId) return;
-    const unsub = onSnapshot(doc(db, 'enterprises', project.enterpriseId), (doc) => {
-      if (doc.exists()) {
-        setEnterprise({ id: doc.id, ...doc.data() } as Enterprise);
+    let active = true;
+    const load = async () => {
+      try {
+        const ent = await fetchEnterprise(project.enterpriseId);
+        if (active) setEnterprise(ent);
+      } catch (error) {
+        console.error('ProjectCostElements: enterprise fetch error:', error);
       }
-    });
-    return () => unsub();
+    };
+    void load();
+    const unsubscribe = subscribeToTable('enterprises', `id=eq.${project.enterpriseId}`, () => void load());
+    return () => { active = false; unsubscribe(); };
   }, [project.enterpriseId]);
 
   // Sync with project prop
@@ -72,38 +82,41 @@ export default function ProjectCostElements({ project }: ProjectCostElementsProp
     setElements(project.costElements || []);
   }, [project.costElements]);
 
-  // Load Saved Views from Firestore
+  // Saved views are per user; RLS restricts every row to the signed-in user.
+  const tableId = `projectCostElements_${project.id}`;
+  const currentUser = getCurrentUser();
+
+  const reloadViews = useCallback(async () => {
+    if (!currentUser) return;
+    try {
+      setSavedViews(await fetchSavedViews(currentUser.uid, tableId) as any);
+    } catch (error) {
+      console.error('ProjectCostElements: saved views fetch error:', error);
+    }
+  }, [currentUser?.uid, tableId]);
+
   useEffect(() => {
-    if (!auth.currentUser) return;
-    const q = query(
-      collection(db, 'savedViews'), 
-      where('userId', '==', auth.currentUser.uid),
-      where('tableId', '==', `projectCostElements_${project.id}`)
-    );
-    const unsub = onSnapshot(q, (snapshot) => {
-      const views = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as SavedView));
-      setSavedViews(views);
-    });
-    return () => unsub();
-  }, [project.id, auth.currentUser?.uid]);
+    if (!currentUser) return;
+    void reloadViews();
+    return subscribeToTable('saved_views', `user_id=eq.${currentUser.uid}`, () => void reloadViews());
+  }, [reloadViews, currentUser?.uid]);
 
   const saveView = async (name: string) => {
-    if (!name.trim() || !auth.currentUser) return;
+    if (!name.trim() || !currentUser) return;
     try {
-      const newView: Omit<SavedView, 'id'> = {
+      await createSavedView(currentUser.uid, {
         name,
-        tableId: `projectCostElements_${project.id}`,
+        tableId,
         columns: visibleColumns,
-        userId: auth.currentUser.uid,
-        createdAt: new Date().toISOString()
-      };
-      await addDoc(collection(db, 'savedViews'), newView);
+        projectId: project.id,
+      });
+      await reloadViews();
       setNewViewName('');
       setIsSavedViewMenuOpen(false);
       toast.success('View saved successfully.');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error saving view:', error);
-      toast.error('Failed to save view.');
+      toast.error(`Failed to save view: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -114,11 +127,12 @@ export default function ProjectCostElements({ project }: ProjectCostElementsProp
 
   const deleteView = async (id: string) => {
     try {
-      await deleteDoc(doc(db, 'savedViews', id));
+      await deleteSavedView(id);
+      await reloadViews();
       toast.success('View deleted.');
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error deleting view:', error);
-      toast.error('Failed to delete view.');
+      toast.error(`Failed to delete view: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -130,13 +144,15 @@ export default function ProjectCostElements({ project }: ProjectCostElementsProp
 
   const handleGlobalSave = async (updatedElements: ProjectCostElement[]) => {
     try {
-      await updateDoc(doc(db, 'projects', project.id), { 
+      // A project carries a few dozen cost elements and they are always read
+      // as a whole list, so they live in one jsonb column rather than a table.
+      await updateProject(project.id, {
         costElements: updatedElements,
-        dateLastModified: new Date().toISOString()
-      });
-    } catch (error) {
+        dateLastModified: new Date().toISOString(),
+      } as any);
+    } catch (error: any) {
       console.error('Error saving cost elements:', error);
-      toast.error('Failed to save changes to database.');
+      toast.error(`Failed to save changes: ${error?.message || 'Unknown error'}`);
     }
   };
 

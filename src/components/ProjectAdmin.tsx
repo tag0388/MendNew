@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { db } from '../firebase';
-import { doc, updateDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { supabase, subscribeToTable } from '../lib/supabase';
+import { updateProject, fetchProjectMembers, assignProjectMember, removeProjectMember } from '../lib/projects';
+import { fetchEnterpriseUsers, type ProjectRole } from '../lib/session';
 import { Project, Enterprise } from '../types';
 import { 
   Calendar as CalendarIcon, 
@@ -120,13 +121,15 @@ export default function ProjectAdmin({ project, enterprise }: ProjectAdminProps)
       }
       
       try {
-        const q = query(
-          collection(db, 'projects'),
-          where('enterpriseId', '==', project.enterpriseId),
-          where('projectCode', '==', newProjectCode.trim())
-        );
-        const querySnapshot = await getDocs(q);
-        setIsDuplicate(!querySnapshot.empty);
+        // (enterprise_id, project_code) is unique in the database, so this
+        // check is a courtesy -- a duplicate is refused on write either way.
+        const { count, error } = await supabase
+          .from('projects')
+          .select('id', { count: 'exact', head: true })
+          .eq('enterprise_id', project.enterpriseId)
+          .eq('project_code', newProjectCode.trim());
+        if (error) throw error;
+        setIsDuplicate((count ?? 0) > 0);
       } catch (error) {
         console.error('Error checking duplicate ID:', error);
       }
@@ -176,11 +179,10 @@ export default function ProjectAdmin({ project, enterprise }: ProjectAdminProps)
     try {
       if (!project.id) throw new Error('Project ID is missing');
 
-      const projectRef = doc(db, 'projects', project.id);
-      await updateDoc(projectRef, {
+      await updateProject(project.id, {
         ...dataToSave,
-        dateLastModified: new Date().toISOString()
-      });
+        dateLastModified: new Date().toISOString(),
+      } as any);
       setLastSaved(new Date().toLocaleTimeString());
     } catch (error) {
       console.error('Update failed', error);
@@ -226,45 +228,100 @@ export default function ProjectAdmin({ project, enterprise }: ProjectAdminProps)
     setReplaceError('');
 
     try {
-      // Check for duplicates
-      const q = query(
-        collection(db, 'projects'),
-        where('enterpriseId', '==', project.enterpriseId),
-        where('projectCode', '==', newProjectCode.trim())
-      );
-      const querySnapshot = await getDocs(q);
-      
-      if (!querySnapshot.empty) {
-        setReplaceError('This Project ID already exists in the enterprise.');
-        setIsReplacing(false);
-        return;
-      }
-
-      const projectRef = doc(db, 'projects', project.id);
-      await updateDoc(projectRef, {
+      // (enterprise_id, project_code) is unique, so a duplicate is refused by
+      // the database. The check up front turns that into a clear message
+      // rather than a constraint violation, but it is not what enforces it.
+      await updateProject(project.id, {
         projectCode: newProjectCode.trim(),
-        dateLastModified: new Date().toISOString()
-      });
+        dateLastModified: new Date().toISOString(),
+      } as any);
 
       setIsReplaceIdModalOpen(false);
       setNewProjectCode('');
       // The parent component should ideally refresh the project data
-    } catch (error) {
+    } catch (error: any) {
       console.error('Replace ID failed', error);
-      setReplaceError('Failed to replace Project ID.');
+      setReplaceError(
+        /duplicate|unique/i.test(error?.message || '')
+          ? 'This Project ID already exists in the enterprise.'
+          : `Failed to replace Project ID: ${error?.message || 'Unknown error'}`
+      );
     } finally {
       setIsReplacing(false);
     }
   };
 
-  const toggleUser = async (uid: string) => {
-    const newUsers = { ...project.users };
-    if (newUsers[uid]) {
-      delete newUsers[uid];
-    } else {
-      newUsers[uid] = 'Project User';
+  /**
+   * Who is on the project, and who could be.
+   *
+   * Both lists used to be read from maps embedded on the project and
+   * enterprise documents -- `project.users[uid]` and `enterprise.users` --
+   * which is a Firestore shape with no equivalent here. Membership is rows:
+   * project_members, whose composite foreign key to enterprise_members is what
+   * enforces "assigned from the list of Enterprise users", so somebody outside
+   * the enterprise cannot be added to one of its projects.
+   */
+  const [members, setMembers] = useState<Record<string, ProjectRole>>({});
+  const [enterpriseUsers, setEnterpriseUsers] = useState<
+    Array<{ userId: string; email: string; role: string }>
+  >([]);
+
+  const reloadMembers = useCallback(async () => {
+    try {
+      const rows = await fetchProjectMembers(project.id);
+      const byId: Record<string, ProjectRole> = {};
+      rows.forEach(r => { byId[r.userId] = r.role as ProjectRole; });
+      setMembers(byId);
+    } catch (error) {
+      console.error('ProjectAdmin: project members fetch error:', error);
     }
-    await updateDoc(doc(db, 'projects', project.id), { users: newUsers });
+  }, [project.id]);
+
+  useEffect(() => {
+    void reloadMembers();
+    return subscribeToTable('project_members', `project_id=eq.${project.id}`, () => void reloadMembers());
+  }, [reloadMembers, project.id]);
+
+  useEffect(() => {
+    if (!project.enterpriseId) return;
+    let active = true;
+    const load = async () => {
+      try {
+        const rows = await fetchEnterpriseUsers(project.enterpriseId);
+        if (active) setEnterpriseUsers(rows.map(r => ({ userId: r.userId, email: r.email, role: r.role })));
+      } catch (error) {
+        console.error('ProjectAdmin: enterprise users fetch error:', error);
+      }
+    };
+    void load();
+    const unsubscribe = subscribeToTable('enterprise_members', `enterprise_id=eq.${project.enterpriseId}`, () => void load());
+    return () => { active = false; unsubscribe(); };
+  }, [project.enterpriseId]);
+
+  const toggleUser = async (uid: string) => {
+    try {
+      if (members[uid]) {
+        // cost_code_users cascades, so unassigning from the project also drops
+        // that person's cost code assignments.
+        await removeProjectMember(project.id, uid);
+      } else {
+        await assignProjectMember(project.id, project.enterpriseId, uid, 'Project User');
+      }
+      await reloadMembers();
+    } catch (error: any) {
+      console.error('Failed to change project access', error);
+      alert(`Failed to change project access: ${error?.message || 'Unknown error'}`);
+    }
+  };
+
+  const setUserRole = async (uid: string, role: ProjectRole) => {
+    try {
+      await assignProjectMember(project.id, project.enterpriseId, uid, role);
+      await reloadMembers();
+    } catch (error: any) {
+      console.error('Failed to change project role', error);
+      alert(`Failed to change project role: ${error?.message || 'Unknown error'}`);
+    }
   };
 
   const adminItems = [
@@ -559,27 +616,24 @@ export default function ProjectAdmin({ project, enterprise }: ProjectAdminProps)
                 <h2 className="text-lg font-bold mb-2 dark:text-white">Project Access</h2>
                 <p className="text-sm text-gray-900 dark:text-gray-400 mb-6">Select users from the enterprise to grant project access.</p>
                 <div className="space-y-2">
-                  {Object.entries(enterprise.users || {}).map(([uid, data]) => (
+                  {enterpriseUsers.map(({ userId: uid, email, role }) => (
                     <div key={uid} className="flex items-center justify-between p-4 hover:bg-gray-50 dark:hover:bg-white/5 rounded-xl transition-colors border border-transparent hover:border-gray-200 dark:hover:border-white/10">
                       <div className="flex items-center gap-4">
                         <input 
                           type="checkbox" 
-                          checked={!!project.users[uid]}
+                          checked={!!members[uid]}
                           onChange={() => toggleUser(uid)}
                           className="w-5 h-5 rounded border-gray-300 dark:border-white/10 text-blue-600 focus:ring-blue-500 bg-transparent"
                         />
                         <div>
-                          <p className="text-sm font-bold dark:text-white">{data.email}</p>
-                          <p className="text-[10px] text-gray-900 dark:text-gray-400 uppercase tracking-widest font-bold">{data.role}</p>
+                          <p className="text-sm font-bold dark:text-white">{email}</p>
+                          <p className="text-[10px] text-gray-900 dark:text-gray-400 uppercase tracking-widest font-bold">{role}</p>
                         </div>
                       </div>
-                      {project.users[uid] && (
+                      {members[uid] && (
                         <select 
-                          value={project.users[uid]}
-                          onChange={async (e) => {
-                            const newUsers = { ...project.users, [uid]: e.target.value as any };
-                            await updateDoc(doc(db, 'projects', project.id), { users: newUsers });
-                          }}
+                          value={members[uid]}
+                          onChange={(e) => void setUserRole(uid, e.target.value as ProjectRole)}
                           className="text-xs bg-gray-100 dark:bg-white/5 border-none rounded-lg px-3 py-1.5 font-bold uppercase tracking-widest text-gray-900 dark:text-gray-400 outline-none focus:ring-2 focus:ring-blue-500"
                         >
                           <option value="Project User">User</option>

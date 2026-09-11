@@ -9,6 +9,7 @@ import ProgressManagementSubPane from './ProgressManagementSubPane';
 import TimeSchedule from './TimeSchedule';
 import Invoicing from './Invoicing';
 import ErrorBoundary from './ErrorBoundary';
+import { fetchProjectCostTotals, type ProjectCostTotals } from '../lib/projects';
 import { cn } from '../lib/utils';
 import { 
   Plus, 
@@ -25,6 +26,7 @@ import {
   PieChart,
   DollarSign,
   TrendingUp,
+  Target,
   Activity,
   Users as UsersIcon,
   Receipt,
@@ -45,6 +47,29 @@ interface ProjectDashboardProps {
 
 export default function ProjectDashboard({ project, enterprise, currentModule, subModuleId, setIsSidebarCollapsed, user, theme = 'light' }: ProjectDashboardProps) {
 
+  // The headline figures come from project_cost_totals -- one grouped
+  // aggregate over the project's cost codes, the same call the enterprise
+  // dashboard makes. Nothing is summed in the browser.
+  const [totals, setTotals] = useState<ProjectCostTotals | null>(null);
+  useEffect(() => {
+    if (!project?.id || currentModule !== 'dashboard') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const byProject = await fetchProjectCostTotals([project.id]);
+        if (!cancelled) setTotals(byProject[project.id] ?? null);
+      } catch (e) {
+        console.error('Project cost totals fetch error:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [project?.id, currentModule]);
+
+  const money = (n: number | undefined) =>
+    n === undefined
+      ? '--'
+      : n.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+
   const renderModuleContent = () => {
     switch (currentModule) {
       case 'dashboard':
@@ -52,12 +77,10 @@ export default function ProjectDashboard({ project, enterprise, currentModule, s
           <div className="space-y-8">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
               {[
-                // TODO(supabase-port): source these from cost_codes once the
-                // data layer lands -- they were previously derived from the
-                // forecast-sheet feature, which has been removed.
-                { label: 'Total EAC', value: '--', icon: DollarSign, color: 'text-blue-600' },
-                { label: 'Total ETC', value: '--', icon: TrendingUp, color: 'text-emerald-600' },
-                { label: 'Performance Index', value: '1.04', icon: Activity, color: 'text-[#FF6321]' },
+                { label: 'Approved Budget', value: money(totals?.approvedBudget), icon: Target, color: 'text-[#FF6321]' },
+                { label: 'Actual Cost', value: money(totals?.actualCost), icon: Activity, color: 'text-amber-600' },
+                { label: 'Total ETC', value: money(totals?.etc), icon: TrendingUp, color: 'text-emerald-600' },
+                { label: 'Total EAC', value: money(totals?.eac), icon: DollarSign, color: 'text-blue-600' },
               ].map((stat, i) => (
                 <div key={i} className="bg-white dark:bg-[#141414] p-6 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm transition-colors">
                   <div className="flex justify-between items-start mb-4">

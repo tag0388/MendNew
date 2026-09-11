@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
+import { useProjectRole } from '../lib/useProjectRole';
 import { Project, Enterprise } from '../types';
 import { Briefcase, Receipt, ChevronLeft, Menu, Settings, List } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { auth } from '../firebase';
 import Subcontracts from './Subcontracts';
 import Invoicing from './Invoicing';
 import BulkSubcontractInvoices from './BulkSubcontractInvoices';
@@ -33,11 +33,10 @@ const SubcontractManagement: React.FC<SubcontractManagementProps> = ({
   const activeTab = (subModuleId as SubcontractTab) || 'subcontracts';
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
-  const userId = auth.currentUser?.uid;
-  const userEmail = auth.currentUser?.email;
-  const isSystemAdmin = userEmail?.toLowerCase() === 'tarek.guindy@gmail.com' || userEmail?.toLowerCase() === 'tarek_guindy@hotmail.com';
-  const isEnterpriseAdmin = userId && enterprise?.users?.[userId]?.role === 'Enterprise System Admin';
-  const isProjectAdmin = userId && (isEnterpriseAdmin || project?.users?.[userId] === 'Project Admin' || isSystemAdmin);
+  // From the database. The two map lookups this replaces read Firestore
+  // document shapes that no longer exist, so both were always undefined --
+  // leaving one hardcoded email address as the only thing granting admin.
+  const { isProjectAdmin } = useProjectRole(projectId);
 
   const handleTabClick = (id: string) => {
     navigate(`/project/${projectId}/subcontract/${id}`);

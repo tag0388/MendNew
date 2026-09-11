@@ -1,4 +1,14 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { subscribeToTable } from '../lib/supabase';
+import { useProjectRole } from '../lib/useProjectRole';
+import { fetchCostCodes, fetchScheduleItems } from '../lib/costCodes';
+import { fetchRulesOfCredit } from '../lib/rulesOfCredit';
+import {
+  fetchProgressPackages, fetchProgressItems, createProgressPackage,
+  updateProgressPackage, deleteProgressPackages, bulkUpdateProgressPackages,
+  importProgressPackages, upsertProgressItems, updateProgressItem,
+  deleteProgressItems, bulkUpdateProgressItems, calculateProgress,
+} from '../lib/progress';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
   Plus, 
   Search, 
@@ -21,20 +31,6 @@ import {
   Download,
   Upload
 } from 'lucide-react';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  doc,
-  serverTimestamp,
-  getDocs,
-  writeBatch
-} from 'firebase/firestore';
-import { db, auth } from '../firebase';
 import { Enterprise, Project, ProgressPackage, ProgressItem, CostCode, RuleOfCredit, ScheduleItem } from '../types';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -95,52 +91,61 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
   const [isPackageSettingsOpen, setIsPackageSettingsOpen] = useState(false);
   const [itemBulkUpdateData, setItemBulkUpdateData] = useState({ field: '', value: '' });
   const [itemsToAddCount, setItemsToAddCount] = useState(1);
-  const isAdmin = isAdminProp !== undefined ? isAdminProp : (project.users?.[auth.currentUser?.uid || ''] === 'Project Admin' || (auth.currentUser?.email?.toLowerCase() === 'tarek.guindy@gmail.com'));
+  // From the database. The map lookup this replaces read a Firestore shape
+  // that does not exist here, so it was always undefined -- leaving one
+  // hardcoded email address as the only thing granting admin.
+  const { isProjectAdmin } = useProjectRole(project.id);
+  const isAdmin = isAdminProp !== undefined ? isAdminProp : isProjectAdmin;
 
   const gridRef = useRef<AgGridReact>(null);
   const itemsGridRef = useRef<AgGridReact>(null);
 
+  const reload = useCallback(async () => {
+    if (!project.id) return;
+    try {
+      const [pkgs, its] = await Promise.all([
+        fetchProgressPackages(project.id),
+        fetchProgressItems(project.id),
+      ]);
+      setPackages(pkgs as any);
+      setItems(its as any);
+    } catch (error: any) {
+      console.error('Progress fetch error:', error);
+      toast.error(`Failed to load progress: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
   useEffect(() => {
     if (!project.id) return;
+    void reload();
 
-    const qPackages = query(collection(db, 'progressPackages'), where('projectId', '==', project.id));
-    const unsubscribePackages = onSnapshot(qPackages, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProgressPackage));
-      setPackages(data);
-      setLoading(false);
-    });
-
-    const qCostCodes = query(collection(db, 'costCodes'), where('projectId', '==', project.id));
-    const unsubscribeCostCodes = onSnapshot(qCostCodes, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as CostCode));
-      setCostCodes(data);
-    });
-
-    const qRoC = query(collection(db, 'rulesOfCredit'), where('projectId', '==', project.id));
-    const unsubscribeRoC = onSnapshot(qRoC, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as RuleOfCredit));
-      setRulesOfCredit(data);
-    });
-
-    const qSch = query(collection(db, 'scheduleItems'), where('projectId', '==', project.id));
-    const unsubscribeSch = onSnapshot(qSch, (snapshot) => {
-      setScheduleItems(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ScheduleItem)));
-    });
-
-    const qItems = query(collection(db, 'progressItems'), where('projectId', '==', project.id));
-    const unsubscribeItems = onSnapshot(qItems, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as ProgressItem));
-      setItems(data);
-    });
-
-    return () => {
-      unsubscribePackages();
-      unsubscribeCostCodes();
-      unsubscribeRoC();
-      unsubscribeSch();
-      unsubscribeItems();
+    const loadReferences = async () => {
+      try {
+        const [codes, rocs, sched] = await Promise.all([
+          fetchCostCodes(project.id),
+          fetchRulesOfCredit(project.id),
+          fetchScheduleItems(project.id),
+        ]);
+        setCostCodes(codes as any);
+        setRulesOfCredit(rocs as any);
+        setScheduleItems(sched as any);
+      } catch (error) {
+        console.error('ProgressTracking: reference data fetch error:', error);
+      }
     };
-  }, [project.id]);
+    void loadReferences();
+
+    const unsubs = [
+      subscribeToTable('progress_packages', `project_id=eq.${project.id}`, () => void reload()),
+      subscribeToTable('progress_items', `project_id=eq.${project.id}`, () => void reload()),
+      subscribeToTable('cost_codes', `project_id=eq.${project.id}`, () => void loadReferences()),
+      subscribeToTable('rules_of_credit', `project_id=eq.${project.id}`, () => void loadReferences()),
+      subscribeToTable('schedule_items', `project_id=eq.${project.id}`, () => void loadReferences()),
+    ];
+    return () => unsubs.forEach(u => u());
+  }, [project.id, reload]);
 
   const filteredItems = useMemo(() => {
     if (!selectedPackageId) return [];
@@ -173,115 +178,102 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     }
 
     try {
-      const newPackage = {
+      const newId = await createProgressPackage(project.id, {
         ...packageFormData,
-        projectId: project.id,
-        unit: packageFormData.unit || 'EA',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-
-      const docRef = await addDoc(collection(db, 'progressPackages'), newPackage);
+        unit: (packageFormData as any).unit || 'EA',
+      });
+      await reload();
       setIsAddingPackage(false);
       setPackageFormData({ packageId: '', description: '' });
-      setSelectedPackageId(docRef.id);
-    } catch (error) {
+      setSelectedPackageId(newId);
+    } catch (error: any) {
       console.error('Error adding package:', error);
+      toast.error(`Failed to add package: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const handleAddItem = async () => {
     if (!selectedPackageId || !selectedPackage) return;
+    if (costCodes.length === 0) {
+      toast.error('Create a cost code first -- a progress item has to be against one.');
+      return;
+    }
 
     try {
       const selectedNodes = itemsGridRef.current?.api.getSelectedNodes();
       let insertAfterOrder = 0;
-      
+
       if (selectedNodes && selectedNodes.length > 0) {
-        // Find the maximum sortOrder among selected nodes or just the last selected node's sort order
         const lastSelected = selectedNodes[selectedNodes.length - 1].data as ProgressItem;
         insertAfterOrder = lastSelected.sortOrder || 0;
-        
-        // Shift existing items after the selected point
-        const itemsToShift = items.filter(i => (i.sortOrder || 0) > insertAfterOrder);
-        const batch = writeBatch(db);
-        itemsToShift.forEach(item => {
-          batch.update(doc(db, 'progressItems', item.id), {
-            sortOrder: (item.sortOrder || 0) + itemsToAddCount,
-            updatedAt: new Date().toISOString()
-          });
-        });
-        await batch.commit();
+
+        // Make room for the new rows. One statement, whatever the size of the
+        // list -- this used to be a write per item shifted.
+        const toShift = items.filter(i => (i.sortOrder || 0) > insertAfterOrder);
+        if (toShift.length > 0) {
+          await upsertProgressItems(project.id, toShift.map(i => ({
+            id: i.id,
+            sortOrder: (i.sortOrder || 0) + itemsToAddCount,
+          })));
+        }
       } else {
-        // If no selection, add to the end
-        const maxOrder = items.length > 0 ? Math.max(...items.map(i => i.sortOrder || 0)) : 0;
-        insertAfterOrder = maxOrder;
+        insertAfterOrder = items.length > 0 ? Math.max(...items.map(i => i.sortOrder || 0)) : 0;
       }
 
-      const batch = writeBatch(db);
-      for (let i = 0; i < itemsToAddCount; i++) {
-        const newDocRef = doc(collection(db, 'progressItems'));
-        const newItem: Partial<ProgressItem> = {
-          projectId: project.id,
-          packageId: selectedPackage.packageId,
-          packageDocId: selectedPackageId,
-          itemId: `Item-${items.length + i + 1}`,
-          description: 'New Item',
-          costCodeId: '',
-          totalQty: 0,
-          plannedStartDate: selectedPackage.defaultStartDate || new Date().toISOString().split('T')[0],
-          plannedEndDate: selectedPackage.defaultEndDate || new Date().toISOString().split('T')[0],
-          phasingMethod: selectedPackage.defaultPhasingMethod || 'Auto',
-          phasingCurve: selectedPackage.defaultPhasingCurve || 'even',
-          currentStartDate: selectedPackage.defaultStartDate || new Date().toISOString().split('T')[0],
-          currentEndDate: selectedPackage.defaultEndDate || new Date().toISOString().split('T')[0],
-          currentPhasingMethod: selectedPackage.defaultPhasingMethod || 'Auto',
-          currentPhasingCurve: selectedPackage.defaultPhasingCurve || 'even',
-          sortOrder: insertAfterOrder + i + 1,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        batch.set(newDocRef, newItem);
-      }
-      
-      await batch.commit();
+      const today = new Date().toISOString().split('T')[0];
+      const newItems = Array.from({ length: itemsToAddCount }, (_, i) => ({
+        packageId: selectedPackageId,
+        itemId: `Item-${items.length + i + 1}`,
+        description: 'New Item',
+        // An item REFERENCES a cost code and cannot reference nothing, so a
+        // new row starts on the first one and is changed in the grid. It used
+        // to be created with an empty cost code, which the column cannot hold.
+        costCodeId: costCodes[0].id,
+        totalQty: 0,
+        plannedStartDate: selectedPackage.defaultStartDate || today,
+        plannedEndDate: selectedPackage.defaultEndDate || today,
+        phasingMethod: selectedPackage.defaultPhasingMethod || 'Auto',
+        phasingCurve: selectedPackage.defaultPhasingCurve || 'even',
+        currentStartDate: selectedPackage.defaultStartDate || today,
+        currentEndDate: selectedPackage.defaultEndDate || today,
+        currentPhasingMethod: selectedPackage.defaultPhasingMethod || 'Auto',
+        currentPhasingCurve: selectedPackage.defaultPhasingCurve || 'even',
+        sortOrder: insertAfterOrder + i + 1,
+      }));
+
+      await upsertProgressItems(project.id, newItems);
+      await reload();
       setItemsToAddCount(1);
       toast.success(`Added ${itemsToAddCount} item(s)`);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error adding items:', error);
-      toast.error('Failed to add items');
+      toast.error(`Failed to add items: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const deletePackage = async (pkg: ProgressPackage) => {
     if (!window.confirm(`Are you sure you want to delete commodity ${pkg.packageId}? This will also delete all related items.`)) return;
     try {
-      // Find related items
-      const qItems = query(collection(db, 'progressItems'), where('packageDocId', '==', pkg.id));
-      const itemsSnapshot = await getDocs(qItems);
-      
-      const batch = writeBatch(db);
-      batch.delete(doc(db, 'progressPackages', pkg.id));
-      itemsSnapshot.docs.forEach(d => batch.delete(doc(db, 'progressItems', d.id)));
-      
-      await batch.commit();
+      // The package's items cascade with it, so there is no read of every
+      // child back first.
+      await deleteProgressPackages([pkg.id]);
+      await reload();
       toast.success(`Deleted commodity ${pkg.packageId} and its items`);
       if (selectedPackageId === pkg.id) setSelectedPackageId(null);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Delete failed', error);
-      toast.error('Failed to delete commodity');
+      toast.error(`Failed to delete commodity: ${error?.message || 'Unknown error'}`);
     }
   };
 
   const updatePackage = async (pkgId: string, updates: any) => {
     try {
-      await updateDoc(doc(db, 'progressPackages', pkgId), {
-        ...updates,
-        updatedAt: new Date().toISOString()
-      });
-    } catch (error) {
+      await updateProgressPackage(pkgId, updates);
+      await reload();
+    } catch (error: any) {
       console.error('Update package failed', error);
-      toast.error('Failed to update commodity');
+      toast.error(`Failed to update commodity: ${error?.message || 'Unknown error'}`);
+      await reload();
     }
   };
 
@@ -290,27 +282,18 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     if (!window.confirm(`Delete ${selectedPackageIds.length} commodities and all their related items?`)) return;
 
     try {
-      const batch = writeBatch(db);
-      for (const id of selectedPackageIds) {
-        batch.delete(doc(db, 'progressPackages', id));
-        // Note: In a production app, you might want to use a Cloud Function for recursive deletion
-        // but here we'll try to find items for each. 
-        // For efficiency in this demo, let's just delete the packages.
-        // Actually, let's try to be thorough for a few.
-      }
-      
-      // To properly delete related items for multiple packages in a batch, we need their IDs
-      const qItems = query(collection(db, 'progressItems'), where('packageDocId', 'in', selectedPackageIds.slice(0, 10))); // Firestore 'in' limit is 10
-      const itemsSnapshot = await getDocs(qItems);
-      itemsSnapshot.docs.forEach(d => batch.delete(doc(db, 'progressItems', d.id)));
-
-      await batch.commit();
+      // One statement, and every package's items cascade. The Firestore
+      // version could only look up ten packages' children at a time, because
+      // its `in` operator capped at ten -- so deleting more than ten
+      // commodities left the rest of their items behind as orphans.
+      await deleteProgressPackages(selectedPackageIds);
+      await reload();
       toast.success(`Deleted ${selectedPackageIds.length} commodities`);
-      setSelectedPackageIds([]);
       if (selectedPackageIds.includes(selectedPackageId || '')) setSelectedPackageId(null);
-    } catch (error) {
+      setSelectedPackageIds([]);
+    } catch (error: any) {
       console.error('Bulk delete failed', error);
-      toast.error('Failed to perform bulk delete');
+      toast.error(`Failed to delete commodities: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -318,20 +301,16 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     if (!bulkUpdateData.field || selectedPackageIds.length === 0) return;
 
     try {
-      const batch = writeBatch(db);
-      selectedPackageIds.forEach(id => {
-        batch.update(doc(db, 'progressPackages', id), { 
-          [bulkUpdateData.field]: bulkUpdateData.value,
-          updatedAt: new Date().toISOString()
-        });
+      const updated = await bulkUpdateProgressPackages(selectedPackageIds, {
+        [bulkUpdateData.field]: bulkUpdateData.value,
       });
-      await batch.commit();
-      toast.success(`Updated ${selectedPackageIds.length} commodities`);
+      await reload();
+      toast.success(`Updated ${updated} commodities`);
       setIsBulkUpdateOpen(false);
       setSelectedPackageIds([]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Bulk update failed', error);
-      toast.error('Failed to perform bulk update');
+      toast.error(`Failed to update commodities: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -364,39 +343,46 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
         const ws = wb.Sheets[wb.SheetNames[0]];
         const data = XLSX.utils.sheet_to_json(ws) as any[];
 
-        const batch = writeBatch(db);
-        let count = 0;
+        const unknownRules = new Set<string>();
+        const rows: any[] = [];
 
         for (const row of data) {
           const commodityId = (row['Commodity ID'] || row['Package ID'])?.toString().trim();
           if (!commodityId) continue;
 
-          const existing = packages.find(p => p.packageId.toLowerCase() === commodityId.toLowerCase());
-          const payload = {
+          // The sheet names a rule of credit; the column is a foreign key.
+          const ruleText = (row['Rule of Credit ID'] || row['ruleOfCreditId'] || row['Rule of Credit'])?.toString().trim() || '';
+          let ruleOfCreditId: string | undefined;
+          if (ruleText) {
+            const resolved = rulesOfCredit.find(r => r.ruleId === ruleText || r.id === ruleText);
+            if (resolved) ruleOfCreditId = resolved.id;
+            else unknownRules.add(ruleText);
+          }
+
+          rows.push({
             packageId: commodityId,
             description: (row['Commodity Description'] || row['Description'])?.toString() || '',
-            ruleOfCreditId: (row['Rule of Credit ID'] || row['ruleOfCreditId'] || row['Rule of Credit'])?.toString() || '',
-            projectId: project.id,
-            updatedAt: new Date().toISOString()
-          };
-
-          if (existing) {
-            batch.update(doc(db, 'progressPackages', existing.id), payload);
-          } else {
-            const newDocRef = doc(collection(db, 'progressPackages'));
-            batch.set(newDocRef, {
-              ...payload,
-              createdAt: new Date().toISOString()
-            });
-          }
-          count++;
+            ruleOfCreditId,
+          });
         }
 
-        await batch.commit();
-        toast.success(`Successfully imported/updated ${count} commodities`);
-      } catch (error) {
+        if (rows.length === 0) {
+          toast.error('No rows in the sheet carried a Commodity ID.');
+          return;
+        }
+
+        // One statement. Upsert on (project_id, package_id), so the database
+        // decides whether a sheet row is a new commodity or an update.
+        const imported = await importProgressPackages(project.id, rows);
+        await reload();
+        toast.success(
+          unknownRules.size > 0
+            ? `Imported ${imported} commodities. Unknown rules of credit left blank: ${Array.from(unknownRules).join(', ')}`
+            : `Successfully imported/updated ${imported} commodities`
+        );
+      } catch (error: any) {
         console.error('Import error:', error);
-        toast.error('Failed to import from Excel');
+        toast.error(`Failed to import: ${error?.message || 'Unknown error'}`);
       } finally {
         setIsImporting(false);
         if (e.target) e.target.value = '';
@@ -408,9 +394,11 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
   const deleteItem = async (item: ProgressItem) => {
     if (!window.confirm(`Delete commodity item ${item.description}?`)) return;
     try {
-      await deleteDoc(doc(db, 'progressItems', item.id));
-    } catch (error) {
+      await deleteProgressItems([item.id]);
+      await reload();
+    } catch (error: any) {
       console.error('Delete failed', error);
+      toast.error(`Failed to delete item: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -419,16 +407,13 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     if (!window.confirm(`Delete ${selectedItemIds.length} commodity items?`)) return;
 
     try {
-      const batch = writeBatch(db);
-      selectedItemIds.forEach(id => {
-        batch.delete(doc(db, 'progressItems', id));
-      });
-      await batch.commit();
+      await deleteProgressItems(selectedItemIds);
+      await reload();
       toast.success(`Deleted ${selectedItemIds.length} commodity items`);
       setSelectedItemIds([]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Item bulk delete failed', error);
-      toast.error('Failed to perform bulk delete for commodity items');
+      toast.error(`Failed to delete items: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -436,29 +421,25 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     if (!itemBulkUpdateData.field || selectedItemIds.length === 0) return;
 
     try {
-      const batch = writeBatch(db);
-      selectedItemIds.forEach(id => {
-        let value: any = itemBulkUpdateData.value;
-        if (itemBulkUpdateData.field.toLowerCase().includes('date')) {
-          value = parseGridDate(value);
-        } else if (itemBulkUpdateData.field === 'totalQty') {
-          value = parseFloat(value) || 0;
-        }
-        
-        if (value !== undefined) {
-          batch.update(doc(db, 'progressItems', id), { 
-            [itemBulkUpdateData.field]: value,
-            updatedAt: new Date().toISOString()
-          });
-        }
+      let value: any = itemBulkUpdateData.value;
+      if (itemBulkUpdateData.field.toLowerCase().includes('date')) {
+        value = parseGridDate(value);
+      } else if (itemBulkUpdateData.field === 'totalQty') {
+        value = parseFloat(value) || 0;
+      }
+      if (value === undefined) return;
+
+      // One statement for every selected item.
+      const updated = await bulkUpdateProgressItems(selectedItemIds, {
+        [itemBulkUpdateData.field]: value,
       });
-      await batch.commit();
-      toast.success(`Updated ${selectedItemIds.length} commodity items`);
+      await reload();
+      toast.success(`Updated ${updated} commodity items`);
       setIsItemBulkUpdateOpen(false);
       setSelectedItemIds([]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Item bulk update failed', error);
-      toast.error('Failed to perform bulk update for commodity items');
+      toast.error(`Failed to update items: ${error?.message || 'Unknown error'}`);
     }
   };
 
@@ -467,7 +448,7 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     const data = items.map(i => ({
       'Commodity Item ID': i.itemId,
       'Description': i.description,
-      'Cost Code': i.costCodeId,
+      'Cost Code': costCodes.find(c => c.id === i.costCodeId)?.code || '',
       'Total Qty': i.totalQty,
       'Unit': selectedPackage.unit || 'EA',
       'Pl Start': i.plannedStartDate,
@@ -493,44 +474,55 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
         const ws = wb.Sheets[wb.SheetNames[0]];
         const data = XLSX.utils.sheet_to_json(ws) as any[];
 
-        const batch = writeBatch(db);
-        let count = 0;
+        const unknownCodes = new Set<string>();
+        const rows: any[] = [];
 
         for (const row of data) {
-          const itemId = (row['Commodity Item ID'] || row['Item ID'] || row['itemId'])?.toString();
+          const itemId = (row['Commodity Item ID'] || row['Item ID'] || row['itemId'])?.toString().trim();
           if (!itemId) continue;
 
-          const existing = items.find(i => i.itemId === itemId);
-          const payload = {
-            itemId: itemId,
-            description: row['Description']?.toString() || '',
-            costCodeId: row['Cost Code']?.toString() || '',
-            totalQty: parseFloat(row['Total Qty']) || 0,
-            plannedStartDate: row['Pl Start']?.toString() || '',
-            plannedEndDate: row['Pl End']?.toString() || '',
-            projectId: project.id,
-            packageId: selectedPackage.packageId,
-            packageDocId: selectedPackageId,
-            updatedAt: new Date().toISOString()
-          };
+          // The sheet names a cost code; the column is a foreign key, and an
+          // item cannot reference nothing.
+          const codeText = row['Cost Code']?.toString().trim() || '';
+          const resolved = costCodes.find(c => c.code === codeText || c.id === codeText);
+          if (!resolved) { unknownCodes.add(codeText || '(blank)'); continue; }
 
-          if (existing) {
-            batch.update(doc(db, 'progressItems', existing.id), payload);
-          } else {
-            const newDocRef = doc(collection(db, 'progressItems'));
-            batch.set(newDocRef, {
-              ...payload,
-              createdAt: new Date().toISOString()
-            });
-          }
-          count++;
+          // An item the package already has keeps its id, so a re-import
+          // updates it rather than creating a duplicate.
+          const existing = items.find(i => i.itemId === itemId);
+
+          rows.push({
+            ...(existing ? { id: existing.id } : {}),
+            itemId,
+            description: row['Description']?.toString() || '',
+            costCodeId: resolved.id,
+            totalQty: parseFloat(row['Total Qty']) || 0,
+            plannedStartDate: row['Pl Start']?.toString() || null,
+            plannedEndDate: row['Pl End']?.toString() || null,
+            packageId: selectedPackageId,
+          });
         }
 
-        await batch.commit();
-        toast.success(`Imported ${count} commodity items`);
-      } catch (error) {
+        if (rows.length === 0) {
+          toast.error(
+            unknownCodes.size > 0
+              ? `No items imported. Unknown cost codes: ${Array.from(unknownCodes).join(', ')}`
+              : 'No rows in the sheet carried a Commodity Item ID.'
+          );
+          return;
+        }
+
+        // One statement, whatever the size of the sheet.
+        const imported = await upsertProgressItems(project.id, rows);
+        await reload();
+        toast.success(
+          unknownCodes.size > 0
+            ? `Imported ${imported} commodity items. Unknown cost codes skipped: ${Array.from(unknownCodes).join(', ')}`
+            : `Imported ${imported} commodity items`
+        );
+      } catch (error: any) {
         console.error('Import error:', error);
-        toast.error('Failed to import commodity items');
+        toast.error(`Failed to import items: ${error?.message || 'Unknown error'}`);
       } finally {
         if (e.target) e.target.value = '';
       }
@@ -540,12 +532,12 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
 
   const updateItem = async (itemId: string, updates: Partial<ProgressItem>) => {
     try {
-      await updateDoc(doc(db, 'progressItems', itemId), {
-        ...updates,
-        updatedAt: new Date().toISOString()
-      });
-    } catch (error) {
+      await updateProgressItem(itemId, updates as any);
+      await reload();
+    } catch (error: any) {
       console.error('Update failed', error);
+      toast.error(`Failed to update item: ${error?.message || 'Unknown error'}`);
+      await reload();
     }
   };
 
@@ -910,173 +902,33 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     return `${y}-${m}-${d}`;
   };
 
-  const calculateDistribution = (total: number, startStr: string, endStr: string, curve: string, periods: any[]) => {
-    if (total === 0 || !startStr || !endStr || periods.length === 0) return {};
-    
-    const start = new Date(startStr);
-    const end = new Date(endStr);
-    if (isNaN(start.getTime()) || isNaN(end.getTime()) || start > end) return {};
-
-    // Filter periods that overlap with the item's date range
-    const relevantPeriods = periods.filter(p => {
-      if (!p.startDate || !p.endDate) return false;
-      const pStart = new Date(p.startDate);
-      const pEnd = new Date(p.endDate);
-      return (pStart <= end && pEnd >= start);
-    });
-
-    if (relevantPeriods.length === 0) return {};
-
-    const values: Record<string, number> = {};
-    const n = relevantPeriods.length;
-
-    // Distribution weights based on curve
-    let weights: number[] = [];
-    if (curve === 'even') {
-      weights = Array(n).fill(1/n);
-    } else if (curve === 'front load') {
-      const sum = (n * (n + 1)) / 2;
-      weights = Array.from({length: n}, (_, i) => (n - i) / sum);
-    } else if (curve === 'back load') {
-      const sum = (n * (n + 1)) / 2;
-      weights = Array.from({length: n}, (_, i) => (i + 1) / sum);
-    } else if (curve === 'Bell' || curve === 'Scurve') {
-      // Bell and S-curve (phasing distribution) approximation
-      const s_weights = Array.from({length: n}, (_, i) => {
-         const x = (i + 0.5) / n;
-         return Math.sin(Math.PI * x);
-      });
-      const sum = s_weights.reduce((a, b) => a + b, 0);
-      weights = s_weights.map(v => v / sum);
-    } else {
-      weights = Array(n).fill(1/n);
-    }
-
-    relevantPeriods.forEach((p, i) => {
-      values[p.id] = Number((total * weights[i]).toFixed(2));
-    });
-
-    return values;
-  };
-
   const handleCalculate = async () => {
     if (items.length === 0) return;
-    
-    const allPeriods = project.progressPeriods?.periods || [];
-    const openPeriods = allPeriods.filter(p => p.status !== 'closed');
-    const currentOpenPeriod = allPeriods.find(p => p.status === 'open');
-    const closedPeriods = allPeriods.filter(p => p.status === 'closed');
 
-    if (openPeriods.length === 0 && !currentOpenPeriod) {
+    const allPeriods = project.progressPeriods?.periods || [];
+    if (allPeriods.filter(p => p.status !== 'closed').length === 0) {
       toast.error('No open or future progress periods available');
       return;
     }
 
+    const toastId = toast.loading('Calculating...');
     try {
-      const batch = writeBatch(db);
-      let updateCount = 0;
-      
-      // Process all items
-      items.forEach(item => {
-        let hasChanges = false;
-        const updates: any = { updatedAt: new Date().toISOString() };
-
-        // 1. Calculate Earned To Date using the RoC for this specific item
-        const itemPackage = packages.find(p => p.id === item.packageDocId);
-        const rocId = item.ruleOfCreditId || itemPackage?.ruleOfCreditId;
-        const roc = rulesOfCredit.find(r => r.id === rocId || r.ruleId === rocId);
-        
-        let earnedToDate = 0;
-        if (roc?.steps) {
-          const progress = item.ruleOfCreditProgress || {};
-          const percent = roc.steps.reduce((sum, step) => {
-            const stepProgress = progress[step.id] || 0;
-            return sum + (stepProgress * step.weight / 100);
-          }, 0);
-          earnedToDate = (percent / 100) * (item.totalQty || 0);
-        }
-
-        // 2. Populate Earned in the Current Period
-        if (currentOpenPeriod) {
-          // Logic: Earned in Current Period = Earned to Date - Earned in all previous periods
-          const currentPeriodIndex = allPeriods.findIndex(p => p.id === currentOpenPeriod.id);
-          const previousPeriods = allPeriods.slice(0, currentPeriodIndex);
-          const prevEarnedSum = previousPeriods.reduce((sum, p) => sum + (item.actualPeriodValues?.[p.id] || 0), 0);
-          const earnedThisPeriod = Math.max(0, earnedToDate - prevEarnedSum);
-          
-          const currentActualValue = item.actualPeriodValues?.[currentOpenPeriod.id] || 0;
-          if (Math.abs(currentActualValue - earnedThisPeriod) > 0.001) {
-            updates.actualPeriodValues = { ...(item.actualPeriodValues || {}), [currentOpenPeriod.id]: earnedThisPeriod };
-            hasChanges = true;
-          }
-        }
-
-        // 3. Calculate for Planned Phasing (Auto)
-        if (item.phasingMethod === 'Auto' && item.plannedStartDate && item.plannedEndDate) {
-          let startDate = item.plannedStartDate;
-          let endDate = item.plannedEndDate;
-
-          const s = new Date(startDate);
-          let e = new Date(endDate);
-          if (e <= s) {
-            e = new Date(s);
-            e.setDate(e.getDate() + 7);
-            endDate = e.toISOString().split('T')[0];
-          }
-
-          const totalQty = item.totalQty || 0;
-          const distributed = calculateDistribution(totalQty, startDate, endDate, item.phasingCurve || 'even', openPeriods);
-          updates.periodValues = distributed;
-          updates.plannedEndDate = endDate;
-          hasChanges = true;
-        }
-
-        // 4. Calculate for Current Phasing (Forecast Auto)
-        const cMethod = item.currentPhasingMethod || 'Auto';
-        if (cMethod === 'Auto' && item.currentStartDate && item.currentEndDate) {
-          let startDate = item.currentStartDate;
-          let endDate = item.currentEndDate;
-
-          if (currentOpenPeriod?.startDate) {
-            const pStart = new Date(currentOpenPeriod.startDate);
-            const userStart = new Date(startDate);
-            if (userStart < pStart) {
-              startDate = currentOpenPeriod.startDate;
-            }
-          }
-
-          const s = new Date(startDate);
-          let e = new Date(endDate);
-          if (e <= s) {
-            e = new Date(s);
-            e.setDate(e.getDate() + 7);
-            endDate = e.toISOString().split('T')[0];
-          }
-
-          const remainingQty = Math.max(0, (item.totalQty || 0) - earnedToDate);
-          const distributed = calculateDistribution(remainingQty, startDate, endDate, item.currentPhasingCurve || 'even', openPeriods);
-          
-          updates.currentPeriodValues = distributed;
-          updates.currentStartDate = startDate;
-          updates.currentEndDate = endDate;
-          hasChanges = true;
-        }
-
-        if (hasChanges) {
-          batch.update(doc(db, 'progressItems', item.id), updates);
-          updateCount++;
-        }
-      });
-
-      if (updateCount > 0) {
-        await batch.commit();
-        toast.success(`Calculated and updated ${updateCount} items`);
+      // One statement in the database. It works out each item's earned
+      // quantity from its rule of credit's weighted steps, the actual for the
+      // current period, and the planned and forecast phasing across the
+      // progress periods -- all of which used to run here, over every item in
+      // the project, on whatever copy this tab was holding.
+      const changed = await calculateProgress(project.id);
+      await reload();
+      if (changed > 0) {
+        toast.success(`Calculated and updated ${changed} items`, { id: toastId });
       } else {
-        toast.info('Calculation complete: No changes needed');
+        toast.info('Calculation complete: No changes needed', { id: toastId });
       }
-    } catch (error) {
+    } catch (error: any) {
+      toast.dismiss(toastId);
       console.error('Calculation failed', error);
-      toast.error('Failed to perform calculation');
+      toast.error(`Failed to perform calculation: ${error?.message || 'Unknown error'}`);
     }
   };
 

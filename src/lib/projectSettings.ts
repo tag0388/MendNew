@@ -117,3 +117,55 @@ export async function importProjectResourceRates(
   raise('import project resource rates', error);
   return data?.length ?? 0;
 }
+
+// ------------------------------------------------- project attribute sets --
+
+/**
+ * The attribute sets a project defines on top of its enterprise's.
+ *
+ * Each is a jsonb column on `projects` holding an array of
+ * { id, title, values[] }. They are maps of user-defined metadata, which is
+ * the same call made for enterprise_attributes and project_attributes on the
+ * records themselves -- see ARCHITECTURE.md on when jsonb is right.
+ */
+export type ProjectAttributeSet =
+  | 'costCodeAttributes'
+  | 'lineItemAttributes'
+  | 'changeAttributes'
+  | 'subcontractAttributes'
+  | 'riskAttributes'
+  | 'procurementAttributes'
+  | 'progressAttributes';
+
+const ATTRIBUTE_COLUMN: Record<ProjectAttributeSet, string> = {
+  costCodeAttributes: 'cost_code_attributes',
+  lineItemAttributes: 'line_item_attributes',
+  changeAttributes: 'change_attributes',
+  subcontractAttributes: 'subcontract_attributes',
+  riskAttributes: 'risk_attributes',
+  procurementAttributes: 'procurement_attributes',
+  progressAttributes: 'progress_attributes',
+};
+
+export async function updateProjectAttributeSet(
+  projectId: string,
+  set: ProjectAttributeSet,
+  attributes: unknown[]
+): Promise<void> {
+  const { error } = await supabase
+    .from('projects')
+    .update({ [ATTRIBUTE_COLUMN[set]]: attributes })
+    .eq('id', projectId);
+  raise('save project attributes', error);
+}
+
+/** One project, for screens that need to follow it live. */
+export async function fetchProjectRow(projectId: string) {
+  const { data, error } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('id', projectId)
+    .maybeSingle();
+  raise('load project', error);
+  return data;
+}

@@ -73,6 +73,33 @@ memory. A 500,000-row actual-cost grid needs the server-side row model or
 server-side pagination. This is NOT yet done and is the largest outstanding
 scale item.
 
+### The Firebase SDK is gone
+
+The `firebase` dependency, `src/firebase.ts` and the applet config are
+removed. Nothing in the app talks to Firestore. Comments that mention it
+explain why a piece of schema or code is shaped the way it is -- the dotted
+attribute paths, the 400-row import chunks, the maps that used to live on a
+document -- and are kept deliberately as the record of what was changed and
+why.
+
+Calculations that moved into the database during the conversion:
+
+| Screen | Now in SQL |
+| --- | --- |
+| Cost codes | `recalculate_project_costs` |
+| Project timephasing | `project_timephasing` view, `apply_cost_phasing` |
+| Subcontracts | `subcontract_summary`, `apply_line_item_phasing`, generated `total` |
+| Invoices | `set_invoice_item_claim`, `create_invoice_from_subcontract`, `invoice_summary` |
+| Changes | `derive_change_totals` trigger |
+| Risks | generated `beta_pert_impact_amount`, `refresh_risk_totals` trigger |
+| Time schedule | `sync_schedule_dates` |
+| Progress periods | `close_progress_period` |
+
+`phase_across_periods` is the single implementation of the five distribution
+curves; both the subcontract and cost phasing functions call it. Anything that
+needs to spread a value over periods should call it too rather than adding a
+third copy.
+
 ### Known scale work still outstanding
 
 1. Actual Cost and ETC grids load all rows for their scope. Fine for a cost
@@ -83,6 +110,12 @@ scale item.
    stream in chunks inside one transaction, not arrive as one request.
 4. RLS helpers are called per row. They are indexed (`cost_code_users` PK is
    `(cost_code_id, user_id)`) but should be measured against real volumes.
+
+5. Procurement Progress still computes its working-day schedule in the
+   browser (`recalculatePlannedDates` / `recalculateForecastDates`). The
+   module was deferred, so its writes were converted but its date engine was
+   not; it needs the same treatment as the phasing functions before real
+   volumes.
 
 None of these are urgent for testing with small data. All of them are blocking
 before a real project is loaded.

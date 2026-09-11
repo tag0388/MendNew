@@ -5,8 +5,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { useNavigate, useLocation, useParams, matchPath } from 'react-router-dom';
-import { db } from '../firebase';
-import { doc, onSnapshot } from 'firebase/firestore';
+import { fetchProjectRow } from '../lib/projectSettings';
+import { subscribeToTable, fromRow } from '../lib/supabase';
 
 interface HeaderProps {
   user: { displayName: string | null; photoURL: string | null };
@@ -28,12 +28,19 @@ export default function Header({ user, enterprise }: HeaderProps) {
       setProject(null);
       return;
     }
-    const unsubscribe = onSnapshot(doc(db, 'projects', projectId), (snapshot) => {
-      if (snapshot.exists()) {
-        setProject({ ...snapshot.data() as Project, id: snapshot.id });
+    let active = true;
+    const load = async () => {
+      try {
+        const row = await fetchProjectRow(projectId);
+        if (active && row) setProject(fromRow<Project>(row));
+      } catch (error) {
+        console.error('Header project fetch error:', error);
       }
-    });
-    return () => unsubscribe();
+    };
+    void load();
+    // The header shows the project name, so it follows renames made elsewhere.
+    const unsubscribe = subscribeToTable('projects', `id=eq.${projectId}`, () => void load());
+    return () => { active = false; unsubscribe(); };
   }, [projectId]);
 
   const isProjectView = location.pathname.startsWith('/project/');

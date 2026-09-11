@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
   Plus, 
   Search, 
@@ -27,19 +27,12 @@ import {
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { toast } from 'sonner';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  doc,
-  serverTimestamp,
-  writeBatch
-} from 'firebase/firestore';
-import { db } from '../firebase';
+import { subscribeToTable } from '../lib/supabase';
+import {
+  fetchInvoiceSummaries, fetchSubcontractSummaries, importInvoices,
+  createInvoiceFromSubcontract, updateInvoice,
+  fetchInvoiceItemDetail, setInvoiceItemClaim,
+} from '../lib/subcontracts';
 import { Enterprise, Project, Subcontract, Invoice, InvoiceItem, SubcontractLineItem } from '../types';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -134,57 +127,58 @@ export default function Invoicing({ enterprise, project, user, theme = 'light' }
     if (!importPreview) return;
     const { data } = importPreview;
     const toastId = toast.loading('Importing invoices...');
-    
+
     try {
-      const batch = writeBatch(db);
-      const subcontractsMap = new Map(subcontracts.map(s => [s.orderId.toLowerCase(), s]));
+      const subcontractsMap = new Map(subcontracts.map(sub => [sub.orderId.toLowerCase(), sub]));
+      const asDate = (v: any) => (v ? dateToISO(new Date(v)) : undefined);
+      const unknownOrders = new Set<string>();
+      const rows: any[] = [];
 
       for (const row of data) {
         const orderId = String(row['Order ID'] || row.orderId || '').trim();
         const invoiceNo = String(row['Invoice No.'] || row.invoiceId || row.ID || row.id || '').trim();
-        
         if (!orderId || !invoiceNo) continue;
 
         const targetSub = subcontractsMap.get(orderId.toLowerCase());
-        if (!targetSub) continue;
+        if (!targetSub) { unknownOrders.add(orderId); continue; }
 
-        const existingInvoice = invoices.find(i => i.subcontractId === targetSub.id && i.invoiceId === invoiceNo);
-        
-        const invoiceData: any = {
+        rows.push({
+          subcontractId: targetSub.id,
+          invoiceId: invoiceNo,
           description: String(row['Invoice Name'] || row.description || row.Description || 'Imported Invoice'),
-          status: (row['Status'] || row.status || 'Draft') as any,
-          submittedDate: row['Submit Date'] ? dateToISO(new Date(row['Submit Date'])) : '',
-          certifiedDate: row['Approve Date'] ? dateToISO(new Date(row['Approve Date'])) : '',
-          paymentDate: row['Payment Date'] ? dateToISO(new Date(row['Payment Date'])) : '',
-          updatedAt: new Date().toISOString()
-        };
-
-        if (existingInvoice) {
-          batch.update(doc(db, 'invoices', existingInvoice.id), invoiceData);
-        } else {
-          const newRef = doc(collection(db, 'invoices'));
-          batch.set(newRef, {
-            ...invoiceData,
-            id: newRef.id,
-            invoiceId: invoiceNo,
-            subcontractId: targetSub.id,
-            projectId: project.id,
-            enterpriseId: enterprise.id,
-            vendorId: targetSub.vendorId,
-            vendorName: targetSub.vendorName,
-            totalAmount: 0,
-            certifiedAmount: 0,
-            items: [],
-            createdAt: new Date().toISOString()
-          });
-        }
+          status: (row['Status'] || row.status || 'Draft'),
+          submittedDate: asDate(row['Submit Date']),
+          certifiedDate: asDate(row['Approve Date']),
+          paymentDate: asDate(row['Payment Date']),
+          vendorId: targetSub.vendorId || undefined,
+        });
       }
 
-      await batch.commit();
-      toast.success('Successfully imported invoices.', { id: toastId });
-    } catch (error) {
+      if (rows.length === 0) {
+        toast.error(
+          unknownOrders.size > 0
+            ? `No rows imported. Unknown orders: ${Array.from(unknownOrders).join(', ')}`
+            : 'No rows in the sheet carried an Order ID and an Invoice No.',
+          { id: toastId }
+        );
+        setImportPreview(null);
+        return;
+      }
+
+      // One statement. Upsert on (subcontract_id, invoice_id), so a sheet row
+      // for an invoice that already exists updates it rather than raising a
+      // second one with the same reference.
+      const imported = await importInvoices(project.id, rows);
+      await reload();
+      toast.success(
+        unknownOrders.size > 0
+          ? `Imported ${imported} invoices. Unknown orders skipped: ${Array.from(unknownOrders).join(', ')}`
+          : `Imported ${imported} invoices.`,
+        { id: toastId }
+      );
+    } catch (error: any) {
       console.error('Error committing import:', error);
-      toast.error('Failed to commit import.', { id: toastId });
+      toast.error(`Failed to commit import: ${error?.message || 'Unknown error'}`, { id: toastId });
     }
     setImportPreview(null);
   };
@@ -211,27 +205,56 @@ export default function Invoicing({ enterprise, project, user, theme = 'light' }
     return { duplicateIds: duplicateList, hasImportDuplicates: duplicateList.length > 0 };
   }, [importPreview]);
 
+  const reload = useCallback(async () => {
+    try {
+      setInvoices(await fetchInvoiceSummaries(project.id) as any);
+    } catch (error: any) {
+      console.error('Invoicing: invoices fetch error:', error);
+      toast.error(`Failed to load invoices: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
   useEffect(() => {
     if (!project.id) return;
+    void reload();
 
-    const qInvoices = query(collection(db, 'invoices'), where('projectId', '==', project.id));
-    const unsubscribeInvoices = onSnapshot(qInvoices, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Invoice));
-      setInvoices(data);
-      setLoading(false);
-    });
-
-    const qSubcontracts = query(collection(db, 'subcontracts'), where('projectId', '==', project.id));
-    const unsubscribeSubcontracts = onSnapshot(qSubcontracts, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Subcontract));
-      setSubcontracts(data);
-    });
-
-    return () => {
-      unsubscribeInvoices();
-      unsubscribeSubcontracts();
+    const loadSubcontracts = async () => {
+      try {
+        setSubcontracts(await fetchSubcontractSummaries(project.id));
+      } catch (error) {
+        console.error('Invoicing: subcontracts fetch error:', error);
+      }
     };
-  }, [project.id]);
+    void loadSubcontracts();
+
+    const unsubInv = subscribeToTable('invoices', `project_id=eq.${project.id}`, () => void reload());
+    const unsubItems = subscribeToTable('invoice_items', undefined, () => void reload());
+    const unsubSub = subscribeToTable('subcontracts', `project_id=eq.${project.id}`, () => void loadSubcontracts());
+
+    return () => { unsubInv(); unsubItems(); unsubSub(); };
+  }, [project.id, reload]);
+
+  // The open invoice's items, with the parent line item's quantity and rate
+  // and the previous invoice's position, from invoice_item_detail.
+  const [invoiceItems, setInvoiceItems] = useState<any[]>([]);
+
+  const reloadInvoiceItems = useCallback(async () => {
+    if (!selectedInvoiceId) { setInvoiceItems([]); return; }
+    try {
+      setInvoiceItems(await fetchInvoiceItemDetail(selectedInvoiceId));
+    } catch (error: any) {
+      console.error('Invoicing: invoice items fetch error:', error);
+    }
+  }, [selectedInvoiceId]);
+
+  useEffect(() => {
+    void reloadInvoiceItems();
+    if (!selectedInvoiceId) return;
+    return subscribeToTable('invoice_items', `invoice_id=eq.${selectedInvoiceId}`,
+      () => void reloadInvoiceItems());
+  }, [reloadInvoiceItems, selectedInvoiceId]);
 
   const selectedInvoice = useMemo(() => 
     invoices.find(i => i.id === selectedInvoiceId), 
@@ -247,98 +270,73 @@ export default function Invoicing({ enterprise, project, user, theme = 'light' }
     e.preventDefault();
     if (!project.id || !enterprise.id || !invoiceFormData.subcontractId) return;
 
-    const subcontract = subcontracts.find(s => s.id === invoiceFormData.subcontractId);
+    const subcontract = subcontracts.find(sub => sub.id === invoiceFormData.subcontractId);
     if (!subcontract) return;
 
     try {
-      const projectInvoices = invoices.filter(i => i.projectId === project.id);
-      const nextId = (projectInvoices.length + 1).toString().padStart(3, '0');
+      const onThisOrder = invoices.filter(i => i.subcontractId === subcontract.id);
+      const numbers = onThisOrder.map(i => parseInt(i.invoiceId)).filter(n => !isNaN(n));
+      const nextId = String(numbers.length > 0 ? Math.max(...numbers) + 1 : 1).padStart(3, '0');
 
-      const items: InvoiceItem[] = (subcontract.lineItems || []).map(li => ({
-        id: Math.random().toString(36).substring(2, 9),
-        subcontractLineItemId: li.id,
-        itemNo: li.itemNo,
-        description: li.description,
-        qty: li.qty,
-        unit: li.unit,
-        rate: li.rate,
-        total: li.total,
-        claimQty: 0,
-        claimPercent: 0,
-        claimValue: 0,
-        certifiedQty: 0,
-        certifiedPercent: 0,
-        certifiedValue: 0
-      }));
+      // The invoice and one item per line item on the order are created in the
+      // database, each opening at what has already been certified. This used
+      // to build the item array in the browser from the subcontract's embedded
+      // line items, always starting them at zero.
+      const newId = await createInvoiceFromSubcontract(
+        subcontract.id,
+        nextId,
+        (invoiceFormData as any).description || undefined,
+        user.displayName || user.email
+      );
 
-      const newInvoice = {
-        ...invoiceFormData,
-        invoiceId: nextId,
-        enterpriseId: enterprise.id,
-        projectId: project.id,
-        vendorId: subcontract.vendorId,
-        vendorName: subcontract.vendorName,
-        createdAt: new Date().toISOString(),
-        createdBy: user.uid,
-        items,
-        totalAmount: 0,
-        certifiedAmount: 0
-      };
+      const rest: any = { ...invoiceFormData };
+      delete rest.subcontractId;
+      delete rest.description;
+      if (Object.keys(rest).length > 0) await updateInvoice(newId, rest);
 
-      const docRef = await addDoc(collection(db, 'invoices'), newInvoice);
+      await reload();
       setIsAddingInvoice(false);
-      setSelectedInvoiceId(docRef.id);
-    } catch (error) {
+      setSelectedInvoiceId(newId);
+    } catch (error: any) {
       console.error('Error adding invoice:', error);
+      toast.error(`Failed to add invoice: ${error?.message || 'Unknown error'}`);
     }
   };
 
+  /**
+   * Edit one claim or certification figure on an invoice item.
+   *
+   * The remaining eleven are derived in the database, from the parent line
+   * item's quantity and rate and the previous invoice's certified position.
+   * This used to derive four of them here, against the subcontract's embedded
+   * line item array, and rewrite the whole invoice.
+   */
   const updateInvoiceItem = async (itemId: string, updates: Partial<InvoiceItem>) => {
-    if (!selectedInvoiceId || !selectedInvoice) return;
-
-    const updatedItems = selectedInvoice.items.map(item => {
-      if (item.id === itemId) {
-        const newItem = { ...item, ...updates };
-        const li = selectedSubcontract?.lineItems?.find(l => l.id === item.subcontractLineItemId);
-        if (li) {
-          if ('claimQty' in updates) {
-            newItem.claimValue = (updates.claimQty || 0) * li.rate;
-            newItem.claimPercent = li.total > 0 ? (newItem.claimValue / li.total) * 100 : 0;
-          } else if ('claimPercent' in updates) {
-            newItem.claimValue = ((updates.claimPercent || 0) / 100) * li.total;
-            newItem.claimQty = li.rate > 0 ? newItem.claimValue / li.rate : 0;
-          }
-
-          if ('certifiedQty' in updates) {
-            newItem.certifiedValue = (updates.certifiedQty || 0) * li.rate;
-            newItem.certifiedPercent = li.total > 0 ? (newItem.certifiedValue / li.total) * 100 : 0;
-          } else if ('certifiedPercent' in updates) {
-            newItem.certifiedValue = ((updates.certifiedPercent || 0) / 100) * li.total;
-            newItem.certifiedQty = li.rate > 0 ? newItem.certifiedValue / li.rate : 0;
-          }
-        }
-        return newItem;
-      }
-      return item;
-    });
-
-    const totalAmount = updatedItems.reduce((sum, i) => sum + (i.claimValue || 0), 0);
-    const certifiedAmount = updatedItems.reduce((sum, i) => sum + (i.certifiedValue || 0), 0);
-
-    await updateDoc(doc(db, 'invoices', selectedInvoiceId), {
-      items: updatedItems,
-      totalAmount,
-      certifiedAmount
-    });
+    const field = Object.keys(updates)[0];
+    if (!field) return;
+    try {
+      await setInvoiceItemClaim(itemId, field, Number((updates as any)[field]) || 0);
+      await reloadInvoiceItems();
+      await reload();
+    } catch (error: any) {
+      console.error('Error updating invoice item:', error);
+      toast.error(`Failed to update item: ${error?.message || 'Unknown error'}`);
+      await reloadInvoiceItems();
+    }
   };
 
   const updateInvoiceStatus = async (status: Invoice['status']) => {
     if (!selectedInvoiceId) return;
     const updates: any = { status };
-    if (status === 'Submitted') updates.submittedDate = new Date().toISOString();
-    if (status === 'Certified') updates.certifiedDate = new Date().toISOString();
-    
-    await updateDoc(doc(db, 'invoices', selectedInvoiceId), updates);
+    if (status === 'Submitted') updates.submittedDate = dateToISO(new Date());
+    if (status === 'Certified') updates.certifiedDate = dateToISO(new Date());
+    try {
+      await updateInvoice(selectedInvoiceId, updates);
+      await reload();
+    } catch (error: any) {
+      console.error('Error updating invoice status:', error);
+      toast.error(`Failed to update status: ${error?.message || 'Unknown error'}`);
+    }
   };
 
   const invoiceColumnDefs = useMemo<ColDef[]>(() => [
@@ -737,7 +735,7 @@ export default function Invoicing({ enterprise, project, user, theme = 'light' }
                 )}>
                   <AgGridReact
                     ref={itemsGridRef}
-                    rowData={selectedInvoice.items || []}
+                    rowData={invoiceItems}
                     columnDefs={itemColumnDefs}
                     animateRows={true}
                     singleClickEdit={true}

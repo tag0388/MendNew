@@ -181,17 +181,20 @@ export async function upsertCostPhasing(
 export async function upsertCostPhasingMany(
   projectId: string,
   rows: Array<
-    { costCodeId: string; type: CostPhasingType; periodValues: Record<string, number> } &
+    { costCodeId: string; type: CostPhasingType; periodValues?: Record<string, number> } &
     Partial<Pick<CostPhasingRow, 'phasingSource' | 'activityId' | 'startDate' | 'endDate' | 'distribution'>>
   >
 ): Promise<void> {
   if (rows.length === 0) return;
   const { error } = await supabase.from('cost_phasing').upsert(
+    // periodValues is optional: a caller saving only the row's settings --
+    // source, dates, curve -- before asking the database to compute the curve
+    // leaves it out, and an existing row keeps the values it already has.
     rows.map(({ costCodeId, type, periodValues, ...settings }) => ({
       project_id: projectId,
       cost_code_id: costCodeId,
       type,
-      period_values: periodValues,
+      ...(periodValues !== undefined ? { period_values: periodValues } : {}),
       ...toRow(settings),
     })),
     { onConflict: 'cost_code_id,type' }
@@ -622,4 +625,51 @@ export async function applyEtcPhasing(
   const { data, error } = await supabase.rpc('apply_etc_phasing', { p_rows: rows });
   raise('apply phasing', error);
   return (data as number) ?? 0;
+}
+
+export interface EtcPhasingOutcome {
+  detailId: string;
+  phased: boolean;
+  reason: string | null;
+}
+
+/**
+ * Recalculate ETC auto-phasing in the database.
+ *
+ * Replaces the day-by-day calendar walk that used to run in the browser --
+ * twice, once in the cost code's ETC Details tab and once in the Bulk ETC
+ * Details screen. Pass the detail ids to phase, or nothing for every
+ * Auto-Phase row in the project.
+ *
+ * Returns one outcome per row considered, so the caller can say which rows
+ * were skipped and why instead of reporting a silent no-op.
+ */
+export async function applyEtcAutoPhasing(
+  projectId: string,
+  detailIds?: string[]
+): Promise<EtcPhasingOutcome[]> {
+  const { data, error } = await supabase.rpc('apply_etc_auto_phasing', {
+    p_project_id: projectId,
+    p_detail_ids: detailIds && detailIds.length > 0 ? detailIds : null,
+  });
+  raise('calculate phasing', error);
+  return (data ?? []).map((r: any) => ({
+    detailId: r.detail_id,
+    phased: r.phased,
+    reason: r.reason ?? null,
+  }));
+}
+
+/** Group skip reasons into the message the grids show. */
+export function summariseEtcPhasing(outcomes: EtcPhasingOutcome[]): {
+  phased: number;
+  skipped: Record<string, number>;
+} {
+  const skipped: Record<string, number> = {};
+  let phased = 0;
+  for (const o of outcomes) {
+    if (o.phased) phased++;
+    else if (o.reason) skipped[o.reason] = (skipped[o.reason] || 0) + 1;
+  }
+  return { phased, skipped };
 }
