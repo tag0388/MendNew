@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useNarrowScreen, FOLD_MODULE_SIDEBAR } from '../lib/useNarrowScreen';
 import { subscribeToTable } from '../lib/supabase';
 import { getCurrentUser } from '../lib/currentUser';
 import { fetchSavedViews, createSavedView, deleteSavedView } from '../lib/savedViews';
@@ -82,6 +83,12 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const [activeTab, setActiveTab] = useState<string>('users');
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['General', 'Cost', 'Change', 'Risk', 'Sub-Contract', 'Procurement', 'Progress', 'Schedule']));
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  // This sidebar is a list of tabs, so it is the first thing to fold when the
+  // window is too narrow to show it and a grid at once. The icon rail still
+  // says where you are, and the toggle still works.
+  const narrow = useNarrowScreen(FOLD_MODULE_SIDEBAR);
+  useEffect(() => { setIsSidebarOpen(!narrow); }, [narrow]);
 
   const adminSections = [
     {
@@ -395,6 +402,19 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
     }
   };
 
+  // Maps the component's short type name onto the attribute set the data
+  // layer knows. Previously an inline chain of ternaries repeated at a dozen
+  // call sites.
+  //
+  // It has to be declared above getAttributes rather than beside its other
+  // helpers: valueIdExists below calls getAttributes during the render body,
+  // which reaches this. A const is in the temporal dead zone until its own
+  // line runs, so declaring it later crashed the screen the moment the Add
+  // Value dialog opened -- the one render where valueIdExists is evaluated.
+  const attributeSetFor = (
+    type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress'
+  ): AttributeSet => `${type}Attributes` as AttributeSet;
+
   const getAttributes = (type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress') => {
     const attrs = (enterprise as any)[attributeSetFor(type)] || [];
     
@@ -706,13 +726,6 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
       return aVal < bVal ? 1 : -1;
     });
   }, [enterprise.vendors, vendorSearch, vendorSort, columnFilters.vendors]);
-
-  // Maps the component's short type name onto the attribute set the data
-  // layer knows. Previously an inline chain of ternaries repeated at a dozen
-  // call sites.
-  const attributeSetFor = (
-    type: 'project' | 'lineItem' | 'costCode' | 'subcontract' | 'procurement' | 'change' | 'risk' | 'progress'
-  ): AttributeSet => `${type}Attributes` as AttributeSet;
 
   const bulkDeleteProjects = async () => {
     await deleteProjects(Array.from(selectedProjectIds));

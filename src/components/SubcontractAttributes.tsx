@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Project, ProjectAttribute, ProjectAttributeValue } from '../types';
-import { updateProjectAttributeSet } from '../lib/projectSettings';
+import { fetchAttributeSet, saveAttributeSet, ATTRIBUTE_CATEGORY } from '../lib/attributes';
 import { 
   Plus, 
   Trash2, 
@@ -59,23 +59,30 @@ const SubcontractAttributes: React.FC<SubcontractAttributesProps> = ({ project }
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    // Initialize with 10 default attributes if empty
-    const currentAttrs = project.subcontractAttributes || [];
-    const initializedAttrs = Array.from({ length: 10 }, (_, i) => {
-      const id = (i + 1).toString().padStart(2, '0');
-      const existing = currentAttrs.find(a => a.id === id);
-      return existing || { id, title: '', values: [] };
-    });
-    setAttributes(initializedAttrs);
-  }, [project.subcontractAttributes]);
+  // The ten slots always exist in the database, so this reads them rather
+  // than inventing empty ones when the project has none.
+  const reloadAttributes = useCallback(async () => {
+    if (!project.enterpriseId || !project.id) return;
+    try {
+      setAttributes(await fetchAttributeSet(
+        project.enterpriseId, project.id, ATTRIBUTE_CATEGORY.subcontractAttributes));
+    } catch (error) {
+      console.error('Error loading subcontract attributes:', error);
+    }
+  }, [project.enterpriseId, project.id]);
+
+  useEffect(() => { void reloadAttributes(); }, [reloadAttributes]);
 
   const handleGlobalSave = async (updatedAttrs: ProjectAttribute[]) => {
     try {
-      await updateProjectAttributeSet(project.id, 'subcontractAttributes', updatedAttrs);
-    } catch (error) {
+      await saveAttributeSet(
+        project.enterpriseId, project.id, ATTRIBUTE_CATEGORY.subcontractAttributes, updatedAttrs);
+    } catch (error: any) {
       console.error('Error saving subcontract attributes:', error);
-      toast.error('Failed to save changes.');
+      // A value that rows still hold cannot be deleted; the database says
+      // how many, so show that rather than a generic failure.
+      toast.error(error?.message || 'Failed to save changes.');
+      await reloadAttributes();   // the screen must not show a change that did not happen
     }
   };
 

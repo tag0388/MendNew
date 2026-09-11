@@ -4,6 +4,7 @@ import { Project, Enterprise } from '../types';
 import { RefreshCw, ClipboardList, ChevronLeft, Menu, Settings, Layout } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
+import { useNarrowScreen, FOLD_MODULE_SIDEBAR } from '../lib/useNarrowScreen';
 import ChangeManagement from './ChangeManagement';
 import BulkChangeRecords from './BulkChangeRecords';
 import ProjectChangeAttributes from './ProjectChangeAttributes';
@@ -26,6 +27,12 @@ const ChangeManagementSubPane: React.FC<ChangeManagementSubPaneProps> = ({
   const { projectId, subModuleId } = useParams();
   const activeTab = (subModuleId as ChangeTab) || 'standard';
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  // This sidebar is a list of tabs, so it is the first thing to fold when the
+  // window is too narrow to show it and a grid at once. The icon rail still
+  // says where you are, and the toggle still works.
+  const narrow = useNarrowScreen(FOLD_MODULE_SIDEBAR);
+  useEffect(() => { setIsSidebarOpen(!narrow); }, [narrow]);
 
   // From the database. The two map lookups this replaces read Firestore
   // document shapes that no longer exist, so both were always undefined --

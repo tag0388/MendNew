@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useProjectRole } from '../lib/useProjectRole';
 import { Project, Enterprise } from '../types';
 import { ShoppingCart, Settings, Tag, Calendar, ChevronLeft, Menu, Layout, ClipboardList } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
+import { useNarrowScreen, FOLD_MODULE_SIDEBAR } from '../lib/useNarrowScreen';
 import ProcurementProgress from './ProcurementProgress';
 import ProcurementStepConfigWrapper from './ProcurementStepConfigWrapper';
 import ProcurementAttributes from './ProcurementAttributes';
@@ -26,6 +27,12 @@ const ProcurementManagementSubPane: React.FC<ProcurementManagementSubPaneProps> 
   const { projectId, subModuleId } = useParams();
   const activeTab = (subModuleId as ProcurementTab) || 'packages';
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  // This sidebar is a list of tabs, so it is the first thing to fold when the
+  // window is too narrow to show it and a grid at once. The icon rail still
+  // says where you are, and the toggle still works.
+  const narrow = useNarrowScreen(FOLD_MODULE_SIDEBAR);
+  useEffect(() => { setIsSidebarOpen(!narrow); }, [narrow]);
 
   // From the database. The two map lookups this replaces read Firestore
   // document shapes that no longer exist, so both were always undefined --

@@ -10,6 +10,7 @@ import {
 import { fetchProject } from './lib/projects';
 import { Enterprise, Project } from './types';
 import Sidebar from './components/Sidebar';
+import { useNarrowScreen, FOLD_MAIN_SIDEBAR } from './lib/useNarrowScreen';
 import Header from './components/Header';
 import EnterpriseDashboard from './components/EnterpriseDashboard';
 import ProjectDashboard from './components/ProjectDashboard';
@@ -31,6 +32,12 @@ export default function App() {
   const [view, setView] = useState<'enterprise' | 'project' | 'system-admin' | 'enterprise-admin' | 'project-admin' | 'profile'>('enterprise');
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+
+  // On a laptop the two sidebars leave too little room for a grid, so the
+  // main one folds to its icon rail. This fires when the window crosses the
+  // width, not on every resize, so opening it by hand still sticks.
+  const narrow = useNarrowScreen(FOLD_MAIN_SIDEBAR);
+  useEffect(() => { setIsSidebarCollapsed(narrow); }, [narrow]);
   const [authError, setAuthError] = useState<string | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
