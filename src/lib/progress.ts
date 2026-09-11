@@ -196,3 +196,22 @@ export async function bulkUpdateProgressItems(ids: string[], patch: Record<strin
   raise('bulk update progress items', error);
   return data?.length ?? 0;
 }
+
+/**
+ * Progress Tracking's Calculate, in the database.
+ *
+ * Works out each item's earned quantity from its rule of credit, the actual
+ * for the current period, and the planned and forecast phasing across the
+ * progress periods. Returns how many items actually moved.
+ */
+export async function calculateProgress(
+  projectId: string,
+  itemIds?: string[]
+): Promise<number> {
+  const { data, error } = await supabase.rpc('calculate_progress', {
+    p_project_id: projectId,
+    p_item_ids: itemIds && itemIds.length > 0 ? itemIds : null,
+  });
+  raise('calculate progress', error);
+  return (data as number) ?? 0;
+}

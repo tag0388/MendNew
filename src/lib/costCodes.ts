@@ -181,17 +181,20 @@ export async function upsertCostPhasing(
 export async function upsertCostPhasingMany(
   projectId: string,
   rows: Array<
-    { costCodeId: string; type: CostPhasingType; periodValues: Record<string, number> } &
+    { costCodeId: string; type: CostPhasingType; periodValues?: Record<string, number> } &
     Partial<Pick<CostPhasingRow, 'phasingSource' | 'activityId' | 'startDate' | 'endDate' | 'distribution'>>
   >
 ): Promise<void> {
   if (rows.length === 0) return;
   const { error } = await supabase.from('cost_phasing').upsert(
+    // periodValues is optional: a caller saving only the row's settings --
+    // source, dates, curve -- before asking the database to compute the curve
+    // leaves it out, and an existing row keeps the values it already has.
     rows.map(({ costCodeId, type, periodValues, ...settings }) => ({
       project_id: projectId,
       cost_code_id: costCodeId,
       type,
-      period_values: periodValues,
+      ...(periodValues !== undefined ? { period_values: periodValues } : {}),
       ...toRow(settings),
     })),
     { onConflict: 'cost_code_id,type' }

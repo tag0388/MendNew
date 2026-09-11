@@ -157,16 +157,19 @@ export async function upsertCostPhasingRows(
 
 /**
  * Recalculate auto-phasing for the project's cost phasing rows, in the
- * database. Pass the phasing row ids to limit it, or nothing for every row set
- * to Auto.
+ * database. Narrow it by phasing row id, or by cost code (which is how the
+ * cost code's own Timephasing tab uses it), or neither for every row set to
+ * Auto in the project.
  */
 export async function applyCostPhasing(
   projectId: string,
-  phasingIds?: string[]
+  phasingIds?: string[],
+  costCodeIds?: string[]
 ): Promise<number> {
   const { data, error } = await supabase.rpc('apply_cost_phasing', {
     p_project_id: projectId,
     p_phasing_ids: phasingIds && phasingIds.length > 0 ? phasingIds : null,
+    p_cost_code_ids: costCodeIds && costCodeIds.length > 0 ? costCodeIds : null,
   });
   raise('calculate phasing', error);
   return (data as number) ?? 0;

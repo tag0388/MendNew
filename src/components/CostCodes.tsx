@@ -5,6 +5,7 @@ import { Project, Enterprise, CostCode, SavedView, Calendar as ProjectCalendar, 
 import { subscribeToTable } from '../lib/supabase';
 import { fetchProjectResourceRates } from '../lib/projectSettings';
 import { parsePastedDate, toStoredDate } from '../lib/phasing';
+import { applyCostPhasing } from '../lib/timephasing';
 import {
   fetchCostCodes,
   updateCostCode,
@@ -2429,165 +2430,51 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     return defs;
   }, [project.reportingPeriods?.periods, project.reportingPeriods?.currentPeriodId, scheduleItems]);
 
-  const calculatePhasing = useCallback((
-    total: number,
-    startDate: string,
-    endDate: string,
-    distribution: string,
-    periods: any[],
-    existingPeriodValues?: Record<string, number>
-  ) => {
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    if (isNaN(start.getTime()) || isNaN(end.getTime()) || start >= end) return {};
+  const handleCalculateAutoPhasing = useCallback(async () => {
+    if (!selectedTimephasingCode || !selectedTimephasingCodeId) return;
 
-    const periodValues: Record<string, number> = {};
-    const activePeriods = periods.filter(p => {
-      const pStart = new Date(p.startDate);
-      const pEnd = new Date(p.endDate);
-      return (pStart <= end && pEnd >= start);
-    });
+    const selectedRows = (timephasingGridRef.current?.api.getSelectedNodes() || []).map(n => n.data);
+    const scoped = selectedRows.length > 0;
+    const autoRows = (scoped ? selectedRows : timephasingRows).filter(r => r?.phasingSource === 'Auto');
 
-    if (activePeriods.length === 0) return {};
-
-    const n = activePeriods.length;
-    let weights: number[] = [];
-
-    switch (distribution) {
-      case 'Even':
-        weights = new Array(n).fill(1);
-        break;
-      case 'Front load':
-        weights = activePeriods.map((_, i) => n - i);
-        break;
-      case 'Back load':
-        weights = activePeriods.map((_, i) => i + 1);
-        break;
-      case 'Bell Curve':
-        weights = activePeriods.map((_, i) => {
-          const x = (i - (n - 1) / 2) / (n / 4 || 1);
-          return Math.exp(-0.5 * x * x);
-        });
-        break;
-      case 'S-Curve':
-        weights = activePeriods.map((_, i) => {
-          const x = (i / (n - 1 || 1)) * 10 - 5;
-          const sigmoid = 1 / (1 + Math.exp(-x));
-          const prevX = ((i - 1) / (n - 1 || 1)) * 10 - 5;
-          const prevSigmoid = i === 0 ? 0 : 1 / (1 + Math.exp(-prevX));
-          return sigmoid - prevSigmoid;
-        });
-        break;
-      case 'Profile':
-        if (existingPeriodValues) {
-          weights = activePeriods.map(p => existingPeriodValues[p.id] || 0);
-          const weightSum = weights.reduce((a, b) => a + b, 0);
-          if (weightSum === 0) {
-            weights = new Array(n).fill(1);
-          }
-        } else {
-          weights = new Array(n).fill(1);
-        }
-        break;
-      default:
-        weights = new Array(n).fill(1);
+    if (autoRows.length === 0) {
+      toast.info(scoped
+        ? "Selected rows are not set to 'Auto' phasing source."
+        : "No rows set to 'Auto' phasing source.");
+      return;
     }
 
-    const totalWeight = weights.reduce((a, b) => a + b, 0);
-    activePeriods.forEach((p, i) => {
-      periodValues[p.id] = (weights[i] / (totalWeight || 1)) * total;
-    });
-
-    return periodValues;
-  }, []);
-
-  const handleCalculateAutoPhasing = useCallback(async () => {
-    if (!selectedTimephasingCode) return;
-    
-    // Get selected rows from grid API
-    const selectedNodes = timephasingGridRef.current?.api.getSelectedNodes();
-    const selectedRows = selectedNodes?.map(node => node.data) || [];
-    
-    let rowsToProcess = [];
-    if (selectedRows.length > 0) {
-      rowsToProcess = selectedRows.filter(r => r.phasingSource === 'Auto');
-      if (rowsToProcess.length === 0) {
-        toast.info("Selected rows are not set to 'Auto' phasing source.");
-        return;
-      }
-    } else {
-      rowsToProcess = timephasingRows.filter(r => r.phasingSource === 'Auto');
-      if (rowsToProcess.length === 0) {
-        toast.info("No rows set to 'Auto' phasing source.");
-        return;
-      }
+    const withSettings = autoRows.filter(r => r.startDate && r.endDate && r.distribution);
+    if (withSettings.length === 0) {
+      toast.warning('Incomplete auto-phasing settings (Dates or Distribution missing)');
+      return;
     }
 
     setIsTimephasingLoading(true);
     try {
-      const phasingUpserts: Parameters<typeof upsertCostPhasingMany>[1] = [];
-      const periods = project.reportingPeriods?.periods || [];
-      const currentPeriodId = project.reportingPeriods?.currentPeriodId;
-      const currentPeriod = periods.find(p => p.id === currentPeriodId);
-      const currentPeriodEnd = currentPeriod ? new Date(currentPeriod.endDate) : null;
-      const currentIndex = resolveCurrentPeriodIndex(periods, currentPeriodId);
-      const nextPeriodStart = (currentIndex !== -1 && currentIndex < periods.length - 1) 
-        ? periods[currentIndex + 1].startDate 
-        : null;
+      // The row's settings are saved first, so Calculate phases what the grid
+      // is showing even if a cell edit has not been committed yet.
+      // (cost_code_id, type) is unique, so this is one upsert -- two people
+      // phasing the same row cannot create two curves for it.
+      await upsertCostPhasingMany(project.id, withSettings.map(r => ({
+        costCodeId: selectedTimephasingCodeId,
+        type: r.id,
+        phasingSource: 'Auto',
+        startDate: toDateOnly(r.startDate),
+        endDate: toDateOnly(r.endDate),
+        distribution: r.distribution,
+      })));
 
-      let updatedCount = 0;
+      // Then the curve itself, in the database. This screen carried a third
+      // copy of the five distribution curves, after the subcontract and
+      // project-wide copies had been consolidated into phase_across_periods.
+      // The EAC row phases what is left to spend and cannot start before the
+      // next open period; both rules live in the function.
+      const phased = await applyCostPhasing(project.id, undefined, [selectedTimephasingCodeId]);
+      await reloadCostPhasing();
 
-      for (const row of rowsToProcess) {
-        if (row.startDate && row.endDate && row.distribution) {
-          let total = row.totalFromCode || 0;
-          let effectiveStartDate = row.startDate;
-
-          // SPECIAL LOGIC FOR EAC
-          if (row.id === 'eac') {
-            const code = costCodes.find(c => c.code === selectedTimephasingCode);
-            // EAC auto-phasing should only distribute the ETC part
-            total = code?.estimateToComplete || 0;
-            
-            // Validation: if start date <= current period end date, auto phasing starts from next period
-            if (currentPeriodEnd && nextPeriodStart) {
-              const userStart = new Date(row.startDate);
-              if (userStart <= currentPeriodEnd) {
-                console.log(`EAC Auto Phasing: Adjusting start date from ${row.startDate} to ${nextPeriodStart} because it was on or before current period.`);
-                effectiveStartDate = nextPeriodStart;
-              }
-            }
-          }
-
-          const newPhasing = calculatePhasing(
-            total,
-            effectiveStartDate,
-            row.endDate,
-            row.distribution,
-            periods,
-            row.periodValues
-          );
-
-          // No "read to find out whether it exists, then update or insert":
-          // (cost_code_id, type) is unique, so this is one upsert and two
-          // people phasing the same row at once cannot create two curves for
-          // it -- which the read-then-write version could.
-          phasingUpserts.push({
-            costCodeId: selectedTimephasingCodeId!,
-            type: row.id,
-            phasingSource: 'Auto',
-            startDate: toDateOnly(row.startDate),
-            endDate: toDateOnly(row.endDate),
-            distribution: row.distribution,
-            periodValues: newPhasing,
-          });
-          updatedCount++;
-        }
-      }
-
-      if (updatedCount > 0) {
-        await upsertCostPhasingMany(project.id, phasingUpserts);
-        await reloadCostPhasing();
-        toast.success(`Recalculated phasing for ${updatedCount} row(s)`);
+      if (phased > 0) {
+        toast.success(`Recalculated phasing for ${phased} row(s)`);
       } else {
         toast.warning('Incomplete auto-phasing settings (Dates or Distribution missing)');
       }
@@ -2597,7 +2484,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
     } finally {
       setIsTimephasingLoading(false);
     }
-  }, [selectedTimephasingCodeId, timephasingRows, project.id, project.reportingPeriods, costCodes, calculatePhasing]);
+  }, [selectedTimephasingCode, selectedTimephasingCodeId, timephasingRows, project.id, reloadCostPhasing]);
 
   const handleExportTimephasing = () => {
     if (!selectedTimephasingCode) return;

@@ -6,7 +6,7 @@ import {
   fetchProgressPackages, fetchProgressItems, createProgressPackage,
   updateProgressPackage, deleteProgressPackages, bulkUpdateProgressPackages,
   importProgressPackages, upsertProgressItems, updateProgressItem,
-  deleteProgressItems, bulkUpdateProgressItems,
+  deleteProgressItems, bulkUpdateProgressItems, calculateProgress,
 } from '../lib/progress';
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
@@ -902,169 +902,31 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
     return `${y}-${m}-${d}`;
   };
 
-  const calculateDistribution = (total: number, startStr: string, endStr: string, curve: string, periods: any[]) => {
-    if (total === 0 || !startStr || !endStr || periods.length === 0) return {};
-    
-    const start = new Date(startStr);
-    const end = new Date(endStr);
-    if (isNaN(start.getTime()) || isNaN(end.getTime()) || start > end) return {};
-
-    // Filter periods that overlap with the item's date range
-    const relevantPeriods = periods.filter(p => {
-      if (!p.startDate || !p.endDate) return false;
-      const pStart = new Date(p.startDate);
-      const pEnd = new Date(p.endDate);
-      return (pStart <= end && pEnd >= start);
-    });
-
-    if (relevantPeriods.length === 0) return {};
-
-    const values: Record<string, number> = {};
-    const n = relevantPeriods.length;
-
-    // Distribution weights based on curve
-    let weights: number[] = [];
-    if (curve === 'even') {
-      weights = Array(n).fill(1/n);
-    } else if (curve === 'front load') {
-      const sum = (n * (n + 1)) / 2;
-      weights = Array.from({length: n}, (_, i) => (n - i) / sum);
-    } else if (curve === 'back load') {
-      const sum = (n * (n + 1)) / 2;
-      weights = Array.from({length: n}, (_, i) => (i + 1) / sum);
-    } else if (curve === 'Bell' || curve === 'Scurve') {
-      // Bell and S-curve (phasing distribution) approximation
-      const s_weights = Array.from({length: n}, (_, i) => {
-         const x = (i + 0.5) / n;
-         return Math.sin(Math.PI * x);
-      });
-      const sum = s_weights.reduce((a, b) => a + b, 0);
-      weights = s_weights.map(v => v / sum);
-    } else {
-      weights = Array(n).fill(1/n);
-    }
-
-    relevantPeriods.forEach((p, i) => {
-      values[p.id] = Number((total * weights[i]).toFixed(2));
-    });
-
-    return values;
-  };
-
   const handleCalculate = async () => {
     if (items.length === 0) return;
-    
-    const allPeriods = project.progressPeriods?.periods || [];
-    const openPeriods = allPeriods.filter(p => p.status !== 'closed');
-    const currentOpenPeriod = allPeriods.find(p => p.status === 'open');
-    const closedPeriods = allPeriods.filter(p => p.status === 'closed');
 
-    if (openPeriods.length === 0 && !currentOpenPeriod) {
+    const allPeriods = project.progressPeriods?.periods || [];
+    if (allPeriods.filter(p => p.status !== 'closed').length === 0) {
       toast.error('No open or future progress periods available');
       return;
     }
 
+    const toastId = toast.loading('Calculating...');
     try {
-      const changed: any[] = [];
-
-      // Process all items
-      items.forEach(item => {
-        let hasChanges = false;
-        const updates: any = {};
-
-        // 1. Calculate Earned To Date using the RoC for this specific item
-        const itemPackage = packages.find(p => p.id === item.packageDocId);
-        const rocId = item.ruleOfCreditId || itemPackage?.ruleOfCreditId;
-        const roc = rulesOfCredit.find(r => r.id === rocId || r.ruleId === rocId);
-        
-        let earnedToDate = 0;
-        if (roc?.steps) {
-          const progress = item.ruleOfCreditProgress || {};
-          const percent = roc.steps.reduce((sum, step) => {
-            const stepProgress = progress[step.id] || 0;
-            return sum + (stepProgress * step.weight / 100);
-          }, 0);
-          earnedToDate = (percent / 100) * (item.totalQty || 0);
-        }
-
-        // 2. Populate Earned in the Current Period
-        if (currentOpenPeriod) {
-          // Logic: Earned in Current Period = Earned to Date - Earned in all previous periods
-          const currentPeriodIndex = allPeriods.findIndex(p => p.id === currentOpenPeriod.id);
-          const previousPeriods = allPeriods.slice(0, currentPeriodIndex);
-          const prevEarnedSum = previousPeriods.reduce((sum, p) => sum + (item.actualPeriodValues?.[p.id] || 0), 0);
-          const earnedThisPeriod = Math.max(0, earnedToDate - prevEarnedSum);
-          
-          const currentActualValue = item.actualPeriodValues?.[currentOpenPeriod.id] || 0;
-          if (Math.abs(currentActualValue - earnedThisPeriod) > 0.001) {
-            updates.actualPeriodValues = { ...(item.actualPeriodValues || {}), [currentOpenPeriod.id]: earnedThisPeriod };
-            hasChanges = true;
-          }
-        }
-
-        // 3. Calculate for Planned Phasing (Auto)
-        if (item.phasingMethod === 'Auto' && item.plannedStartDate && item.plannedEndDate) {
-          let startDate = item.plannedStartDate;
-          let endDate = item.plannedEndDate;
-
-          const s = new Date(startDate);
-          let e = new Date(endDate);
-          if (e <= s) {
-            e = new Date(s);
-            e.setDate(e.getDate() + 7);
-            endDate = e.toISOString().split('T')[0];
-          }
-
-          const totalQty = item.totalQty || 0;
-          const distributed = calculateDistribution(totalQty, startDate, endDate, item.phasingCurve || 'even', openPeriods);
-          updates.periodValues = distributed;
-          updates.plannedEndDate = endDate;
-          hasChanges = true;
-        }
-
-        // 4. Calculate for Current Phasing (Forecast Auto)
-        const cMethod = item.currentPhasingMethod || 'Auto';
-        if (cMethod === 'Auto' && item.currentStartDate && item.currentEndDate) {
-          let startDate = item.currentStartDate;
-          let endDate = item.currentEndDate;
-
-          if (currentOpenPeriod?.startDate) {
-            const pStart = new Date(currentOpenPeriod.startDate);
-            const userStart = new Date(startDate);
-            if (userStart < pStart) {
-              startDate = currentOpenPeriod.startDate;
-            }
-          }
-
-          const s = new Date(startDate);
-          let e = new Date(endDate);
-          if (e <= s) {
-            e = new Date(s);
-            e.setDate(e.getDate() + 7);
-            endDate = e.toISOString().split('T')[0];
-          }
-
-          const remainingQty = Math.max(0, (item.totalQty || 0) - earnedToDate);
-          const distributed = calculateDistribution(remainingQty, startDate, endDate, item.currentPhasingCurve || 'even', openPeriods);
-          
-          updates.currentPeriodValues = distributed;
-          updates.currentStartDate = startDate;
-          updates.currentEndDate = endDate;
-          hasChanges = true;
-        }
-
-        if (hasChanges) changed.push({ id: item.id, ...updates });
-      });
-
-      if (changed.length > 0) {
-        // One statement for every item whose phasing moved.
-        await upsertProgressItems(project.id, changed);
-        await reload();
-        toast.success(`Calculated and updated ${changed.length} items`);
+      // One statement in the database. It works out each item's earned
+      // quantity from its rule of credit's weighted steps, the actual for the
+      // current period, and the planned and forecast phasing across the
+      // progress periods -- all of which used to run here, over every item in
+      // the project, on whatever copy this tab was holding.
+      const changed = await calculateProgress(project.id);
+      await reload();
+      if (changed > 0) {
+        toast.success(`Calculated and updated ${changed} items`, { id: toastId });
       } else {
-        toast.info('Calculation complete: No changes needed');
+        toast.info('Calculation complete: No changes needed', { id: toastId });
       }
     } catch (error: any) {
+      toast.dismiss(toastId);
       console.error('Calculation failed', error);
       toast.error(`Failed to perform calculation: ${error?.message || 'Unknown error'}`);
     }
