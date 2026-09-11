@@ -5374,7 +5374,7 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
               transition={{ type: 'spring', damping: 30, stiffness: 300 }}
-              className="fixed right-0 top-0 bottom-0 w-[800px] bg-white dark:bg-[#0A0A0A] shadow-[-20px_0_50px_rgba(0,0,0,0.1)] z-[101] flex flex-col border-l border-gray-200 dark:border-white/10"
+              className="fixed right-0 top-0 bottom-0 w-full max-w-[800px] bg-white dark:bg-[#0A0A0A] shadow-[-20px_0_50px_rgba(0,0,0,0.1)] z-[101] flex flex-col border-l border-gray-200 dark:border-white/10"
             >
               {/* Header Section */}
               <div className="shrink-0 p-6 border-b bg-white dark:bg-[#0A0A0A]">

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useNarrowScreen, FOLD_MODULE_SIDEBAR } from '../lib/useNarrowScreen';
 import { subscribeToTable } from '../lib/supabase';
 import { getCurrentUser } from '../lib/currentUser';
 import { fetchSavedViews, createSavedView, deleteSavedView } from '../lib/savedViews';
@@ -82,6 +83,12 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
   const [activeTab, setActiveTab] = useState<string>('users');
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['General', 'Cost', 'Change', 'Risk', 'Sub-Contract', 'Procurement', 'Progress', 'Schedule']));
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  // This sidebar is a list of tabs, so it is the first thing to fold when the
+  // window is too narrow to show it and a grid at once. The icon rail still
+  // says where you are, and the toggle still works.
+  const narrow = useNarrowScreen(FOLD_MODULE_SIDEBAR);
+  useEffect(() => { setIsSidebarOpen(!narrow); }, [narrow]);
 
   const adminSections = [
     {

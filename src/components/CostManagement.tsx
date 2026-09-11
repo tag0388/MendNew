@@ -3,6 +3,7 @@ import { Project, Enterprise } from '../types';
 import { DollarSign, Tag, List, ChevronLeft, Menu, Settings, Hash, Database, Calendar, Target, ClipboardList } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { cn } from '../lib/utils';
+import { useNarrowScreen, FOLD_MODULE_SIDEBAR } from '../lib/useNarrowScreen';
 import ProjectCostCodeAttributes from './ProjectCostCodeAttributes';
 import ProjectResourceRates from './ProjectResourceRates';
 import CostReportingPeriod from './CostReportingPeriod';
@@ -31,6 +32,12 @@ const CostManagement: React.FC<CostManagementProps> = ({
   const activeTab = (subModuleId as CostTab) || 'costCodes';
   const [expandedSections, setExpandedSections] = useState<string[]>(['overview', 'settings']);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  // This sidebar is a list of tabs, so it is the first thing to fold when the
+  // window is too narrow to show it and a grid at once. The icon rail still
+  // says where you are, and the toggle still works.
+  const narrow = useNarrowScreen(FOLD_MODULE_SIDEBAR);
+  useEffect(() => { setIsSidebarOpen(!narrow); }, [narrow]);
 
   // From the database, not from a map on the project object and not from a
   // hardcoded email address. The two map lookups this replaces read Firestore

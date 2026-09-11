@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useNarrowScreen, FOLD_MODULE_SIDEBAR } from '../lib/useNarrowScreen';
 import { supabase, subscribeToTable } from '../lib/supabase';
 import { updateProject, fetchProjectMembers, assignProjectMember, removeProjectMember } from '../lib/projects';
 import { fetchEnterpriseUsers, type ProjectRole } from '../lib/session';
@@ -63,6 +64,12 @@ export default function ProjectAdmin({ project, enterprise }: ProjectAdminProps)
   const [saving, setSaving] = useState(false);
   const [lastSaved, setLastSaved] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  // This sidebar is a list of tabs, so it is the first thing to fold when the
+  // window is too narrow to show it and a grid at once. The icon rail still
+  // says where you are, and the toggle still works.
+  const narrow = useNarrowScreen(FOLD_MODULE_SIDEBAR);
+  useEffect(() => { setIsSidebarOpen(!narrow); }, [narrow]);
   
   const [formData, setFormData] = useState({
     projectName: project.projectName,
