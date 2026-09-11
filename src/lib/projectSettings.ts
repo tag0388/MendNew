@@ -1,3 +1,4 @@
+import { ATTRIBUTE_CATEGORY } from './attributes';
 import { supabase, fromRows, toRow, raise } from './supabase';
 import type { Calendar, ResourceRate } from '../types';
 
@@ -137,25 +138,32 @@ export type ProjectAttributeSet =
   | 'procurementAttributes'
   | 'progressAttributes';
 
-const ATTRIBUTE_COLUMN: Record<ProjectAttributeSet, string> = {
-  costCodeAttributes: 'cost_code_attributes',
-  lineItemAttributes: 'line_item_attributes',
-  changeAttributes: 'change_attributes',
-  subcontractAttributes: 'subcontract_attributes',
-  riskAttributes: 'risk_attributes',
-  procurementAttributes: 'procurement_attributes',
-  progressAttributes: 'progress_attributes',
-};
-
+/**
+ * Replaces one of a project's own attribute sets.
+ *
+ * Needs the enterprise because a project's slots are scoped to it. See
+ * updateAttributeSet in enterpriseSettings for why this is a diff rather than
+ * an overwrite.
+ */
 export async function updateProjectAttributeSet(
   projectId: string,
   set: ProjectAttributeSet,
-  attributes: unknown[]
+  attributes: unknown[],
+  enterpriseId?: string
 ): Promise<void> {
-  const { error } = await supabase
-    .from('projects')
-    .update({ [ATTRIBUTE_COLUMN[set]]: attributes })
-    .eq('id', projectId);
+  let entId = enterpriseId;
+  if (!entId) {
+    const { data, error } = await supabase
+      .from('projects').select('enterprise_id').eq('id', projectId).maybeSingle();
+    raise('load project enterprise', error);
+    entId = (data as any)?.enterprise_id;
+  }
+  const { error } = await supabase.rpc('save_attribute_set', {
+    p_enterprise_id: entId,
+    p_project_id: projectId,
+    p_category: ATTRIBUTE_CATEGORY[set],
+    p_attributes: attributes,
+  });
   raise('save project attributes', error);
 }
 

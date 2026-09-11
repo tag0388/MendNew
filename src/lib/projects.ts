@@ -8,7 +8,26 @@ export async function fetchProject(projectId: string): Promise<Project | null> {
   raise('load project', error);
   const project = fromRow<Project>(data);
   if (!project) return null;
-  return (await hydratePeriods([project]))[0];
+
+  // The project's own attribute sets are rows now. The screens still read
+  // project.costCodeAttributes and the rest, so they are put back into that
+  // shape here -- one call for all nine categories.
+  //
+  // Only the open project needs these; the project list does not build
+  // attribute columns, so fetchProjects does not pay for them.
+  const [hydrated, attrsRes] = await Promise.all([
+    hydratePeriods([project]),
+    supabase.rpc('attribute_sets', {
+      p_enterprise_id: project.enterpriseId,
+      p_project_id: projectId,
+    }),
+  ]);
+  raise('load project attributes', attrsRes.error);
+
+  return {
+    ...hydrated[0],
+    ...((attrsRes.data ?? {}) as Record<string, unknown>),
+  } as Project;
 }
 
 export async function createProject(
