@@ -55,6 +55,10 @@ const CostManagement: React.FC<CostManagementProps> = ({
 
   const handleTabClick = (id: string) => {
     navigate(`/project/${projectId}/cost/${id}`);
+    // On a laptop this sidebar has to be opened to pick a tab, and leaving it
+    // open then costs the content 288px for the rest of the visit. Picking a
+    // tab is the end of what it was opened for, so it folds back.
+    if (narrow) setIsSidebarOpen(false);
   };
 
   const sections = [

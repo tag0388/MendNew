@@ -259,9 +259,9 @@ const ProjectChangeAttributes: React.FC<ProjectChangeAttributesProps> = ({ proje
 
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-[#141414]">
-      <div className="flex-1 flex gap-4 xl:gap-8 p-4 xl:p-8 min-h-0">
+      <div className="flex-1 flex flex-col xl:flex-row gap-4 xl:gap-8 p-4 xl:p-8 min-h-0 overflow-y-auto xl:overflow-visible">
         {/* Left Sidebar: 10 Static Rows */}
-        <div className="w-64 xl:w-80 shrink-0 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden shadow-sm">
+        <div className="w-full xl:w-80 shrink-0 max-h-64 xl:max-h-none bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden shadow-sm">
           <div className="p-4 border-b border-gray-100 dark:border-white/10">
             <div className="relative">
               <Plus className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />

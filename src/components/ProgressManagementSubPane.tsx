@@ -47,6 +47,8 @@ const ProgressManagementSubPane: React.FC<ProgressManagementSubPaneProps> = ({
 
   const handleTabClick = (id: string) => {
     navigate(`/project/${projectId}/progress/${id}`);
+    // Folds back after a tab is chosen; see CostManagement.
+    if (narrow) setIsSidebarOpen(false);
   };
 
   const sections = [

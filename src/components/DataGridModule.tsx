@@ -227,20 +227,23 @@ const DataGridModule: React.FC<DataGridModuleProps> = ({
           narrower until the heading is a column of single words. Given a
           floor, the row runs out of space and wraps instead. */}
       <div className="p-4 xl:p-6 border-b border-gray-100 dark:border-white/10 flex flex-wrap justify-between items-center gap-x-4 gap-y-3 bg-gray-50/50 dark:bg-white/5 shrink-0">
-        <div className="flex-1 min-w-[16rem]">
-          <h3 className="text-xl font-bold dark:text-white">{title}</h3>
+        <div className="flex-1 min-w-[12rem]">
+          <h3 className="text-lg xl:text-xl font-bold dark:text-white">{title}</h3>
           {description && <p className="text-sm text-gray-900 dark:text-gray-400">{description}</p>}
         </div>
-        <div className="flex gap-2 shrink-0 max-w-full">
+        {/* The toolbar wraps within itself and its search shrinks, so however
+            narrow the panel gets, no button ends up outside it. shrink-0 here
+            was the reason they did. */}
+        <div className="flex flex-wrap items-center gap-2 min-w-0 w-full sm:w-auto">
           {onQuickFilterChange && (
-            <div className="relative">
+            <div className="relative flex-1 min-w-[9rem] max-w-[16rem]">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
               <input 
                 type="text" 
                 placeholder={searchPlaceholder}
                 value={quickFilterText}
                 onChange={(e) => onQuickFilterChange(e.target.value)}
-                className="pl-10 pr-4 py-2 bg-white dark:bg-[#1a1a1a] border border-gray-200 dark:border-white/10 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none w-64 max-w-full dark:text-white"
+                className="pl-10 pr-4 py-2 bg-white dark:bg-[#1a1a1a] border border-gray-200 dark:border-white/10 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full dark:text-white"
               />
             </div>
           )}

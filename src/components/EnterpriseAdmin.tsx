@@ -1928,7 +1928,14 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                     {section.items.map(item => (
                       <button
                         key={item.id}
-                        onClick={() => setActiveTab(item.id)}
+                        onClick={() => {
+                          setActiveTab(item.id);
+                          // On a laptop this sidebar has to be opened to pick a
+                          // tab, and leaving it open then costs the content 288px
+                          // for the rest of the visit. Picking a tab is the end of
+                          // what it was opened for, so it folds back.
+                          if (narrow) setIsSidebarOpen(false);
+                        }}
                         title={!isSidebarOpen ? item.label : undefined}
                         className={`w-full flex items-center ${isSidebarOpen ? 'gap-3 px-4' : 'justify-center px-0'} py-2.5 rounded-xl text-sm font-medium transition-all ${
                           activeTab === item.id 
@@ -2177,12 +2184,12 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
-              className="flex-1 flex gap-4 xl:gap-8 min-h-0"
+              className="flex-1 flex flex-col xl:flex-row gap-4 xl:gap-8 min-h-0 overflow-y-auto xl:overflow-visible"
             >
               {/* Left Sidebar: 10 Static Rows. Narrower below 1280px, where
                   every pixel the values grid can have is worth more than the
                   width of a title. */}
-              <div className="w-64 xl:w-80 shrink-0 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden">
+              <div className="w-full xl:w-80 shrink-0 max-h-64 xl:max-h-none bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden">
                 <div className="p-4 border-b border-gray-100 dark:border-white/10">
                   <div className="relative">
                     <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
