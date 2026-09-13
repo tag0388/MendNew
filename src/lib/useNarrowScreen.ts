@@ -41,3 +41,34 @@ export function useNarrowScreen(maxWidth: number): boolean {
  */
 export const FOLD_MODULE_SIDEBAR = 1536;
 export const FOLD_MAIN_SIDEBAR = 1280;
+
+/**
+ * Whether the window is shorter than a given height.
+ *
+ * The sidebar carries four sections and thirteen links. On a desktop they fit
+ * with room to spare; on a laptop the last of them fall below the fold, and
+ * because the scrollbar only appears while scrolling, a link that is merely
+ * out of sight looks like a link that is not there. Screens use this to
+ * tighten their vertical rhythm instead.
+ */
+export function useShortScreen(maxHeight: number): boolean {
+  const query = `(max-height: ${maxHeight - 1}px)`;
+
+  const [short, setShort] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia(query).matches
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mql = window.matchMedia(query);
+    const onChange = (e: MediaQueryListEvent) => setShort(e.matches);
+    setShort(mql.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, [query]);
+
+  return short;
+}
+
+/** Below this, the navigation tightens so every link stays reachable. */
+export const COMPACT_NAV_HEIGHT = 900;
