@@ -1,3 +1,4 @@
+import { ATTRIBUTE_CATEGORY } from './attributes';
 import { supabase, fromRows, toRow, raise } from './supabase';
 import type { ProjectAttribute, ResourceRate, Vendor, Calendar } from '../types';
 
@@ -23,36 +24,31 @@ export type AttributeSet =
   | 'procurementAttributes'
   | 'progressAttributes';
 
-const ATTRIBUTE_COLUMNS: Record<AttributeSet, string> = {
-  projectAttributes: 'project_attributes',
-  lineItemAttributes: 'line_item_attributes',
-  costCodeAttributes: 'cost_code_attributes',
-  subcontractAttributes: 'subcontract_attributes',
-  changeAttributes: 'change_attributes',
-  riskAttributes: 'risk_attributes',
-  procurementAttributes: 'procurement_attributes',
-  progressAttributes: 'progress_attributes',
-};
-
 /**
  * Replaces one attribute set.
  *
- * NOTE: this is still read-modify-write, as it was in Firestore -- the caller
- * hands over the whole array. Two admins editing the same attribute set at
- * once will have one edit silently overwritten. Acceptable while enterprise
- * settings are edited by one admin at a time; if that stops being true these
- * become a child table with per-row writes.
+ * The set is ten numbered slots with their titles and values. The database
+ * works out what moved -- a title changed, a value added, a value gone --
+ * rather than overwriting the lot, which is what lets it refuse the deletion
+ * of a value that rows still hold. That refusal arrives as an error naming
+ * the count, and is meant to reach the user.
+ *
+ * This used to write a jsonb array onto the enterprise row, read-modify-write,
+ * so two people editing different attributes at once could lose each other's
+ * work. Slots are rows now, so they cannot.
  */
 export async function updateAttributeSet(
   enterpriseId: string,
   set: AttributeSet,
-  attributes: ProjectAttribute[]
+  attributes: unknown[]
 ): Promise<void> {
-  const { error } = await supabase
-    .from('enterprises')
-    .update({ [ATTRIBUTE_COLUMNS[set]]: attributes })
-    .eq('id', enterpriseId);
-  raise(`update ${set}`, error);
+  const { error } = await supabase.rpc('save_attribute_set', {
+    p_enterprise_id: enterpriseId,
+    p_project_id: null,
+    p_category: ATTRIBUTE_CATEGORY[set],
+    p_attributes: attributes,
+  });
+  raise('save attributes', error);
 }
 
 export async function updateEnterpriseProfile(

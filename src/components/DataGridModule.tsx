@@ -220,12 +220,17 @@ const DataGridModule: React.FC<DataGridModuleProps> = ({
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl overflow-hidden">
       {/* Header / Toolbar */}
-      <div className="p-6 border-b border-gray-100 dark:border-white/10 flex justify-between items-center bg-gray-50/50 dark:bg-white/5 shrink-0">
-        <div>
-          <h3 className="text-xl font-bold dark:text-white">{title}</h3>
+      {/* The title block and the toolbar sit on one line while there is room
+          and wrap onto two when there is not. Without min-w-0 the title
+          cannot shrink past its longest word, so a narrow window broke the
+          heading into one word per line and pushed the toolbar off the
+          panel. */}
+      <div className="p-6 border-b border-gray-100 dark:border-white/10 flex flex-wrap justify-between items-center gap-x-4 gap-y-3 bg-gray-50/50 dark:bg-white/5 shrink-0">
+        <div className="min-w-0 flex-1">
+          <h3 className="text-xl font-bold dark:text-white truncate">{title}</h3>
           {description && <p className="text-sm text-gray-900 dark:text-gray-400">{description}</p>}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 shrink-0 max-w-full">
           {onQuickFilterChange && (
             <div className="relative">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
@@ -234,7 +239,7 @@ const DataGridModule: React.FC<DataGridModuleProps> = ({
                 placeholder={searchPlaceholder}
                 value={quickFilterText}
                 onChange={(e) => onQuickFilterChange(e.target.value)}
-                className="pl-10 pr-4 py-2 bg-white dark:bg-[#1a1a1a] border border-gray-200 dark:border-white/10 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none w-64 dark:text-white"
+                className="pl-10 pr-4 py-2 bg-white dark:bg-[#1a1a1a] border border-gray-200 dark:border-white/10 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none w-64 max-w-full dark:text-white"
               />
             </div>
           )}

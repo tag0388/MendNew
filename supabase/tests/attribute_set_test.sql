@@ -87,3 +87,56 @@ select case when expected = actual then 'PASS' else 'FAIL' end as status,
  order by (expected = actual), label;
 
 rollback;
+
+-- ============================================================================
+-- attribute_sets -- every category in one call
+--
+-- fetchEnterprise and fetchProject hang the sets off the object they return,
+-- because that is the shape fifteen screens read. Nine separate calls would
+-- do the same work nine times on every page load.
+-- ============================================================================
+
+begin;
+
+create temporary table bundle_results (label text, expected text, actual text) on commit drop;
+
+do $$
+declare ent uuid; proj uuid; b jsonb;
+begin
+  insert into enterprises (name, enterprise_code) values ('ZZ-BUNDLE','ZZBUN') returning id into ent;
+  insert into projects (enterprise_id, project_name, project_code)
+  values (ent,'ZZ-BUNDLE','ZZBUN-1') returning id into proj;
+
+  perform save_attribute_set(ent, null, 'cost_code',
+    '[{"id":"01","title":"Discipline","values":[{"id":"CIV","description":"Civil","sortOrder":1}]}]'::jsonb);
+  perform save_attribute_set(ent, null, 'line_item',
+    '[{"id":"02","title":"Trade","values":[]}]'::jsonb);
+  perform save_attribute_set(ent, proj, 'cost_code',
+    '[{"id":"01","title":"Area","values":[]}]'::jsonb);
+
+  b := attribute_sets(ent, null);
+  insert into bundle_results values ('the bundle is keyed the way the screens read it','Discipline',
+                                     b #>> '{costCodeAttributes,0,title}');
+  insert into bundle_results values ('a second category comes in the same call','Trade',
+                                     b #>> '{lineItemAttributes,1,title}');
+  insert into bundle_results values ('all nine categories are present','9',
+                                     (select count(*)::text from jsonb_object_keys(b)));
+  insert into bundle_results values ('each carries its ten slots','10',
+                                     jsonb_array_length(b -> 'costCodeAttributes')::text);
+  insert into bundle_results values ('values come with them','CIV',
+                                     b #>> '{costCodeAttributes,0,values,0,id}');
+
+  b := attribute_sets(ent, proj);
+  insert into bundle_results values ('a project bundle is its own','Area',
+                                     b #>> '{costCodeAttributes,0,title}');
+  -- A project cannot describe itself, so that one category is absent.
+  insert into bundle_results values ('a project has no project-attributes category','8',
+                                     (select count(*)::text from jsonb_object_keys(b)));
+end $$;
+
+select case when expected = actual then 'PASS' else 'FAIL' end as status,
+       label, expected, actual
+  from bundle_results
+ order by (expected = actual), label;
+
+rollback;

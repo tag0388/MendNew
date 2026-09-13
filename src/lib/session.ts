@@ -74,19 +74,25 @@ export async function fetchEnterprise(enterpriseId: string): Promise<Enterprise 
   raise('load enterprise', error);
   if (!data) return null;
 
-  // Vendors and resource rates are their own tables now; the components still
-  // read them as arrays hanging off the enterprise.
-  const [vendorsRes, ratesRes] = await Promise.all([
+  // Vendors, resource rates and attributes are their own tables now; the
+  // components still read them as arrays hanging off the enterprise, so they
+  // are put back into that shape here rather than in fifteen screens.
+  const [vendorsRes, ratesRes, attrsRes] = await Promise.all([
     supabase.from('vendors').select('*').eq('enterprise_id', enterpriseId).order('name'),
     supabase.from('resource_rates').select('*').eq('enterprise_id', enterpriseId).order('sort_order'),
+    supabase.rpc('attribute_sets', { p_enterprise_id: enterpriseId, p_project_id: null }),
   ]);
   raise('load vendors', vendorsRes.error);
   raise('load resource rates', ratesRes.error);
+  raise('load attributes', attrsRes.error);
 
   return {
     ...(fromRow<Enterprise>(data) as Enterprise),
     vendors: fromRows(vendorsRes.data),
     resourceRates: fromRows(ratesRes.data),
+    // One call returns all nine categories, keyed the way the screens expect:
+    // projectAttributes, costCodeAttributes, and so on.
+    ...((attrsRes.data ?? {}) as Record<string, unknown>),
   };
 }
 

@@ -2177,10 +2177,12 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
-              className="flex-1 flex gap-8 min-h-0"
+              className="flex-1 flex gap-4 xl:gap-8 min-h-0"
             >
-              {/* Left Sidebar: 10 Static Rows */}
-              <div className="w-80 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden">
+              {/* Left Sidebar: 10 Static Rows. Narrower below 1280px, where
+                  every pixel the values grid can have is worth more than the
+                  width of a title. */}
+              <div className="w-64 xl:w-80 shrink-0 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden">
                 <div className="p-4 border-b border-gray-100 dark:border-white/10">
                   <div className="relative">
                     <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
@@ -2223,8 +2225,12 @@ export default function EnterpriseAdmin({ enterprise, setIsSidebarCollapsed }: E
                 </div>
               </div>
 
-              {/* Right Side: Value List Editor */}
-              <div className="flex-1 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden">
+              {/* Right Side: Value List Editor.
+                  min-w-0 matters here: a flex child will not shrink below its
+                  content's own minimum unless told to, so without it this
+                  panel pushed past the window and the grid's footer collapsed
+                  on top of itself. */}
+              <div className="flex-1 min-w-0 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl flex flex-col overflow-hidden">
                 <AnimatePresence mode="wait">
                   {selectedAttrId ? (
                     <motion.div
