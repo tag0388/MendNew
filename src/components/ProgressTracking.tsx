@@ -9,6 +9,7 @@ import {
   deleteProgressItems, bulkUpdateProgressItems, calculateProgress,
 } from '../lib/progress';
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { attributeField } from '../lib/attributes';
 import { 
   Plus, 
   Search, 
@@ -1052,7 +1053,7 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
       .filter(attr => attr.title && attr.title.trim() !== '')
       .map(attr => ({
         headerName: attr.title,
-        field: `enterpriseAttributes.${attr.id}`,
+        field: attributeField('enterprise', attr.id),
         width: 150,
         editable: true,
         cellEditor: 'agSelectCellEditor',
@@ -1083,7 +1084,7 @@ export default function ProgressTracking({ enterprise, project, user, theme = 'l
       .filter(attr => attr.title && attr.title.trim() !== '')
       .map(attr => ({
         headerName: attr.title,
-        field: `projectAttributes.${attr.id}`,
+        field: attributeField('project', attr.id),
         width: 150,
         editable: true,
         cellEditor: 'agSelectCellEditor',

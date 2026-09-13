@@ -44,6 +44,7 @@ import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { cn, formatCurrency } from '../lib/utils';
+import { attributeField } from '../lib/attributes';
 import { 
   Dialog, 
   DialogContent, 
@@ -204,10 +205,10 @@ export default function BulkChangeRecords({ project, enterprise }: BulkChangeRec
         'EAC Amount': r.eacAmount
       };
       enterprise.lineItemAttributes?.forEach(a => {
-        row[a.title] = r.enterpriseAttributes?.[a.id] || '';
+        row[a.title] = r[attributeField('enterprise', a.id)] || '';
       });
       project.lineItemAttributes?.forEach(a => {
-        row[a.title] = r.projectAttributes?.[a.id] || '';
+        row[a.title] = r[attributeField('project', a.id)] || '';
       });
       return row;
     });
@@ -455,7 +456,7 @@ export default function BulkChangeRecords({ project, enterprise }: BulkChangeRec
       openByDefault: true,
       children: enterpriseLineItemAttrs.map((attr, index) => ({
         headerName: attr.title,
-        field: `enterpriseAttributes.${attr.id}`,
+        field: attributeField('enterprise', attr.id),
         width: 150,
         columnGroupShow: index === 0 ? undefined : 'open',
         editable: (params: any) => !params.data?.isTotalRow,
@@ -468,10 +469,7 @@ export default function BulkChangeRecords({ project, enterprise }: BulkChangeRec
         },
         valueSetter: (params: any) => {
           if (!params.data || params.newValue === undefined) return false;
-          if (!params.data.enterpriseAttributes) {
-            params.data.enterpriseAttributes = {};
-          }
-          params.data.enterpriseAttributes[attr.id] = params.newValue;
+          params.data[attributeField('enterprise', attr.id)] = params.newValue;
           return true;
         },
         valueFormatter: (params: any) => {
@@ -486,7 +484,7 @@ export default function BulkChangeRecords({ project, enterprise }: BulkChangeRec
       openByDefault: true,
       children: projectLineItemAttrs.map((attr, index) => ({
         headerName: attr.title,
-        field: `projectAttributes.${attr.id}`,
+        field: attributeField('project', attr.id),
         width: 150,
         columnGroupShow: index === 0 ? undefined : 'open',
         editable: (params: any) => !params.data?.isTotalRow,
@@ -499,10 +497,7 @@ export default function BulkChangeRecords({ project, enterprise }: BulkChangeRec
         },
         valueSetter: (params: any) => {
           if (!params.data || params.newValue === undefined) return false;
-          if (!params.data.projectAttributes) {
-            params.data.projectAttributes = {};
-          }
-          params.data.projectAttributes[attr.id] = params.newValue;
+          params.data[attributeField('project', attr.id)] = params.newValue;
           return true;
         },
         valueFormatter: (params: any) => {

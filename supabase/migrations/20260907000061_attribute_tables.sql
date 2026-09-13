@@ -139,10 +139,10 @@ begin
   for s in select * from attribute_scopes loop
     for i in 1 .. 10 loop
       execute format('alter table %I add column if not exists %I text',
-                     s.table_name, 'ent_attr_' || lpad(i::text, 2, '0'));
+                     s.table_name, 'ent_attr' || lpad(i::text, 2, '0'));
       if s.has_project_level then
         execute format('alter table %I add column if not exists %I text',
-                       s.table_name, 'prj_attr_' || lpad(i::text, 2, '0'));
+                       s.table_name, 'prj_attr' || lpad(i::text, 2, '0'));
       end if;
     end loop;
   end loop;
@@ -329,7 +329,7 @@ begin
   select * into d from attribute_definitions where id = p_definition_id;
   if not found then return 0; end if;
 
-  col := case d.level when 'enterprise' then 'ent_attr_' else 'prj_attr_' end
+  col := case d.level when 'enterprise' then 'ent_attr' else 'prj_attr' end
          || d.attribute_number;
 
   for s in select * from attribute_scopes where category = d.category loop
@@ -386,7 +386,7 @@ begin
     return case tg_op when 'DELETE' then old else new end;
   end if;
 
-  col := case d.level when 'enterprise' then 'ent_attr_' else 'prj_attr_' end
+  col := case d.level when 'enterprise' then 'ent_attr' else 'prj_attr' end
          || d.attribute_number;
 
   if tg_op = 'DELETE' then

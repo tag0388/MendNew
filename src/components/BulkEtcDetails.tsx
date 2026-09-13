@@ -59,6 +59,7 @@ import {
 import * as XLSX from 'xlsx';
 import DataGridModule from './DataGridModule';
 import { cn, formatNumber } from '../lib/utils';
+import { attributeField } from '../lib/attributes';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'motion/react';
 import { Badge } from '@/components/ui/badge';
@@ -489,11 +490,11 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
       };
 
       enterpriseLineItemAttrs.forEach(attr => {
-        exportRow[`E_${attr.title}`] = row.enterpriseAttributes?.[attr.id] || '';
+        exportRow[`E_${attr.title}`] = row[attributeField('enterprise', attr.id)] || '';
       });
 
       projectLineItemAttrs.forEach(attr => {
-        exportRow[`P_${attr.title}`] = row.projectAttributes?.[attr.id] || '';
+        exportRow[`P_${attr.title}`] = row[attributeField('project', attr.id)] || '';
       });
 
       for (let i = 1; i <= 5; i++) {
@@ -621,14 +622,14 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           const enterpriseAttributes: Record<string, string> = {};
           enterpriseLineItemAttrs.forEach(attr => {
             if (row[`E_${attr.title}`] !== undefined) {
-              enterpriseAttributes[attr.id] = String(row[`E_${attr.title}`]);
+              enterpriseAttributes[attributeField('enterprise', attr.id)] = String(row[`E_${attr.title}`]);
             }
           });
 
           const projectAttributes: Record<string, string> = {};
           projectLineItemAttrs.forEach(attr => {
             if (row[`P_${attr.title}`] !== undefined) {
-              projectAttributes[attr.id] = String(row[`P_${attr.title}`]);
+              projectAttributes[attributeField('project', attr.id)] = String(row[`P_${attr.title}`]);
             }
           });
 
@@ -653,8 +654,8 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
             unit: row['Unit'] || '',
             rate: Number(row['Rate']) || 0,
             periodValues,
-            enterpriseAttributes,
-            projectAttributes,
+            ...enterpriseAttributes,
+            ...projectAttributes,
             userDefined,
           });
           byCostCode.set(costCodeId, bucket);
@@ -903,7 +904,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
         openByDefault: true,
         children: enterpriseLineItemAttrs.map((attr, index) => ({
           headerName: attr.title,
-          field: `enterpriseAttributes.${attr.id}`,
+          field: attributeField('enterprise', attr.id),
           width: 150,
           columnGroupShow: index === 0 ? undefined : 'open',
           editable: (params: any) => params.node.rowPinned !== 'top',
@@ -913,14 +914,11 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           },
           valueSetter: (params: any) => {
             if (!params.data || params.newValue === undefined) return false;
-            if (!params.data.enterpriseAttributes) {
-              params.data.enterpriseAttributes = {};
-            }
             let val = params.newValue;
             if (typeof val === 'string' && val.includes(' - ')) {
               val = val.split(' - ')[0];
             }
-            params.data.enterpriseAttributes[attr.id] = val;
+            params.data[attributeField('enterprise', attr.id)] = val;
             return true;
           },
           valueFormatter: (params: any) => {
@@ -937,7 +935,7 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
         openByDefault: true,
         children: projectLineItemAttrs.map((attr, index) => ({
           headerName: attr.title,
-          field: `projectAttributes.${attr.id}`,
+          field: attributeField('project', attr.id),
           width: 150,
           columnGroupShow: index === 0 ? undefined : 'open',
           editable: (params: any) => params.node.rowPinned !== 'top',
@@ -947,14 +945,11 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           },
           valueSetter: (params: any) => {
             if (!params.data || params.newValue === undefined) return false;
-            if (!params.data.projectAttributes) {
-              params.data.projectAttributes = {};
-            }
             let val = params.newValue;
             if (typeof val === 'string' && val.includes(' - ')) {
               val = val.split(' - ')[0];
             }
-            params.data.projectAttributes[attr.id] = val;
+            params.data[attributeField('project', attr.id)] = val;
             return true;
           },
           valueFormatter: (params: any) => {

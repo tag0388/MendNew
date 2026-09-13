@@ -64,6 +64,7 @@ import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { cn, formatCurrency } from '../lib/utils';
+import { attributeField } from '../lib/attributes';
 import { 
   BarChart, 
   Bar, 
@@ -442,14 +443,14 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
       
       // Add Enterprise Change Attributes
       enterprise.changeAttributes?.forEach(attr => {
-        const val = c.enterpriseAttributes?.[attr.id];
+        const val = c[attributeField('enterprise', attr.id)];
         const v = attr.values.find(v => v.id === val);
         row[`[E] ${attr.title}`] = v ? `${v.id} - ${v.description}` : val || '';
       });
       
       // Add Project Change Attributes
       project.changeAttributes?.forEach(attr => {
-        const val = c.projectAttributes?.[attr.id];
+        const val = c[attributeField('project', attr.id)];
         const v = attr.values.find(v => v.id === val);
         row[`[P] ${attr.title}`] = v ? `${v.id} - ${v.description}` : val || '';
       });
@@ -560,10 +561,10 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
       };
       // Add attributes
       enterprise.lineItemAttributes?.forEach(a => {
-        row[a.title] = r.enterpriseAttributes?.[a.id] || '';
+        row[a.title] = r[attributeField('enterprise', a.id)] || '';
       });
       project.lineItemAttributes?.forEach(a => {
-        row[a.title] = r.projectAttributes?.[a.id] || '';
+        row[a.title] = r[attributeField('project', a.id)] || '';
       });
       return row;
     });
@@ -933,7 +934,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
       openByDefault: true,
       children: enterpriseChangeAttrs.map((attr, index) => ({
         headerName: attr.title,
-        field: `enterpriseAttributes.${attr.id}`,
+        field: attributeField('enterprise', attr.id),
         width: 200,
         columnGroupShow: index === 0 ? undefined : 'open',
         editable: true,
@@ -959,7 +960,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
       openByDefault: true,
       children: projectChangeAttrs.map((attr, index) => ({
         headerName: attr.title,
-        field: `projectAttributes.${attr.id}`,
+        field: attributeField('project', attr.id),
         width: 200,
         columnGroupShow: index === 0 ? undefined : 'open',
         editable: true,
@@ -1017,7 +1018,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
       openByDefault: true,
       children: enterpriseLineItemAttrs.map((attr, index) => ({
         headerName: attr.title,
-        field: `enterpriseAttributes.${attr.id}`,
+        field: attributeField('enterprise', attr.id),
         width: 200,
         columnGroupShow: index === 0 ? undefined : 'open',
         editable: true,
@@ -1038,7 +1039,7 @@ export default function ChangeManagement({ project, enterprise }: ChangeManageme
       openByDefault: true,
       children: projectLineItemAttrs.map((attr, index) => ({
         headerName: attr.title,
-        field: `projectAttributes.${attr.id}`,
+        field: attributeField('project', attr.id),
         width: 200,
         columnGroupShow: index === 0 ? undefined : 'open',
         editable: true,

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { attributeField } from '../lib/attributes';
 import { resolveCurrentPeriodIndex } from '../lib/periods';
 import { 
   Plus, 
@@ -983,7 +984,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
         headerName: 'Enterprise Subcontract Attributes',
         openByDefault: true,
         children: validEnterpriseSubcontractAttrs.map(attr => ({
-          field: `enterpriseAttributes.${attr.id}`,
+          field: attributeField('enterprise', attr.id),
           headerName: attr.title || `Attribute ${attr.id}`,
           width: 200,
           editable: true,
@@ -1010,7 +1011,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
         headerName: 'Project Subcontract Attributes',
         openByDefault: true,
         children: validProjectSubcontractAttrs.map(attr => ({
-          field: `projectAttributes.${attr.id}`,
+          field: attributeField('project', attr.id),
           headerName: attr.title || `Attribute ${attr.id}`,
           width: 200,
           editable: true,
@@ -2451,7 +2452,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
         openByDefault: true,
         children: enterpriseLineItemAttrs.map((attr, index) => ({
           headerName: attr.title,
-          field: `enterpriseAttributes.${attr.id}`,
+          field: attributeField('enterprise', attr.id),
           width: 150,
           columnGroupShow: index === 0 ? undefined : 'open',
           editable: (params: any) => params.node.rowPinned !== 'top',
@@ -2484,7 +2485,7 @@ export default function SubcontractManagement({ enterprise, project, user, theme
         openByDefault: true,
         children: projectLineItemAttrs.map((attr, index) => ({
           headerName: attr.title,
-          field: `projectAttributes.${attr.id}`,
+          field: attributeField('project', attr.id),
           width: 150,
           columnGroupShow: index === 0 ? undefined : 'open',
           editable: (params: any) => params.node.rowPinned !== 'top',

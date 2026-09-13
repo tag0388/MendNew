@@ -1,4 +1,5 @@
 import { supabase, fromRow, fromRows, toRow, raise, assertId } from './supabase';
+import { bulkSetAttributes } from './attributes';
 import type {
   CostCode, EtcDetail, ScheduleItem, Change, ChangeRecord, Subcontract,
   Calendar as ProjectCalendar,
@@ -456,12 +457,16 @@ export async function insertCostCodeAt(
     p_code: input.code,
     p_name: input.name ?? '',
     p_eac_method: input.eacMethod ?? 'Manual',
-    p_enterprise_attributes: input.enterpriseAttributes ?? {},
-    p_project_attributes: input.projectAttributes ?? {},
     p_insert_index: typeof insertIndex === 'number' ? insertIndex : null,
   });
   raise('create cost code', error);
-  return fromRow<CostCode>(data)!;
+  const created = fromRow<CostCode>(data)!;
+
+  // The row exists before its attributes do, because they are columns the
+  // insert does not name. One statement more, and only when there are any.
+  await bulkSetAttributes('cost_codes', [created.id],
+                          input.enterpriseAttributes, input.projectAttributes);
+  return created;
 }
 
 /**
@@ -485,10 +490,12 @@ export async function bulkUpdateCostCodes(
   const { data, error } = await supabase.rpc('bulk_update_cost_codes', {
     p_cost_code_ids: ids,
     p_eac_method: patch.eacMethod ?? null,
-    p_enterprise_attributes: patch.enterpriseAttributes ?? null,
-    p_project_attributes: patch.projectAttributes ?? null,
   });
   raise('bulk update cost codes', error);
+
+  // Attributes are columns now, so they are set by the one function that
+  // knows how a slot maps to a column rather than by each bulk RPC.
+  await bulkSetAttributes('cost_codes', ids, patch.enterpriseAttributes, patch.projectAttributes);
   return (data as number) ?? 0;
 }
 
@@ -549,8 +556,6 @@ export async function bulkUpdateEtcDetails(
     p_calendar_id: patch.calendarId || null,
     p_phasing_method: patch.phasingMethod || null,
     p_phasing_unit: patch.phasingUnit || null,
-    p_enterprise_attributes: nonEmpty(patch.enterpriseAttributes),
-    p_project_attributes: nonEmpty(patch.projectAttributes),
     p_user_defined: nonEmpty(patch.userDefined),
     p_skip_library_resources: true,
     p_phasing_start_date: patch.phasingStartDate || null,
@@ -561,6 +566,10 @@ export async function bulkUpdateEtcDetails(
       : patch.phasingQty,
   });
   raise('bulk update ETC rows', error);
+
+  // Attributes are columns now, so they are set by the one function that
+  // knows how a slot maps to a column rather than by each bulk RPC.
+  await bulkSetAttributes('etc_details', ids, patch.enterpriseAttributes, patch.projectAttributes);
   return (data as number) ?? 0;
 }
 

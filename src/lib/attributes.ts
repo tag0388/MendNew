@@ -111,20 +111,60 @@ export async function attributeValueUsage(
 /**
  * The columns a row carries its attribute codes in.
  *
- * Slot '03' at enterprise level is `ent_attr_03`; at project level
- * `prj_attr_03`. Grids and imports use this to bind a column to a slot.
+ * Slot '03' at enterprise level is `ent_attr03`; at project level
+ * `prj_attr03`. Grids and imports use this to bind a column to a slot.
  */
 export function attributeColumn(
   level: 'enterprise' | 'project',
   attributeNumber: string
 ): string {
-  return `${level === 'enterprise' ? 'ent' : 'prj'}_attr_${attributeNumber}`;
+  return `${level === 'enterprise' ? 'ent' : 'prj'}_attr${attributeNumber}`;
 }
 
-/** The same, in the camelCase the rows arrive as. */
+/**
+ * The same, in the camelCase the rows arrive as.
+ *
+ * There is no underscore before the number, and that is deliberate:
+ * toCamelKey and toSnakeKey are not symmetric over digits. ent_attr_01 (with the underscore) would
+ * come back as ent_attr01, a column that does not exist -- reads would work
+ * and writes would fail. ent_attr01 survives the trip in both directions.
+ */
 export function attributeField(
   level: 'enterprise' | 'project',
   attributeNumber: string
 ): string {
   return `${level === 'enterprise' ? 'ent' : 'prj'}Attr${attributeNumber}`;
+}
+
+/**
+ * Set attributes across a selection.
+ *
+ * The patch is keyed by slot -- `{ '01': 'CIV', '03': 'L3' }` -- which is the
+ * shape a bulk-edit form already produces, because a form is built from the
+ * slots. A slot in the patch is written; a slot with a blank value clears it;
+ * a slot the patch does not mention is left alone, so editing Discipline does
+ * not disturb the other nine.
+ *
+ * `table` is the real table name, checked in the database against the same
+ * registry that says which category it carries.
+ */
+export async function bulkSetAttributes(
+  table: string,
+  ids: string[],
+  enterprise?: Record<string, unknown> | null,
+  project?: Record<string, unknown> | null
+): Promise<number> {
+  const some = (m?: Record<string, unknown> | null) =>
+    m && Object.keys(m).length > 0 ? m : null;
+  if (ids.length === 0) return 0;
+  if (!some(enterprise) && !some(project)) return 0;
+
+  const { data, error } = await supabase.rpc('bulk_set_attributes', {
+    p_table: table,
+    p_ids: ids,
+    p_enterprise: some(enterprise),
+    p_project: some(project),
+  });
+  raise('set attributes', error);
+  return (data as number) ?? 0;
 }

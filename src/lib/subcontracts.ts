@@ -1,4 +1,5 @@
 import { supabase, fromRow, fromRows, toRow, raise, assertId } from './supabase';
+import { bulkSetAttributes } from './attributes';
 import type { Subcontract, SubcontractLineItem, Invoice, InvoiceItem } from '../types';
 
 /**
@@ -251,14 +252,16 @@ export async function bulkUpdateLineItems(ids: string[], patch: LineItemBulkPatc
     p_distribution: patch.distribution || null,
     p_type: patch.type || null,
     p_status: patch.status || null,
-    p_enterprise_attributes: nonEmpty(patch.enterpriseAttributes),
-    p_project_attributes: nonEmpty(patch.projectAttributes),
     p_user_defined: nonEmpty(patch.userDefined),
     p_clear_enterprise_attributes: patch.clearEnterpriseAttributes ?? [],
     p_clear_project_attributes: patch.clearProjectAttributes ?? [],
     p_clear_user_defined: patch.clearUserDefined ?? [],
   });
   raise('bulk update line items', error);
+
+  // Attributes are columns now, so they are set by the one function that
+  // knows how a slot maps to a column rather than by each bulk RPC.
+  await bulkSetAttributes('subcontract_line_items', ids, patch.enterpriseAttributes, patch.projectAttributes);
   return (data as number) ?? 0;
 }
 
