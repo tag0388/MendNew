@@ -41,6 +41,8 @@ const ProcurementManagementSubPane: React.FC<ProcurementManagementSubPaneProps> 
 
   const handleTabClick = (id: string) => {
     navigate(`/project/${projectId}/procurement/${id}`);
+    // Folds back after a tab is chosen; see CostManagement.
+    if (narrow) setIsSidebarOpen(false);
   };
 
   const sections = [
