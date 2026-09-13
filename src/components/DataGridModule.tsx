@@ -220,14 +220,15 @@ const DataGridModule: React.FC<DataGridModuleProps> = ({
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-[#141414] border border-gray-200 dark:border-white/10 rounded-2xl overflow-hidden">
       {/* Header / Toolbar */}
-      {/* The title block and the toolbar sit on one line while there is room
-          and wrap onto two when there is not. Without min-w-0 the title
-          cannot shrink past its longest word, so a narrow window broke the
-          heading into one word per line and pushed the toolbar off the
-          panel. */}
-      <div className="p-6 border-b border-gray-100 dark:border-white/10 flex flex-wrap justify-between items-center gap-x-4 gap-y-3 bg-gray-50/50 dark:bg-white/5 shrink-0">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-xl font-bold dark:text-white truncate">{title}</h3>
+      {/* The title block and the toolbar share one line while there is room
+          for both, and the toolbar drops to a second line when there is not.
+          The minimum width on the title is what makes that happen: a block
+          that may shrink to nothing never forces a wrap, it just gets
+          narrower until the heading is a column of single words. Given a
+          floor, the row runs out of space and wraps instead. */}
+      <div className="p-4 xl:p-6 border-b border-gray-100 dark:border-white/10 flex flex-wrap justify-between items-center gap-x-4 gap-y-3 bg-gray-50/50 dark:bg-white/5 shrink-0">
+        <div className="flex-1 min-w-[16rem]">
+          <h3 className="text-xl font-bold dark:text-white">{title}</h3>
           {description && <p className="text-sm text-gray-900 dark:text-gray-400">{description}</p>}
         </div>
         <div className="flex gap-2 shrink-0 max-w-full">

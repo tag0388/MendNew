@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useShortScreen, COMPACT_NAV_HEIGHT } from '../lib/useNarrowScreen';
 import { 
   Layout, 
   Briefcase, 
@@ -93,6 +94,13 @@ export default function Sidebar({
   // These only decide which links to show. Every screen behind them is
   // enforced by row level security, so a hidden link is a convenience, not
   // the protection.
+  // Four sections and thirteen links fit a desktop with room to spare. On a
+  // laptop the last of them fall below the fold, and a scrollbar that only
+  // appears while scrolling makes an out-of-sight link look like a missing
+  // one -- which is exactly how Enterprise Admin went missing. So the rhythm
+  // tightens rather than the list scrolling.
+  const compact = useShortScreen(COMPACT_NAV_HEIGHT);
+
   const isEnterpriseAdmin = isSystemAdmin || enterpriseRole === 'Enterprise System Admin';
   const isProjectAdmin = isEnterpriseAdmin || projectRole === 'Project Admin';
 
@@ -142,8 +150,8 @@ export default function Sidebar({
         {isCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
       </Button>
 
-      <div className="p-6 overflow-hidden flex-1 flex flex-col min-h-0">
-        <div className={cn("flex items-center gap-2 mb-8 shrink-0", isCollapsed && "justify-center")}>
+      <div className={cn("overflow-hidden flex-1 flex flex-col min-h-0", compact ? "p-4" : "p-6")}>
+        <div className={cn("flex items-center gap-2 shrink-0", compact ? "mb-4" : "mb-8", isCollapsed && "justify-center")}>
           {enterprise?.logoURL ? (
             <div className="shrink-0 w-8 h-8 rounded overflow-hidden border border-gray-200 dark:border-white/10">
               <img src={enterprise.logoURL} alt={enterprise.name} className="w-full h-full object-contain bg-white" referrerPolicy="no-referrer" />
@@ -156,11 +164,15 @@ export default function Sidebar({
           {!isCollapsed && <span className="font-bold tracking-tight text-sm whitespace-nowrap dark:text-white">{enterprise?.name || 'Mend'}</span>}
         </div>
 
-        <ScrollArea className="flex-1 pr-2 -mr-2">
-          <div className="space-y-6">
+        {/* The thumb is bg-border by default, which on a white sidebar is close
+              to invisible -- so when a link was merely scrolled out of sight it
+              read as missing. Given the rhythm above this should rarely be
+              needed, but when it is, it has to be seen. */}
+          <ScrollArea className="flex-1 pr-2 -mr-2 [&_[data-slot=scroll-area-thumb]]:bg-gray-400 dark:[&_[data-slot=scroll-area-thumb]]:bg-white/30">
+          <div className={compact ? "space-y-3" : "space-y-6"}>
             {/* Enterprise Section */}
             <div>
-              {!isCollapsed && <p className="px-3 text-[10px] font-bold text-gray-900 dark:text-white/20 uppercase tracking-widest mb-2">Enterprise</p>}
+              {!isCollapsed && <p className="px-3 text-[10px] font-bold text-gray-900 dark:text-white/20 uppercase tracking-widest mb-1">Enterprise</p>}
               <nav className="space-y-1">
                 {enterpriseItems.map((item) => (
                   <Button
@@ -169,7 +181,7 @@ export default function Sidebar({
                     disabled={item.disabled}
                     onClick={() => handleNavClick(item.id)}
                     className={cn(
-                      "w-full justify-start gap-3 px-3 py-2 h-auto font-normal",
+                      "w-full justify-start gap-3 px-3 h-auto font-normal", compact ? "py-1" : "py-2",
                       location.pathname !== '/' && "text-black dark:text-white/40 hover:text-black dark:hover:text-white/70",
                       isCollapsed && "justify-center px-0"
                     )}
@@ -200,7 +212,7 @@ export default function Sidebar({
                         variant={isActive ? "default" : "ghost"}
                         onClick={() => handleModuleClick(item.id)}
                         className={cn(
-                          "w-full justify-start gap-3 px-3 py-2 h-auto font-normal",
+                          "w-full justify-start gap-3 px-3 h-auto font-normal", compact ? "py-1" : "py-2",
                           !isActive && "text-black dark:text-white/40 hover:text-black dark:hover:text-white/70",
                           isCollapsed && "justify-center px-0"
                         )}
@@ -217,7 +229,7 @@ export default function Sidebar({
 
             {/* Administration Section */}
             <div>
-              {!isCollapsed && <p className="px-3 text-[10px] font-bold text-gray-900 dark:text-white/20 uppercase tracking-widest mb-2">Administration</p>}
+              {!isCollapsed && <p className="px-3 text-[10px] font-bold text-gray-900 dark:text-white/20 uppercase tracking-widest mb-1">Administration</p>}
               <nav className="space-y-1">
                 {adminItems.filter(i => i.visible).map((item) => (
                   <Button
@@ -225,7 +237,7 @@ export default function Sidebar({
                     variant={location.pathname === `/${item.id}` ? "default" : "ghost"}
                     onClick={() => handleNavClick(item.id)}
                     className={cn(
-                      "w-full justify-start gap-3 px-3 py-2 h-auto font-normal",
+                      "w-full justify-start gap-3 px-3 h-auto font-normal", compact ? "py-1" : "py-2",
                       location.pathname !== `/${item.id}` && "text-black dark:text-white/40 hover:text-black dark:hover:text-white/70",
                       isCollapsed && "justify-center px-0"
                     )}
@@ -240,13 +252,13 @@ export default function Sidebar({
 
             {/* User Section */}
             <div>
-              {!isCollapsed && <p className="px-3 text-[10px] font-bold text-gray-900 dark:text-white/20 uppercase tracking-widest mb-2">User</p>}
+              {!isCollapsed && <p className="px-3 text-[10px] font-bold text-gray-900 dark:text-white/20 uppercase tracking-widest mb-1">User</p>}
               <nav className="space-y-1">
                 <Button
                   variant={location.pathname === '/profile' ? "default" : "ghost"}
                   onClick={() => handleNavClick('profile')}
                   className={cn(
-                    "w-full justify-start gap-3 px-3 py-2 h-auto font-normal",
+                    "w-full justify-start gap-3 px-3 h-auto font-normal", compact ? "py-1" : "py-2",
                     location.pathname !== '/profile' && "text-black dark:text-white/40 hover:text-black dark:hover:text-white/70",
                     isCollapsed && "justify-center px-0"
                   )}
@@ -261,13 +273,13 @@ export default function Sidebar({
         </ScrollArea>
       </div>
 
-      <div className="mt-auto p-6 space-y-4">
+      <div className={cn("mt-auto", compact ? "p-3 space-y-2" : "p-6 space-y-4")}>
         <div className="pt-4 border-t border-gray-100 dark:border-white/10 space-y-2">
           <Button 
             variant="ghost"
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
             className={cn(
-              "w-full justify-start gap-3 px-3 py-2 h-auto font-normal text-black dark:text-white/40 hover:text-black dark:hover:text-white/70",
+              "w-full justify-start gap-3 px-3 h-auto font-normal", compact ? "py-1" : "py-2", " text-black dark:text-white/40 hover:text-black dark:hover:text-white/70",
               isCollapsed && "justify-center px-0"
             )}
             title={isCollapsed ? `Switch to ${theme === 'dark' ? 'light' : 'dark'} mode` : ""}
@@ -280,7 +292,7 @@ export default function Sidebar({
             variant="ghost"
             onClick={() => void signOut()}
             className={cn(
-              "w-full justify-start gap-3 px-3 py-2 h-auto font-normal text-red-400 hover:text-red-300 hover:bg-red-400/10",
+              "w-full justify-start gap-3 px-3 h-auto font-normal", compact ? "py-1" : "py-2", " text-red-400 hover:text-red-300 hover:bg-red-400/10",
               isCollapsed && "justify-center px-0"
             )}
             title={isCollapsed ? "Sign Out" : ""}
