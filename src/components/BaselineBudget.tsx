@@ -410,14 +410,14 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
         const enterpriseAttributes: Record<string, any> = {};
         enterpriseAttrs.forEach(attr => {
           if (row[`E_${attr.title}`] !== undefined) {
-            enterpriseAttributes[attr.id] = String(row[`E_${attr.title}`]);
+            enterpriseAttributes[attributeField('enterprise', attr.id)] = String(row[`E_${attr.title}`]);
           }
         });
 
         const projectAttributes: Record<string, any> = {};
         projectAttrs.forEach(attr => {
           if (row[`P_${attr.title}`] !== undefined) {
-            projectAttributes[attr.id] = String(row[`P_${attr.title}`]);
+            projectAttributes[attributeField('project', attr.id)] = String(row[`P_${attr.title}`]);
           }
         });
 
@@ -428,8 +428,8 @@ const BaselineBudget: React.FC<BaselineBudgetProps> = ({ project, enterprise }) 
           description: row['Description'] || '',
           source: 'EST',
           amount: Number(row['Amount']) || 0,
-          enterpriseAttributes,
-          projectAttributes,
+          ...enterpriseAttributes,
+          ...projectAttributes,
         };
       });
 

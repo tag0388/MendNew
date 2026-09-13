@@ -1,4 +1,5 @@
 import { supabase, fromRow, fromRows, toRow, raise, assertId } from './supabase';
+import { bulkSetAttributes } from './attributes';
 import type { Change, ChangeRecord } from '../types';
 
 /**
@@ -154,10 +155,12 @@ export async function bulkUpdateChangeRecords(
     p_scope: patch.scope || null,
     p_budget_amount: patch.budgetAmount ?? null,
     p_eac_amount: patch.eacAmount ?? null,
-    p_enterprise_attributes: nonEmpty(patch.enterpriseAttributes),
-    p_project_attributes: nonEmpty(patch.projectAttributes),
   });
   raise('bulk update change records', error);
+
+  // Attributes are columns now, so they are set by the one function that
+  // knows how a slot maps to a column rather than by each bulk RPC.
+  await bulkSetAttributes('change_records', ids, patch.enterpriseAttributes, patch.projectAttributes);
   return (data as number) ?? 0;
 }
 
@@ -170,15 +173,7 @@ export async function mergeChangeAttributes(
   patch: { enterpriseAttributes?: Record<string, string>; projectAttributes?: Record<string, string> }
 ): Promise<number> {
   if (ids.length === 0) return 0;
-  const nonEmpty = (m?: Record<string, unknown>) =>
-    m && Object.keys(m).length > 0 ? m : null;
-  const { data, error } = await supabase.rpc('merge_change_attributes', {
-    p_change_ids: ids,
-    p_enterprise_attributes: nonEmpty(patch.enterpriseAttributes),
-    p_project_attributes: nonEmpty(patch.projectAttributes),
-  });
-  raise('update change attributes', error);
-  return (data as number) ?? 0;
+  return bulkSetAttributes('changes', ids, patch.enterpriseAttributes, patch.projectAttributes);
 }
 
 /**

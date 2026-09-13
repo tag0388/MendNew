@@ -135,3 +135,36 @@ export function attributeField(
 ): string {
   return `${level === 'enterprise' ? 'ent' : 'prj'}Attr${attributeNumber}`;
 }
+
+/**
+ * Set attributes across a selection.
+ *
+ * The patch is keyed by slot -- `{ '01': 'CIV', '03': 'L3' }` -- which is the
+ * shape a bulk-edit form already produces, because a form is built from the
+ * slots. A slot in the patch is written; a slot with a blank value clears it;
+ * a slot the patch does not mention is left alone, so editing Discipline does
+ * not disturb the other nine.
+ *
+ * `table` is the real table name, checked in the database against the same
+ * registry that says which category it carries.
+ */
+export async function bulkSetAttributes(
+  table: string,
+  ids: string[],
+  enterprise?: Record<string, unknown> | null,
+  project?: Record<string, unknown> | null
+): Promise<number> {
+  const some = (m?: Record<string, unknown> | null) =>
+    m && Object.keys(m).length > 0 ? m : null;
+  if (ids.length === 0) return 0;
+  if (!some(enterprise) && !some(project)) return 0;
+
+  const { data, error } = await supabase.rpc('bulk_set_attributes', {
+    p_table: table,
+    p_ids: ids,
+    p_enterprise: some(enterprise),
+    p_project: some(project),
+  });
+  raise('set attributes', error);
+  return (data as number) ?? 0;
+}

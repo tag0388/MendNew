@@ -622,14 +622,14 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
           const enterpriseAttributes: Record<string, string> = {};
           enterpriseLineItemAttrs.forEach(attr => {
             if (row[`E_${attr.title}`] !== undefined) {
-              enterpriseAttributes[attr.id] = String(row[`E_${attr.title}`]);
+              enterpriseAttributes[attributeField('enterprise', attr.id)] = String(row[`E_${attr.title}`]);
             }
           });
 
           const projectAttributes: Record<string, string> = {};
           projectLineItemAttrs.forEach(attr => {
             if (row[`P_${attr.title}`] !== undefined) {
-              projectAttributes[attr.id] = String(row[`P_${attr.title}`]);
+              projectAttributes[attributeField('project', attr.id)] = String(row[`P_${attr.title}`]);
             }
           });
 
@@ -654,8 +654,8 @@ export default function BulkEtcDetails({ project, enterprise, theme = 'light' }:
             unit: row['Unit'] || '',
             rate: Number(row['Rate']) || 0,
             periodValues,
-            enterpriseAttributes,
-            projectAttributes,
+            ...enterpriseAttributes,
+            ...projectAttributes,
             userDefined,
           });
           byCostCode.set(costCodeId, bucket);

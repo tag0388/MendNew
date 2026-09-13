@@ -535,9 +535,9 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
             if (excelVal !== undefined) {
               const matchedVal = attr.values?.find(v => v.description === excelVal || v.id === excelVal)?.id || excelVal;
               if (enterprise.procurementAttributes?.some(ea => ea.id === attr.id)) {
-                enterpriseAttributes[attr.id] = matchedVal;
+                enterpriseAttributes[attributeField('enterprise', attr.id)] = matchedVal;
               } else {
-                projectAttributes[attr.id] = matchedVal;
+                projectAttributes[attributeField('project', attr.id)] = matchedVal;
               }
             }
           });
@@ -564,8 +564,8 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
             packageId,
             description,
             calendarId: calendarId || null,
-            enterpriseAttributes,
-            projectAttributes,
+            ...enterpriseAttributes,
+            ...projectAttributes,
             stepData,
           });
         }

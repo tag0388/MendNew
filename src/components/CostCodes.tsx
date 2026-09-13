@@ -1564,14 +1564,14 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
           const enterpriseAttributes: Record<string, string> = {};
           enterpriseLineItemAttrs.forEach(attr => {
             if (row[`E_${attr.title}`] !== undefined) {
-              enterpriseAttributes[attr.id] = String(row[`E_${attr.title}`]);
+              enterpriseAttributes[attributeField('enterprise', attr.id)] = String(row[`E_${attr.title}`]);
             }
           });
 
           const projectAttributes: Record<string, string> = {};
           projectLineItemAttrs.forEach(attr => {
             if (row[`P_${attr.title}`] !== undefined) {
-              projectAttributes[attr.id] = String(row[`P_${attr.title}`]);
+              projectAttributes[attributeField('project', attr.id)] = String(row[`P_${attr.title}`]);
             }
           });
 
@@ -1590,8 +1590,8 @@ export default function CostCodes({ project, enterprise, theme = 'light' }: Cost
             unit: row['Unit'] || '',
             rate: Number(row['Rate']) || 0,
             periodValues,
-            enterpriseAttributes,
-            projectAttributes,
+            ...enterpriseAttributes,
+            ...projectAttributes,
             userDefined,
           });
         });

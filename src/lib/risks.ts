@@ -1,4 +1,5 @@
 import { supabase, fromRow, fromRows, toRow, raise, assertId } from './supabase';
+import { bulkSetAttributes } from './attributes';
 import type { Risk, RiskRecord } from '../types';
 
 /**
@@ -188,18 +189,11 @@ function splitCellEdit(field: string, value: any) {
 }
 
 async function mergeAttributes(
-  fn: 'merge_risk_attributes' | 'merge_risk_record_attributes',
-  idsParam: 'p_risk_ids' | 'p_record_ids',
+  table: 'risks' | 'risk_records',
   ids: string[],
   patch: { enterpriseAttributes?: Record<string, any>; projectAttributes?: Record<string, any> }
 ): Promise<void> {
-  const nonEmpty = (m?: Record<string, unknown>) => (m && Object.keys(m).length > 0 ? m : null);
-  const { error } = await supabase.rpc(fn, {
-    [idsParam]: ids,
-    p_enterprise_attributes: nonEmpty(patch.enterpriseAttributes),
-    p_project_attributes: nonEmpty(patch.projectAttributes),
-  } as any);
-  raise('update attributes', error);
+  await bulkSetAttributes(table, ids, patch.enterpriseAttributes, patch.projectAttributes);
 }
 
 /** Merge attribute maps into many risk records at once. */
@@ -208,13 +202,13 @@ export async function mergeRiskRecordAttributes(
   patch: { enterpriseAttributes?: Record<string, any>; projectAttributes?: Record<string, any> }
 ): Promise<void> {
   if (ids.length === 0) return;
-  await mergeAttributes('merge_risk_record_attributes', 'p_record_ids', ids, patch);
+  await mergeAttributes('risk_records', ids, patch);
 }
 
 /** One cell edit on the risks grid. */
 export async function applyRiskCellEdit(id: string, field: string, value: any): Promise<void> {
   const { column, attributes } = splitCellEdit(field, value);
-  if (attributes) await mergeAttributes('merge_risk_attributes', 'p_risk_ids', [id], attributes);
+  if (attributes) await mergeAttributes('risks', [id], attributes);
   if (column) await updateRisk(id, column as Partial<Risk>);
 }
 
@@ -222,7 +216,7 @@ export async function applyRiskCellEdit(id: string, field: string, value: any): 
 export async function applyRiskRecordCellEdit(id: string, field: string, value: any): Promise<void> {
   const { column, attributes } = splitCellEdit(field, value);
   if (attributes) {
-    await mergeAttributes('merge_risk_record_attributes', 'p_record_ids', [id], attributes);
+    await mergeAttributes('risk_records', [id], attributes);
   }
   if (column) await updateRiskRecord(id, column as Partial<RiskRecord>);
 }
