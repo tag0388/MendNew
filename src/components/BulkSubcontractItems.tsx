@@ -11,6 +11,7 @@ import { ColDef, ColGroupDef, CellValueChangedEvent } from 'ag-grid-community';
 import toast from 'react-hot-toast';
 import * as XLSX from 'xlsx';
 import { formatCurrency, formatNumber, formatDate, dateToISO } from '../lib/utils';
+import { attributeField } from '../lib/attributes';
 import {
   Dialog,
   DialogContent,
@@ -378,7 +379,7 @@ const BulkSubcontractItems: React.FC<BulkSubcontractItemsProps> = ({ project, en
           ...(enterprise.lineItemAttributes || [])
             .filter(a => a.title)
             .map(attr => ({
-              field: `enterpriseAttributes.${attr.id}`,
+              field: attributeField('enterprise', attr.id),
               headerName: attr.title,
               width: 150,
               editable: true,
@@ -390,7 +391,7 @@ const BulkSubcontractItems: React.FC<BulkSubcontractItemsProps> = ({ project, en
           ...(project.lineItemAttributes || [])
             .filter(a => a.title)
             .map(attr => ({
-              field: `projectAttributes.${attr.id}`,
+              field: attributeField('project', attr.id),
               headerName: attr.title,
               width: 150,
               editable: true,

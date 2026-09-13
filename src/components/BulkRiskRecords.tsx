@@ -40,6 +40,7 @@ import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { cn, formatCurrency } from '../lib/utils';
+import { attributeField } from '../lib/attributes';
 import { 
   Dialog, 
   DialogContent, 
@@ -386,7 +387,7 @@ export default function BulkRiskRecords({ project, enterprise }: BulkRiskRecords
       openByDefault: true,
       children: enterpriseLineItemAttrs.map(attr => ({
         headerName: attr.title,
-        field: `enterpriseAttributes.${attr.id}`,
+        field: attributeField('enterprise', attr.id),
         width: 200,
         editable: true,
         cellEditor: 'agRichSelectCellEditor',
@@ -409,7 +410,7 @@ export default function BulkRiskRecords({ project, enterprise }: BulkRiskRecords
       openByDefault: true,
       children: projectLineItemAttrs.map(attr => ({
         headerName: attr.title,
-        field: `projectAttributes.${attr.id}`,
+        field: attributeField('project', attr.id),
         width: 200,
         editable: true,
         cellEditor: 'agRichSelectCellEditor',

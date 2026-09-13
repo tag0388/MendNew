@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { cn } from '../lib/utils';
+import { attributeField } from '../lib/attributes';
 import { toast } from 'sonner';
 import { handleFirestoreError, OperationType } from '../lib/errorHandlers';
 
@@ -140,7 +141,7 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
       .filter(attr => attr.title && attr.values && attr.values.length > 0)
       .map(attr => ({
       headerName: attr.title,
-      field: `enterpriseAttributes.${attr.id}`,
+      field: attributeField('enterprise', attr.id),
       width: 150,
       editable: true,
       cellEditor: 'agSelectCellEditor',
@@ -154,7 +155,7 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
       .filter(attr => attr.title && attr.values && attr.values.length > 0)
       .map(attr => ({
       headerName: attr.title,
-      field: `projectAttributes.${attr.id}`,
+      field: attributeField('project', attr.id),
       width: 150,
       editable: true,
       cellEditor: 'agSelectCellEditor',
@@ -463,7 +464,7 @@ export default function ProcurementProgress({ project, enterprise, hideTabs = fa
 
         // Attributes
         allAttributes.forEach(attr => {
-          const valId = item.enterpriseAttributes?.[attr.id] || item.projectAttributes?.[attr.id];
+          const valId = item[attributeField('enterprise', attr.id)] || item[attributeField('project', attr.id)];
           row[attr.title] = attr.values?.find(v => v.id === valId)?.description || valId || '';
         });
 

@@ -59,6 +59,7 @@ import {
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { formatCurrency, formatNumber } from '../lib/utils';
+import { attributeField } from '../lib/attributes';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 import { useTheme } from 'next-themes';
@@ -308,11 +309,11 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
       };
 
       enterpriseAttrs.forEach(attr => {
-        exportRow[`E_${attr.title}`] = r.enterpriseAttributes?.[attr.id] || '';
+        exportRow[`E_${attr.title}`] = r[attributeField('enterprise', attr.id)] || '';
       });
 
       projectAttrs.forEach(attr => {
-        exportRow[`P_${attr.title}`] = r.projectAttributes?.[attr.id] || '';
+        exportRow[`P_${attr.title}`] = r[attributeField('project', attr.id)] || '';
       });
 
       return exportRow;
@@ -625,7 +626,7 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
         headerName: 'Enterprise Attributes',
         children: enterpriseAttrs.map(attr => ({
           headerName: attr.title,
-          field: `enterpriseAttributes.${attr.id}`,
+          field: attributeField('enterprise', attr.id),
           width: 150,
           editable: isProjectAdmin,
           cellEditor: 'agSelectCellEditor',
@@ -638,7 +639,7 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
           },
           valueSetter: (params: any) => {
             if (!params.data.enterpriseAttributes) params.data.enterpriseAttributes = {};
-            params.data.enterpriseAttributes[attr.id] = params.newValue;
+            params.data[attributeField('enterprise', attr.id)] = params.newValue;
             return true;
           }
         }))
@@ -650,7 +651,7 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
         headerName: 'Project Attributes',
         children: projectAttrs.map(attr => ({
           headerName: attr.title,
-          field: `projectAttributes.${attr.id}`,
+          field: attributeField('project', attr.id),
           width: 150,
           editable: isProjectAdmin,
           cellEditor: 'agSelectCellEditor',
@@ -663,7 +664,7 @@ const ActualCost: React.FC<ActualCostProps> = ({ project, enterprise }) => {
           },
           valueSetter: (params: any) => {
             if (!params.data.projectAttributes) params.data.projectAttributes = {};
-            params.data.projectAttributes[attr.id] = params.newValue;
+            params.data[attributeField('project', attr.id)] = params.newValue;
             return true;
           }
         }))

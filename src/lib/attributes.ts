@@ -111,8 +111,8 @@ export async function attributeValueUsage(
 /**
  * The columns a row carries its attribute codes in.
  *
- * Slot '03' at enterprise level is `ent_attr_03`; at project level
- * `prj_attr_03`. Grids and imports use this to bind a column to a slot.
+ * Slot '03' at enterprise level is `ent_attr03`; at project level
+ * `prj_attr03`. Grids and imports use this to bind a column to a slot.
  */
 export function attributeColumn(
   level: 'enterprise' | 'project',
@@ -125,7 +125,7 @@ export function attributeColumn(
  * The same, in the camelCase the rows arrive as.
  *
  * There is no underscore before the number, and that is deliberate:
- * toCamelKey and toSnakeKey are not symmetric over digits. ent_attr_01 would
+ * toCamelKey and toSnakeKey are not symmetric over digits. ent_attr_01 (with the underscore) would
  * come back as ent_attr01, a column that does not exist -- reads would work
  * and writes would fail. ent_attr01 survives the trip in both directions.
  */

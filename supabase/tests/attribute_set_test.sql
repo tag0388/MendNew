@@ -62,7 +62,7 @@ begin
                               s #>> '{1,title}');
 
   -- Which is what makes the guard work: a delete is visible as a delete.
-  insert into cost_codes (project_id, code, name, ent_attr_01)
+  insert into cost_codes (project_id, code, name, ent_attr01)
   values (proj,'1100','Civil','CIV');
   begin
     perform save_attribute_set(ent, null, 'cost_code',
