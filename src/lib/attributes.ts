@@ -118,10 +118,17 @@ export function attributeColumn(
   level: 'enterprise' | 'project',
   attributeNumber: string
 ): string {
-  return `${level === 'enterprise' ? 'ent' : 'prj'}_attr_${attributeNumber}`;
+  return `${level === 'enterprise' ? 'ent' : 'prj'}_attr${attributeNumber}`;
 }
 
-/** The same, in the camelCase the rows arrive as. */
+/**
+ * The same, in the camelCase the rows arrive as.
+ *
+ * There is no underscore before the number, and that is deliberate:
+ * toCamelKey and toSnakeKey are not symmetric over digits. ent_attr_01 would
+ * come back as ent_attr01, a column that does not exist -- reads would work
+ * and writes would fail. ent_attr01 survives the trip in both directions.
+ */
 export function attributeField(
   level: 'enterprise' | 'project',
   attributeNumber: string

@@ -40,10 +40,10 @@ begin
 
   -- ------------------------------------------------------- resolution ----
   insert into results
-  select 'a titled enterprise slot becomes a column','ent_attr_01',
+  select 'a titled enterprise slot becomes a column','ent_attr01',
          import_dynamic_columns('etc_details', proj) #>> '{E_Discipline,column}';
   insert into results
-  select 'a titled project slot becomes its own column','prj_attr_03',
+  select 'a titled project slot becomes its own column','prj_attr03',
          import_dynamic_columns('etc_details', proj) #>> '{P_Area,column}';
   insert into results
   select 'an untitled slot produces nothing','false',
@@ -59,10 +59,10 @@ begin
   insert into results values ('nothing was unrecognised','[]', res ->> 'ignored_columns');
 
   insert into results
-  select 'the enterprise attribute is in its real column','CIV', ent_attr_01
+  select 'the enterprise attribute is in its real column','CIV', ent_attr01
     from etc_details where project_id = proj;
   insert into results
-  select 'the project attribute is in its real column','Level 3', prj_attr_03
+  select 'the project attribute is in its real column','Level 3', prj_attr03
     from etc_details where project_id = proj;
   insert into results
   select 'a user-defined number is still jsonb, and a number','42', user_defined ->> 'num1'
@@ -112,7 +112,7 @@ begin
 
   update attribute_values set code = 'CIVIL' where definition_id = d_ent and code = 'CIV';
   insert into results
-  select 'renaming a code reaches the imported row','CIVIL', ent_attr_01
+  select 'renaming a code reaches the imported row','CIVIL', ent_attr01
     from etc_details where project_id = proj and item = 'Labour';
 end $$;
 

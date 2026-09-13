@@ -68,7 +68,7 @@ begin
     select coalesce(cols || jsonb_object_agg(
              case d.level when 'enterprise' then 'E_' else 'P_' end || btrim(d.title),
              jsonb_strip_nulls(jsonb_build_object(
-               'column', case d.level when 'enterprise' then 'ent_attr_' else 'prj_attr_' end
+               'column', case d.level when 'enterprise' then 'ent_attr' else 'prj_attr' end
                          || d.attribute_number,
                'type',   'text',
                'ids', (select jsonb_agg(v.code order by v.sort_order, v.code)

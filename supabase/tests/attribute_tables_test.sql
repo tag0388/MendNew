@@ -61,10 +61,10 @@ begin
   end;
 
   -- ------------------------------------------------ assignment is a column --
-  insert into cost_codes (project_id, code, name, ent_attr_01)
+  insert into cost_codes (project_id, code, name, ent_attr01)
   values (proj,'1100','Civil works','CIV');
   insert into results
-  select 'the code lands in a real column','CIV', ent_attr_01
+  select 'the code lands in a real column','CIV', ent_attr01
     from cost_codes where project_id = proj;
   insert into results values ('the value knows it is in use','1',
                               attribute_usage_count(def,'CIV')::text);
@@ -81,7 +81,7 @@ begin
 
   update attribute_values set code = 'CIVIL' where id = val;
   insert into results
-  select 'renaming a code carries into the rows that hold it','CIVIL', ent_attr_01
+  select 'renaming a code carries into the rows that hold it','CIVIL', ent_attr01
     from cost_codes where project_id = proj;
 
   delete from attribute_values where definition_id = def and code = 'MEC';
@@ -91,7 +91,7 @@ begin
   -- A description is a label; changing it must not rewrite any data.
   update attribute_values set description = 'Civil Engineering' where id = val;
   insert into results
-  select 'changing only the description leaves the rows alone','CIVIL', ent_attr_01
+  select 'changing only the description leaves the rows alone','CIVIL', ent_attr01
     from cost_codes where project_id = proj;
 end $$;
 
